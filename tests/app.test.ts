@@ -261,3 +261,131 @@ test('non-fast-forward rejection never clears the selected local snapshot', asyn
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
 });
+
+async function reloadProject(saved: any) {
+  await act(async () => root.unmount());
+  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  root = createRoot(document.getElementById('root')!);
+  await act(async () => root.render(React.createElement(App)));
+}
+function boundProject() {
+  const saved = repo() as any;
+  saved.uploadTarget = { id: 77, owner: 'destination', repo: 'backup', branch: 'release', purgeAfterUpload: false, token: 'target-token' };
+  return saved;
+}
+function identifyDestination() {
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init) => String(url) === 'https://api.github.com/repos/destination/backup' ? ok({ id: 77, owner: { login: 'destination' }, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' }) : base(url, init);
+}
+
+test('batch upload reuses the bound renamed repository and branch without creating another', async () => {
+  await reloadProject(boundProject()); identifyDestination();
+  (globalThis as any).confirm = () => false;
+  await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量上传至私人仓库'); await click('开始批量上传');
+  await waitFor(() => document.body.textContent?.includes('成功') === true);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'release');
+  assert.equal(saved.remoteSnapshot.commitSha, 'uploaded');
+  assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+});
+
+test('single re-upload locks the chosen name and reuses the exact bound branch without creating a repo', async () => {
+  await reloadProject(boundProject()); identifyDestination();
+  await enterWorkbench(); await click('分叉与私有仓');
+  const name = [...document.querySelectorAll<HTMLInputElement>('input')].find(field => field.value === 'backup')!;
+  assert.equal(name.readOnly, true);
+  await click('更新已绑定仓库（保留历史）');
+  // Submitting through the button triggers the form's default action in jsdom.
+  await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'release');
+  assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
+  assert.ok(alerts.some(message => message.includes('完整上传')));
+});
+
+test('rename button changes the existing repository and rewrites historical links while keeping source identity', async () => {
+  const saved = boundProject();
+  saved.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', sourceSha: 'v2', commitSha: 'previous', htmlUrl: 'old' };
+  saved.backups[0].remoteSnapshot = { ...saved.remoteSnapshot, sourceSha: 'v1', commitSha: 'old-target' };
+  await reloadProject(saved); identifyDestination();
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'PATCH' && String(url).endsWith('/repos/destination/backup')) return ok({ id: 77, owner: { login: 'destination' }, name: 'renamed', html_url: 'https://github.com/destination/renamed' });
+    return base(url, init);
+  };
+  (globalThis as any).prompt = () => 'renamed';
+  await enterWorkbench(); await click('分叉与私有仓'); await click('修改项目名称');
+  await waitFor(() => alerts.length > 0);
+  const renamed = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(renamed.uploadTarget.repo, 'renamed'); assert.equal(renamed.repo, 'project');
+  assert.equal(renamed.backups[0].remoteSnapshot.repo, 'renamed'); assert.equal(renamed.backups[0].remoteSnapshot.commitSha, 'old-target');
+});
+
+test('restoring a version creates a new target commit with old bytes and retains current source/cache', async () => {
+  await reloadProject(boundProject()); identifyDestination();
+  await enterWorkbench(); await click('版本归档库 (1)'); await click('恢复此版本');
+  await waitFor(() => alerts.length > 0);
+  assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.latestCommitSha, 'v2'); assert.equal(saved.remoteSnapshot.sourceSha, 'v1');
+  assert.equal(saved.remoteSnapshot.commitSha, 'uploaded');
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.ok(requests.some(r => r.path.endsWith('/git/commits') && r.payload.parents[0] === 'parent'));
+});
+
+test('upload after a restore archives the restored manifest with its matching source version', async () => {
+  const saved = boundProject();
+  saved.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', sourceSha: 'v1', commitSha: 'restored-old', htmlUrl: 'old' };
+  await reloadProject(saved); identifyDestination();
+  await enterWorkbench(); await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
+  await waitFor(() => alerts.length > 0);
+  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const archived = updated.backups.find((item: any) => item.remoteSnapshot?.commitSha === 'restored-old');
+  assert.equal(archived.commitSha, 'v1'); assert.equal(archived.tree[0].sha, sha('old'));
+  assert.equal(updated.latestCommitSha, 'v2'); assert.equal(updated.remoteSnapshot.sourceSha, 'v2');
+});
+
+test('current-branch copy saves exact downloaded version and adds a separate managed project', async () => {
+  identifyDestination(); const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => String(url).endsWith('/user') ? ok({ login: 'destination' }) : base(url, init);
+  // Use an existing private destination chosen explicitly for this test.
+  const second = globalThis.fetch;
+  globalThis.fetch = async (url, init) => String(url) === 'https://api.github.com/repos/destination/backup' ? ok({ id: 77, private: true, owner: { login: 'destination' }, name: 'backup', default_branch: 'release', html_url: 'https://github.com/destination/backup' }) : second(url, init);
+  await enterWorkbench(); await click('分叉与私有仓'); await click('板块二：创建分叉与上游同步');
+  await input('project', 'backup');
+  await click('保存当前分支并加入我的项目');
+  await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const managed = saved.find((item: any) => item.origin);
+  assert.ok(managed, alerts.join(' ')); assert.equal(saved.length, 2);
+  assert.equal(managed.origin.branch, 'develop'); assert.equal(managed.uploadTarget.repo, 'backup');
+  assert.equal(managed.remoteSnapshot.sourceSha, 'v2'); assert.ok(uploadedContents.includes('new'));
+  assert.ok(!requests.some(r => r.path.endsWith('/forks')));
+});
+
+test('complete Fork uses original repository, verifies all branches, and adds it without downloading source files', async () => {
+  let created = false;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    const payload = init.body ? JSON.parse(init.body as string) : undefined; requests.push({ path, payload });
+    if (path === '/user') return ok({ login: 'me' });
+    if (path === '/repos/source/project') return ok({ id: 42, default_branch: 'develop' });
+    if (path.startsWith('/repos/source/project/branches?')) return ok([{ name: 'develop' }, { name: 'other' }]);
+    if (path === '/repos/source/project/forks') { created = true; return ok({ id: 77, owner: { login: 'me' }, name: 'project' }); }
+    if (path === '/repos/me/project') return created ? ok({ id: 77, name: 'project', fork: true, parent: { id: 42 }, owner: { login: 'me' }, default_branch: 'develop', html_url: 'https://github.com/me/project' }) : ok({ message: 'Not Found' }, 404);
+    if (path.startsWith('/repos/me/project/branches?')) return ok([{ name: 'develop' }, { name: 'other' }]);
+    if (path.includes('/repos/me/project/commits/')) return ok({ sha: 'fork-head', commit: { tree: { sha: 'fork-tree' }, message: 'fork', author: { name: 'author', date: '2026-10-15' } } });
+    if (path.includes('/git/trees/fork-tree')) return ok({ tree: [entry('new')] });
+    throw new Error(path);
+  };
+  await enterWorkbench(); await click('分叉与私有仓'); await click('板块二：创建分叉与上游同步');
+  const select = [...document.querySelectorAll('select')].find(item => [...item.options].some(option => option.value === 'full'))!;
+  await act(async () => { select.value = 'full'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+  await click('完整分叉并加入我的项目'); await waitFor(() => alerts.length > 0);
+  const records = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const managed = records.find((item: any) => item.forkScope === 'full');
+  assert.ok(managed, alerts.join(' ')); assert.equal(managed.owner, 'me'); assert.equal(managed.forkTarget.branches.length, 2);
+  assert.equal(managed.isCachePurged, true); assert.equal(managed.origin.url, 'https://github.com/source/project');
+  assert.ok(!requests.some(r => r.path.includes('/git/blobs/')));
+});

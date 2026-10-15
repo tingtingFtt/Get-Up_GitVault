@@ -267,3 +267,127 @@ test('same-head non-fast-forward errors remain actionable and never force a retr
   await assert.rejects(() => githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync'), /非快进更新.*源码已保留/);
   assert.equal(calls.filter(c => c.init.method === 'PATCH').length, 1);
 });
+
+test('snapshot updates append to the newest target parent without force when destination changes', async () => {
+  destination(); const base = handler;
+  let writes = 0;
+  handler = (path, init) => {
+    if (path.endsWith('/git/ref/heads/release')) return response({ object: { sha: writes ? 'new-commit' : calls.filter(c => c.path.endsWith('/git/ref/heads/release')).length > 1 ? 'concurrent' : 'parent' } });
+    if (path.endsWith('/git/commits/concurrent')) return response({ tree: { sha: 'old-tree' } });
+    if (init.method === 'PATCH') writes++;
+    return base(path, init);
+  };
+  const result = await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync', undefined, undefined, undefined, { rebaseOnConflict: true });
+  assert.equal(result.verified, true);
+  const commits = calls.filter(c => c.path.endsWith('/git/commits') && c.init.method === 'POST').map(c => JSON.parse(c.init.body as string));
+  assert.deepEqual(commits.map(c => c.parents), [['parent'], ['concurrent']]);
+  assert.ok(calls.filter(c => c.init.method === 'PATCH').every(c => JSON.parse(c.init.body as string).force === false));
+});
+
+test('upload refuses a different repository with the same name', async () => {
+  destination();
+  await assert.rejects(() => githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync', undefined, undefined, undefined, { expectedRepoId: 99 }), /身份校验失败/);
+  assert.ok(!calls.some(c => c.init.method === 'POST'));
+});
+
+test('rename keeps immutable repository ID and only sends an explicit name update', async () => {
+  handler = (path, init) => init.method === 'PATCH' ? response({ id: 77, owner: { login: 'me' }, name: 'new-name', html_url: 'https://github.com/me/new-name' }) : response({ id: 77, owner: { login: 'me' }, name: 'backup', default_branch: 'release' });
+  const result = await githubClient.renameRepository({ id: 77, owner: 'me', repo: 'backup' }, 'new-name', 'token');
+  assert.equal(result.id, 77); assert.equal(result.repo, 'new-name');
+  const writes = calls.filter(c => c.init.method === 'PATCH');
+  assert.equal(writes.length, 1); assert.deepEqual(JSON.parse(writes[0].init.body as string), { name: 'new-name' });
+  assert.ok(!calls.some(c => c.init.method === 'POST'));
+});
+
+test('complete Fork requests all branches and only succeeds after verifying its source and branches', async () => {
+  let created = false;
+  handler = (path, init) => {
+    if (path === '/user') return response({ login: 'me' });
+    if (path === '/repos/author/template') return response({ id: 42, default_branch: 'main' });
+    if (path.startsWith('/repos/author/template/branches?')) return response([{ name: 'main' }, { name: 'feature/demo' }]);
+    if (path.endsWith('/forks')) { created = true; return response({ id: 77, owner: { login: 'me' }, name: 'my-template' }); }
+    if (path === '/repos/me/my-template') return created ? response({ id: 77, fork: true, parent: { id: 42 }, owner: { login: 'me' }, name: 'my-template', default_branch: 'main', html_url: 'https://github.com/me/my-template', full_name: 'me/my-template' }) : response({ message: 'Not Found' }, 404);
+    if (path.startsWith('/repos/me/my-template/branches?')) return response([{ name: 'main' }, { name: 'feature/demo' }]);
+    throw new Error(path);
+  };
+  const result = await githubClient.createFork('https://github.com/author/template/tree/feature/demo', 'token', 'my-template');
+  assert.equal(result.verified, true); assert.equal(result.branches.length, 2);
+  assert.equal(JSON.parse(calls.find(c => c.path.endsWith('/forks'))!.init.body as string).default_branch_only, false);
+});
+
+test('complete Fork can associate an existing matching Fork without creating another', async () => {
+  handler = path => {
+    if (path === '/user') return response({ login: 'me' });
+    if (path === '/repos/author/template') return response({ id: 42, default_branch: 'main' });
+    if (path.includes('/branches?')) return response([{ name: 'main' }]);
+    if (path === '/repos/me/mine') return response({ id: 77, name: 'mine', fork: true, owner: { login: 'me' }, parent: { id: 42 }, default_branch: 'main', html_url: 'https://github.com/me/mine' });
+    throw new Error(path);
+  };
+  const result = await githubClient.createFork('author/template', 'token', 'mine');
+  assert.equal(result.id, 77); assert.ok(!calls.some(c => c.init.method === 'POST'));
+});
+
+test('history requests the bound repository ID, slash branch and selected page without stale caching', async () => {
+  handler = (path) => path === '/repos/me/mine' ? response({ id: 77, owner: { login: 'me' }, name: 'mine', default_branch: 'main' }) : response([{ sha: 'old', commit: { message: 'previous', author: { name: 'author', date: 'yesterday' } }, html_url: 'https://github.com/me/mine/commit/old' }]);
+  const history = await githubClient.listHistory({ id: 77, owner: 'me', repo: 'mine', branch: 'feature/demo' }, 'token', 2);
+  assert.equal(history[0].sha, 'old');
+  assert.ok(calls.some(c => c.path.endsWith('/commits?sha=feature%2Fdemo&per_page=30&page=2') && c.init.cache === 'no-store'));
+});
+
+test('complete Fork fills a missing branch without overwriting an existing branch', async () => {
+  let added = false;
+  handler = (path, init) => {
+    if (path === '/user') return response({ login: 'me' });
+    if (path === '/repos/author/template') return response({ id: 42, default_branch: 'main' });
+    if (path.startsWith('/repos/author/template/branches?')) return response([{ name: 'main' }, { name: 'feature/demo' }]);
+    if (path === '/repos/me/mine') return response({ id: 77, name: 'mine', fork: true, owner: { login: 'me' }, parent: { id: 42 }, default_branch: 'main', html_url: 'https://github.com/me/mine' });
+    if (path.startsWith('/repos/me/mine/branches?')) return response(added ? [{ name: 'main' }, { name: 'feature/demo' }] : [{ name: 'main' }]);
+    if (path.endsWith('/commits/feature%2Fdemo')) return response({ sha: 'feature-head' });
+    if (path === '/repos/me/mine/git/refs') { assert.deepEqual(JSON.parse(init.body as string), { ref: 'refs/heads/feature/demo', sha: 'feature-head' }); added = true; return response({}); }
+    throw new Error(path);
+  };
+  const result = await githubClient.createFork('author/template', 'token', 'mine');
+  assert.equal(result.branches.length, 2); assert.ok(!calls.some(c => c.init.method === 'PATCH' || c.path.endsWith('/forks')));
+});
+
+test('complete Fork refuses an unrelated existing repository without writing to it', async () => {
+  handler = path => {
+    if (path === '/user') return response({ login: 'me' });
+    if (path === '/repos/author/template') return response({ id: 42, default_branch: 'main' });
+    if (path.includes('/branches?')) return response([{ name: 'main' }]);
+    return response({ id: 77, name: 'mine', fork: false });
+  };
+  await assert.rejects(() => githubClient.createFork('author/template', 'token', 'mine'), /名称已被其他仓库占用/);
+  assert.ok(!calls.some(c => ['POST', 'PATCH'].includes(c.init.method || '')));
+});
+
+test('all-branch synchronization replaces file snapshots and appends target history for every upstream branch', async () => {
+  const heads: Record<string, string> = { main: 'old-main', 'feature/demo': 'old-feature' };
+  let commitIndex = 0;
+  handler = (path, init) => {
+    if (path === '/repos/me/mine') return response({ id: 77, fork: true, parent: { owner: { login: 'author' }, name: 'template' } });
+    if (path === '/repos/author/template') return response({ default_branch: 'main' });
+    if (path.includes('/branches?')) return response([{ name: 'main' }, { name: 'feature/demo' }]);
+    if (path.startsWith('/repos/author/template/commits/')) return response({ sha: 'upstream-' + path.split('/').pop(), commit: { tree: { sha: 'source-tree' }, message: 'upstream', author: {} } });
+    if (path.includes('/author/template/git/trees/')) return response({ tree: [{ path: 'a.txt', type: 'blob', mode: '100644', sha: sha('new'), size: 3 }] });
+    if (path.includes('/author/template/git/blobs/')) return response({ encoding: 'base64', content: Buffer.from('new').toString('base64') });
+    if (path.includes('/git/ref/heads/')) return response({ object: { sha: heads[decodeURIComponent(path.split('/heads/')[1])] } });
+    if (path.includes('/git/commits/')) return response({ tree: { sha: path.includes('/old-') ? 'old-tree' : 'new-tree' } });
+    if (path.includes('/git/trees/old-tree')) return response({ tree: [{ path: 'deleted.txt', type: 'blob', mode: '100644', sha: sha('remove') }] });
+    if (path.endsWith('/git/blobs')) return response({ sha: sha('new') });
+    if (path.endsWith('/git/trees')) {
+      const payload = JSON.parse(init.body as string); assert.equal(payload.base_tree, undefined); assert.deepEqual(payload.tree.map((f: any) => f.path), ['a.txt']);
+      return response({ sha: 'new-tree' });
+    }
+    if (path.endsWith('/git/commits')) return response({ sha: `saved-${++commitIndex}` });
+    if (path.includes('/git/refs/heads/')) {
+      const payload = JSON.parse(init.body as string); assert.equal(payload.force, false); heads[decodeURIComponent(path.split('/heads/')[1])] = payload.sha; return response({});
+    }
+    throw new Error(path);
+  };
+  const results = await githubClient.syncAllForkBranches('me', 'mine', 'token');
+  assert.deepEqual(results.map(r => r.success), [true, true]);
+  assert.ok(results.every(r => r.sourceSha && r.commitSha));
+  const parents = calls.filter(c => c.path.endsWith('/git/commits') && c.init.method === 'POST').map(c => JSON.parse(c.init.body as string).parents);
+  assert.deepEqual(parents, [['old-main'], ['old-feature']]);
+});

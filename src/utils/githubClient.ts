@@ -253,6 +253,36 @@ export const githubClient = {
     return { hasUpdate: commit.sha !== currentSha, latestSha: commit.sha, latestCommit: { sha: commit.sha, message: commit.commit.message, author: commit.commit.author?.name, date: commit.commit.author?.date } };
   },
 
+  async repository(owner: string, repo: string, token?: string, expectedId?: number) {
+    const meta = await json(root(owner, repo), token, { cache: 'no-store' });
+    if (expectedId && meta.id !== expectedId) throw new Error('目标仓库身份已变化，已停止操作，请检查绑定，避免写入同名的新仓库');
+    return { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private };
+  },
+
+  async renameRepository(target: { id?: number; owner: string; repo: string }, name: string, token: string) {
+    const requested = name.trim();
+    if (!/^[a-zA-Z0-9._-]+$/.test(requested)) throw new Error('仓库名称只能包含英文、数字、点、下划线和连字符');
+    const before = await githubClient.repository(target.owner, target.repo, token, target.id);
+    const meta = await json(root(before.owner, before.repo), token, body('PATCH', { name: requested }));
+    if (before.id && meta.id !== before.id) throw new Error('重命名后的仓库身份校验失败，未更新本地绑定');
+    return { id: meta.id as number | undefined, owner: meta.owner?.login || before.owner, repo: meta.name as string, htmlUrl: meta.html_url as string };
+  },
+
+  async inspectRepo(url: string, branch: string | undefined, token?: string, ref?: string) {
+    const { owner, repo, linkedRef } = parseRepository(url);
+    const meta = await json(root(owner, repo), token, { cache: 'no-store' });
+    const selected = ref || await resolveRef(owner, repo, linkedRef, branch, token) || meta.default_branch;
+    const commit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(selected)}`, token, { cache: 'no-store' });
+    const tree = await getTree(owner, repo, commit.commit.tree.sha, token);
+    return { owner, repo, branch: branch || meta.default_branch, latestCommitSha: commit.sha as string, commitMessage: commit.commit.message as string, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date || new Date().toISOString(), tree, repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url } };
+  },
+
+  async listHistory(target: { id?: number; owner: string; repo: string; branch: string }, token: string, page = 1) {
+    const identity = await githubClient.repository(target.owner, target.repo, token, target.id);
+    const entries = await json(`${root(identity.owner, identity.repo)}/commits?sha=${encodeURIComponent(target.branch)}&per_page=30&page=${page}`, token, { cache: 'no-store' });
+    return entries.map((item: any) => ({ sha: item.sha as string, message: item.commit.message as string, author: item.commit.author?.name || 'Unknown', date: item.commit.author?.date || '', htmlUrl: item.html_url as string }));
+  },
+
   async ensurePrivateRepo(token: string, repoName: string, description?: string, remark?: string) {
     const user = await json('/user', token);
     const name = repoName.trim().replace(/[^a-zA-Z0-9._-]/g, '-').replace(/^-+|-+$/g, '');
@@ -261,16 +291,17 @@ export const githubClient = {
     try {
       const existing = await json(root(user.login, name), token);
       if (!existing.private) throw new Error('目标仓库已存在且为公开仓库，请选择其他名称或使用指定仓库上传');
-      return { owner: user.login, repo: existing.name, defaultBranch: existing.default_branch, htmlUrl: existing.html_url, alreadyExisted: true };
+      return { id: existing.id as number | undefined, owner: user.login, repo: existing.name, defaultBranch: existing.default_branch, htmlUrl: existing.html_url, alreadyExisted: true };
     } catch (error) { if (!(error instanceof GitHubError) || error.status !== 404) throw error; }
     const created = await json('/user/repos', token, body('POST', { name, description: composed, private: true, auto_init: true }));
-    return { owner: user.login, repo: created.name, defaultBranch: created.default_branch || 'main', htmlUrl: created.html_url, alreadyExisted: false };
+    return { id: created.id as number | undefined, owner: user.login, repo: created.name, defaultBranch: created.default_branch || 'main', htmlUrl: created.html_url, alreadyExisted: false };
   },
 
-  async push(targetOwner: string, targetRepo: string, targetBranch: string, token: string, files: CachedFile[], commitMessage: string, description?: string, remark?: string, originalSourceUrl?: string) {
+  async push(targetOwner: string, targetRepo: string, targetBranch: string, token: string, files: CachedFile[], commitMessage: string, description?: string, remark?: string, originalSourceUrl?: string, options: { rebaseOnConflict?: boolean; expectedRepoId?: number } = {}) {
     const signal = operation.signal;
     const base = root(targetOwner, targetRepo);
     const meta = await json(base, token);
+    if (options.expectedRepoId && meta.id !== options.expectedRepoId) throw new Error('目标仓库身份校验失败，上传已停止');
     const branch = targetBranch || meta.default_branch || 'main';
     const refUrl = `${base}/git/ref/heads/${refPath(branch)}`;
     const readHead = async () => (await json(refUrl, token, { cache: 'no-store' }, signal)).object.sha as string;
@@ -316,45 +347,43 @@ export const githubClient = {
       // Git's well-known empty tree supports legitimate empty source commits.
       treeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
     }
-    const commit = parent && parentTree === treeSha ? { sha: parent } : await json(`${base}/git/commits`, token, body('POST', { message: commitMessage || 'Sync complete project snapshot via GitVault', tree: treeSha, parents: parent ? [parent] : [] }));
-    signal.throwIfAborted();
-    if (parent) {
-      const current = await readHead();
-      if (current !== parent && current !== commit.sha) throw conflict(current);
-      // Identical snapshots are already present. Do not update a ref to its own SHA.
-      if (current !== commit.sha) {
-        try {
-          await json(`${base}/git/refs/heads/${refPath(branch)}`, token, body('PATCH', { sha: commit.sha, force: false }), signal);
-        } catch (error) {
-          signal.throwIfAborted();
-          if (error instanceof GitHubError && error.status < 500 && ![409, 422].includes(error.status)) throw error;
-          let actual: string;
-          try { actual = await readHead(); } catch { throw error; }
-          // A successful write can lose its HTTP response. Verify it instead of repeating the mutation.
-          if (actual !== commit.sha) {
-            if (actual !== parent) throw conflict(actual);
-            if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) {
-              throw new Error(`目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`);
-            }
-            throw error;
-          }
-        }
-      }
-    } else {
-      try { await json(`${base}/git/refs`, token, body('POST', { ref: `refs/heads/${branch}`, sha: commit.sha }), signal); }
-      catch (error) {
+    let expectedParent = parent;
+    for (let attempt = 0; attempt < (options.rebaseOnConflict ? 3 : 1); attempt++) {
+      signal.throwIfAborted();
+      const commit = expectedParent && parentTree === treeSha ? { sha: expectedParent } : await json(`${base}/git/commits`, token, body('POST', { message: commitMessage || 'Sync complete project snapshot via GitVault', tree: treeSha, parents: expectedParent ? [expectedParent] : [] }), signal);
+      let moved = '';
+      try {
+        if (expectedParent) {
+          const current = await readHead();
+          if (current !== expectedParent && current !== commit.sha) moved = current;
+          else if (current !== commit.sha) await json(`${base}/git/refs/heads/${refPath(branch)}`, token, body('PATCH', { sha: commit.sha, force: false }), signal);
+        } else await json(`${base}/git/refs`, token, body('POST', { ref: `refs/heads/${branch}`, sha: commit.sha }), signal);
+      } catch (error) {
         signal.throwIfAborted();
         if (error instanceof GitHubError && error.status < 500 && ![409, 422].includes(error.status)) throw error;
         let actual: string;
         try { actual = await readHead(); } catch { throw error; }
-        if (actual !== commit.sha) throw conflict(actual);
+        if (actual !== commit.sha) {
+          if (actual !== expectedParent) moved = actual;
+          else if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) throw new Error(`目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`);
+          else throw error;
+        }
       }
+      if (!moved) {
+        progress('正在验证目标提交和分支…');
+        const verifiedHead = await readHead();
+        const verifiedCommit = await json(`${base}/git/commits/${commit.sha}`, token, {}, signal);
+        if (verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
+        if (verifiedHead === commit.sha) return { success: true, verified: true, repoId: meta.id as number | undefined, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
+        // Do not replay after our commit landed and another writer subsequently changed it.
+        throw new Error('上传后的分支已被其他提交修改，验证未通过；本地文件已保留，请重新检查');
+      }
+      if (!options.rebaseOnConflict || attempt === 2) throw conflict(moved);
+      expectedParent = moved;
+      parentTree = (await json(`${base}/git/commits/${moved}`, token, {}, signal)).tree.sha;
+      progress('目标分支出现新提交，正在接续最新历史创建覆盖更新…');
     }
-    progress('正在验证目标提交和分支…');
-    const verifiedHead = await readHead();
-    const verifiedCommit = await json(`${base}/git/commits/${commit.sha}`, token);
-    if (verifiedHead !== commit.sha || verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
-    return { success: true, verified: true, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
+    throw new Error('目标分支持续变化，已停止重试并保留本地文件');
   },
 
   async fetchBranches(url: string, token?: string, signal?: AbortSignal): Promise<string[]> {
@@ -385,8 +414,66 @@ export const githubClient = {
 
   async createFork(url: string, token: string, newRepoName?: string) {
     const { owner, repo } = parseRepository(url);
-    const fork = await json(`${root(owner, repo)}/forks`, token, body('POST', newRepoName?.trim() ? { name: newRepoName.trim() } : {}));
-    return { owner: fork.owner.login, repo: fork.name, htmlUrl: fork.html_url, defaultBranch: fork.default_branch || 'main', full_name: fork.full_name };
+    const source = await json(root(owner, repo), token);
+    const user = await json('/user', token);
+    if (owner.toLowerCase() === user.login.toLowerCase()) throw new Error('不能在同一个账号下 Fork 自己的仓库，请使用“当前分支独立副本”或指定其他账号');
+    const branches = await githubClient.fetchBranches(`${owner}/${repo}`, token, operation.signal);
+    const requestedName = newRepoName?.trim() || repo;
+    let fork: any;
+    try {
+      fork = await json(root(user.login, requestedName), token, { cache: 'no-store' });
+      if (!fork.fork || fork.parent?.id !== source.id) throw new Error('目标名称已被其他仓库占用，请更换名称；未修改已有仓库');
+    } catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 404) throw error;
+      fork = await json(`${root(owner, repo)}/forks`, token, body('POST', { name: requestedName, default_branch_only: false }));
+    }
+    const forkOwner = fork.owner.login;
+    const forkName = fork.name;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      operation.signal.throwIfAborted();
+      progress(`正在验证完整分叉的 ${branches.length} 个分支（${attempt + 1}/30）…`);
+      try {
+        const current = await json(root(forkOwner, forkName), token, { cache: 'no-store' });
+        if (!current.fork || current.parent?.id !== source.id) throw new Error('分叉来源身份校验失败');
+        let found = await githubClient.fetchBranches(`${forkOwner}/${forkName}`, token, operation.signal);
+        for (const missing of branches.filter(branch => !found.includes(branch))) {
+          const sourceCommit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(missing)}`, token);
+          try { await json(`${root(forkOwner, forkName)}/git/refs`, token, body('POST', { ref: `refs/heads/${missing}`, sha: sourceCommit.sha })); }
+          catch (error) { if (!(error instanceof GitHubError) || ![404, 409, 422].includes(error.status)) throw error; }
+        }
+        if (!branches.every(branch => found.includes(branch))) found = await githubClient.fetchBranches(`${forkOwner}/${forkName}`, token, operation.signal);
+        if (branches.every(branch => found.includes(branch))) return { id: current.id as number, owner: forkOwner, repo: forkName, htmlUrl: current.html_url as string, defaultBranch: source.default_branch as string, branches: found, full_name: current.full_name as string, verified: true };
+      } catch (error) {
+        if (!(error instanceof GitHubError) || ![404, 409].includes(error.status)) throw error;
+      }
+      await new Promise<void>((resolve, reject) => {
+        const signal = operation.signal;
+        const abort = () => { clearTimeout(timer); reject(signal.reason); };
+        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, 2000);
+        signal.addEventListener('abort', abort, { once: true });
+      });
+    }
+    throw new Error(`分叉仍在创建或缺少分支，请稍后重试以关联已有 Fork：https://github.com/${forkOwner}/${forkName}`);
+  },
+
+  async syncAllForkBranches(owner: string, repo: string, token: string) {
+    const meta = await json(root(owner, repo), token);
+    if (!meta.fork || !meta.parent) throw new Error('目标不是 Fork');
+    const sourceOwner = meta.parent.owner.login;
+    const sourceRepo = meta.parent.name;
+    const branches = await githubClient.fetchBranches(`${sourceOwner}/${sourceRepo}`, token, operation.signal);
+    const results: Array<{ branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string }> = [];
+    for (const branch of branches) {
+      operation.signal.throwIfAborted();
+      progress(`正在同步分支 ${branch}（${results.length + 1}/${branches.length}）…`);
+      try {
+        const snapshot = await githubClient.fetchRepo(`${sourceOwner}/${sourceRepo}`, branch, token);
+        const uploaded = await githubClient.push(owner, repo, branch, token, snapshot.files, `Sync upstream ${sourceOwner}/${sourceRepo}:${branch} @ ${snapshot.latestCommitSha}`, undefined, undefined, undefined, { rebaseOnConflict: true, expectedRepoId: meta.id });
+        if (typeof indexedDB !== 'undefined') await transferCache.clear(snapshot.latestCommitSha);
+        results.push({ branch, success: true, sourceSha: snapshot.latestCommitSha, commitSha: uploaded.commitSha });
+      } catch (error) { results.push({ branch, success: false, error: (error as Error).message }); }
+    }
+    return results;
   },
 
   async syncFork(owner: string, repo: string, branch: string, token: string) {
