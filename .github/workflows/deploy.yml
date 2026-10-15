@@ -15,8 +15,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -33,22 +34,25 @@ jobs:
       - name: Install compatible dependencies
         run: |
           npm install --save-dev --save-exact esbuild@0.28.2
-          npm install react-is
+          npm install react-is@19
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
       - name: Build
-        run: npm run build
+        run: npm run build -- --base=/Get-Up_GitVault/
 
       - name: Check build output
         run: test -f dist/index.html
+
+      - name: Disable Jekyll
+        run: touch dist/.nojekyll
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./dist
 
-      - name: Deployment
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
