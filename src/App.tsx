@@ -16,7 +16,8 @@ const RepoHeatmap = React.lazy(() => import('./components/RepoHeatmap'));
 import { localCache, transferCache, CachedFile } from './utils/localCache';
 import { githubClient, beginGithubOperation, cancelGithubOperation, operationSignal, parseRepository, gitBlobSha } from './utils/githubClient';
 import { safeFetchJson } from './utils/api';
-import { sourceOf, savedSnapshot, archiveVersion, renamedProject } from './utils/projectModel';
+import { sourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
+import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 
 interface RepoTreeItem {
@@ -30,6 +31,8 @@ interface RepoTreeItem {
 interface TrackedRepo {
   remoteSnapshot?: RemoteSnapshot;
   uploadTarget?: UploadTarget;
+  branchTargets?: Record<string, UploadTarget>;
+  branchUploadPending?: boolean;
   origin?: ProjectSource;
   savedCopies?: RemoteSnapshot[];
   forkScope?: 'current' | 'full';
@@ -128,8 +131,8 @@ function formatFileSize(bytes?: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
-function publicProjectRecord({ token, uploadTarget, ...repo }: TrackedRepo) {
-  return { ...repo, uploadTarget: uploadTarget ? { ...uploadTarget, token: undefined } : undefined };
+function publicProjectRecord({ token, uploadTarget, branchTargets, ...repo }: TrackedRepo) {
+  return { ...repo, uploadTarget: uploadTarget ? { ...uploadTarget, token: undefined } : undefined, branchTargets: branchTargets ? Object.fromEntries(Object.entries(branchTargets).map(([branch, target]) => [branch, { ...target, token: undefined }])) : undefined };
 }
 function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
@@ -237,6 +240,14 @@ export default function App() {
   const [pushCopyMode, setPushCopyMode] = useState(false);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [importMode, setImportMode] = useState<'single' | 'batch'>('single');
+  const [batchLinks, setBatchLinks] = useState('');
+  const [importResults, setImportResults] = useState<ImportLink[]>([]);
+  const [workbenchBranches, setWorkbenchBranches] = useState<string[]>([]);
+  const [workbenchBranchInput, setWorkbenchBranchInput] = useState('');
+  const [workbenchBranchError, setWorkbenchBranchError] = useState('');
+  const [workbenchBranchLoading, setWorkbenchBranchLoading] = useState(false);
+  const workbenchLookup = useRef<AbortController | null>(null);
 
   // Form states for adding repo (Link)
   const [repoUrl, setRepoUrl] = useState('');
@@ -329,7 +340,13 @@ export default function App() {
     window.addEventListener('gitvault-progress', listener);
     return () => window.removeEventListener('gitvault-progress', listener);
   }, []);
-  useEffect(() => { setHistoryPage(1); setHistoryHasMore(true); }, [activeRepoId]);
+  useEffect(() => { setHistoryPage(1); setHistoryHasMore(true); }, [activeRepoId, repos.find(repo => repo.id === activeRepoId)?.branch]);
+  useEffect(() => {
+    workbenchLookup.current?.abort();
+    setWorkbenchBranches([]); setWorkbenchBranchError(''); setWorkbenchBranchLoading(false);
+    setWorkbenchBranchInput(reposRef.current.find(repo => repo.id === activeRepoId)?.branch || '');
+    return () => workbenchLookup.current?.abort();
+  }, [activeRepoId]);
   useEffect(() => { setVisibleFileCount(150); }, [activeRepoId, viewingBackup?.id, fileSearchQuery]);
 
   // Persist a reviewable record before deleting any local source content.
@@ -384,14 +401,17 @@ export default function App() {
     const snapshot: RemoteSnapshot = { repoId: result.repoId, owner: result.owner, repo: result.repo, branch: result.branch, commitSha: result.commitSha, sourceSha, htmlUrl: result.htmlUrl };
     await localCache.saveSyncReceipt(repo.id, sourceSha, snapshot);
     const current = reposRef.current.find(r => r.id === repo.id) || repo;
-    if (version) patchRepo(repo.id, { backups: current.backups.map(b => b.id === version.id ? { ...b, remoteSnapshot: snapshot } : b) });
+    const sourceBranch = version?.branch || sourceOf(repo).branch;
+    const binding: UploadTarget = { ...current.uploadTarget, id: result.repoId || current.uploadTarget?.id, owner: result.owner, repo: result.repo, branch: result.branch, purgeAfterUpload: purge, token: uploadToken || current.uploadTarget?.token };
+    const branchTargets = bindTarget ? { ...current.branchTargets, [sourceBranch]: binding } : current.branchTargets;
+    if (version) patchRepo(repo.id, { branchTargets, backups: current.backups.map(b => b.id === version.id ? { ...b, remoteSnapshot: snapshot } : b) });
     else if (!bindTarget) patchRepo(repo.id, { savedCopies: [snapshot, ...(current.savedCopies || [])] });
     else {
       const previous = current.remoteSnapshot;
       const priorVersion = previous && previous.sourceSha !== current.latestCommitSha ? current.backups.find(item => item.commitSha === previous.sourceSha) : undefined;
       const archived = previous ? archiveVersion(priorVersion ? { ...current, ...priorVersion, latestCommitSha: priorVersion.commitSha, remoteSnapshot: previous } : current) : undefined;
       const backups = previous && previous.commitSha !== snapshot.commitSha && archived ? [archived, ...current.backups] : current.backups;
-      patchRepo(repo.id, { ...extra, backups, remoteSnapshot: snapshot, uploadTarget: { ...current.uploadTarget, id: result.repoId || current.uploadTarget?.id, owner: result.owner, repo: result.repo, branch: result.branch, purgeAfterUpload: purge, token: uploadToken || current.uploadTarget?.token }, lastUploadedToPrivateAt: new Date().toISOString() });
+      patchRepo(repo.id, { ...extra, backups, remoteSnapshot: snapshot, branchTargets, uploadTarget: binding, branchUploadPending: false, lastUploadedToPrivateAt: new Date().toISOString() });
     }
     if (purge) {
       try {
@@ -402,9 +422,10 @@ export default function App() {
     } else if (!version && sourceSha === current.latestCommitSha) patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: (await localCache.getProjectFiles(repo.id, sourceSha)).length });
   };
 
-  const boundTarget = async (repo: TrackedRepo, token: string) => {
-    const stored = repo.uploadTarget;
+  const boundTarget = async (repo: TrackedRepo, token: string, branch = sourceOf(repo).branch) => {
+    const stored = targetForBranch(repo, branch);
     if (stored) {
+      assertBranchTarget(repo, branch, stored);
       const identity = await githubClient.repository(stored.owner, stored.repo, token, stored.id);
       return { ...stored, id: identity.id || stored.id, owner: identity.owner, repo: identity.repo, htmlUrl: identity.htmlUrl, defaultBranch: stored.branch };
     }
@@ -415,9 +436,19 @@ export default function App() {
     }
     return undefined;
   };
-  const pushSnapshot = async (repo: TrackedRepo, files: CachedFile[], token: string, message: string) => {
-    const target = await boundTarget(repo, token);
+  const assertDestinationBranch = (repo: TrackedRepo, destination: { id?: number; owner: string; repo: string; branch: string }, branch = sourceOf(repo).branch) => {
+    for (const item of reposRef.current) {
+      const bindings = { ...item.branchTargets, ...(item.uploadTarget && !item.branchUploadPending ? { [sourceOf(item).branch]: item.uploadTarget } : {}) };
+      for (const [sourceBranch, target] of Object.entries(bindings)) {
+        const sameRepo = destination.id && target.id ? destination.id === target.id : destination.owner.toLowerCase() === target.owner.toLowerCase() && destination.repo.toLowerCase() === target.repo.toLowerCase();
+        if (sameRepo && destination.branch === target.branch && sourceBranch !== branch) throw new Error(`目标分支 ${target.branch} 已绑定来源分支 ${sourceBranch}，不能用 ${branch} 覆盖。请使用对应分支或另存副本到其他仓库。`);
+      }
+    }
+  };
+  const pushSnapshot = async (repo: TrackedRepo, files: CachedFile[], token: string, message: string, branch = sourceOf(repo).branch) => {
+    const target = await boundTarget(repo, token, branch);
     if (!target) throw new Error('请先通过上传入口指定并绑定目标仓库');
+    assertDestinationBranch(repo, target, branch);
     return githubClient.push(target.owner, target.repo, target.branch, token, files, message, repo.forkScope === 'full' ? undefined : repo.description, repo.forkScope === 'full' ? undefined : repo.remark, repo.forkScope === 'full' ? undefined : sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
   };
   const handleRenameTarget = async (repo: TrackedRepo) => {
@@ -880,16 +911,63 @@ export default config;
 
   const activeRepo = repos.find(r => r.id === activeRepoId);
 
+  const handleWorkbenchBranches = async () => {
+    if (!activeRepo) return;
+    workbenchLookup.current?.abort();
+    const controller = new AbortController(); workbenchLookup.current = controller;
+    setWorkbenchBranchLoading(true); setWorkbenchBranchError('');
+    const source = sourceOf(activeRepo);
+    try {
+      const branches = await githubClient.fetchBranches(`${source.owner}/${source.repo}`, activeRepo.token || globalToken, controller.signal);
+      if (controller.signal.aborted) return;
+      setWorkbenchBranches(branches); setWorkbenchBranchInput(source.branch);
+    } catch (error) { if (!controller.signal.aborted) setWorkbenchBranchError((error as Error).message); }
+    finally { if (!controller.signal.aborted) setWorkbenchBranchLoading(false); }
+  };
+  const handleSwitchBranch = async () => {
+    if (!activeRepo || !workbenchBranchInput.trim()) return;
+    const repo = activeRepo; const source = sourceOf(repo); const branch = workbenchBranchInput.trim();
+    if (branch === source.branch) return;
+    workbenchLookup.current?.abort(); setWorkbenchBranchLoading(false);
+    startOperation(); setWorkbenchBranchError(''); fileRequest.current++;
+    try {
+      const auth = repo.uploadTarget?.token || globalToken || repo.token || '';
+      const previousTarget = repo.uploadTarget || (repo.privateRepoUrl ? await boundTarget(repo, auth) : undefined);
+      const branchTargets = { ...repo.branchTargets, ...(previousTarget && !repo.branchUploadPending ? { [source.branch]: previousTarget } : {}) };
+      const nextTarget = targetForBranch({ ...repo, uploadTarget: previousTarget, branchTargets }, branch);
+      const cached = await localCache.getProjectFiles(repo.id, repo.latestCommitSha);
+      const data = await githubClient.fetchRepo(`${source.owner}/${source.repo}`, branch, repo.token || globalToken, { cachedFiles: cached });
+      operationSignal().throwIfAborted();
+      await localCache.saveProjectFiles(repo.id, data.files, data.latestCommitSha);
+      operationSignal().throwIfAborted();
+      const current = reposRef.current.find(item => item.id === repo.id);
+      if (!current || sourceOf(current).branch !== source.branch) throw new Error('项目已改变，请重新选择分支');
+      const old = archiveVersion(repo);
+      patchRepo(repo.id, { branch: data.branch, url: repo.origin ? repo.url : `https://github.com/${source.owner}/${source.repo}`, origin: repo.origin ? { ...repo.origin, branch: data.branch } : undefined,
+        latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree,
+        repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl },
+        backups: [old, ...current.backups.map(item => ({ ...item, branch: item.branch || source.branch }))], branchTargets, uploadTarget: nextTarget, branchUploadPending: !!nextTarget && !Object.hasOwn(branchTargets, data.branch), remoteSnapshot: undefined,
+        forkTarget: repo.forkTarget ? { ...repo.forkTarget, branch: data.branch } : undefined,
+        hasUpdate: false, latestRemoteCommit: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString() });
+      setViewingBackup(null); setSelectedFilePath(null); setFileContent(null); setSelectedBackupIds([]); setFileSearchQuery(''); setVisibleFileCount(150); setMobileFileView('list'); setWorkbenchTab('files');
+      await transferCache.clear(data.latestCommitSha);
+      alert(`已重新拉取并切换到 ${data.branch}，共 ${data.files.length} 个文件。${nextTarget ? `上传目标：${nextTarget.owner}/${nextTarget.repo}:${nextTarget.branch}。` : ''}其他分支的文件和历史记录已保留。`);
+    } catch (error) { setWorkbenchBranchError('切换未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
+  };
+
   // Status check logic
   const checkSingleRepoStatus = async (repoId: string, isBackground = false) => {
     const repo = reposRef.current.find(r => r.id === repoId);
     if (!repo || checkingRepos.current.has(repoId)) return;
-    checkingRepos.current.add(repoId);
     if (operationSignal().aborted && isBackground) return;
+    checkingRepos.current.add(repoId);
     if (!isBackground) { startOperation(); setLoadingText(`正在检测 ${repo.repo} 的更新…`); }
     try {
       const source = sourceOf(repo);
       const data = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, repo.token || globalToken);
+      const current = reposRef.current.find(item => item.id === repoId);
+      if (!current || sourceOf(current).branch !== source.branch) return;
       patchRepo(repo.id, { hasUpdate: data.hasUpdate, latestRemoteCommit: data.latestCommit, lastCheckedAt: new Date().toISOString() });
     } catch (error) {
       patchRepo(repo.id, { lastCheckedAt: new Date().toISOString() });
@@ -907,6 +985,48 @@ export default config;
   };
 
   // Add new repository link: Directly pull project into local memory/storage
+  const handleBatchImport = async (retry = false) => {
+    const items = retry ? importResults.map(item => item.status === 'error' && item.url ? { ...item, status: 'pending' as const, message: undefined } : item) : parseImportLinks(batchLinks);
+    if (!items.length) { setImportResults([]); setErrorMsg('请先填写至少一个仓库链接'); return; }
+    startOperation(); setErrorMsg(''); setImportResults([...items]);
+    const token = tokenInput.trim() || globalToken;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].status !== 'pending') continue;
+      if (operationSignal().aborted) break;
+      items[i] = { ...items[i], status: 'downloading', message: '正在拉取默认分支…' }; setImportResults([...items]);
+      try {
+        const parsed = parseRepository(items[i].url!);
+        const existing = reposRef.current.filter(item => !item.origin && item.owner.toLowerCase() === parsed.owner.toLowerCase() && item.repo.toLowerCase() === parsed.repo.toLowerCase());
+        if (existing.length) {
+          const meta = await githubClient.repository(parsed.owner, parsed.repo, token);
+          if (existing.some(item => item.branch === meta.defaultBranch)) {
+            items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${meta.defaultBranch} 已在项目列表中` }; setImportResults([...items]); continue;
+          }
+        }
+        const data = await githubClient.fetchRepo(items[i].url!, undefined, token);
+        operationSignal().throwIfAborted();
+        const exists = reposRef.current.some(item => { const source = sourceOf(item); return source.owner.toLowerCase() === data.owner.toLowerCase() && source.repo.toLowerCase() === data.repo.toLowerCase() && source.branch === data.branch && !item.origin; });
+        if (exists) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
+        else {
+          const newRepo: TrackedRepo = { ...data, id: `repo-${crypto.randomUUID()}`, url: items[i].url!, token: tokenInput.trim() || undefined, remark: '未备注项目', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length };
+          // Keep file contents in IndexedDB only; never copy them into the project record.
+          const { files, ...record } = newRepo as TrackedRepo & { files?: CachedFile[] };
+          await localCache.saveProjectFiles(record.id, data.files, data.latestCommitSha);
+          operationSignal().throwIfAborted(); persistRepos([record, ...reposRef.current]);
+          if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
+            try { (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${record.repo}`, JSON.stringify({ repo: record.repo, sha: record.latestCommitSha, files: data.files })); }
+            catch { /* Durable browser cache is already saved; native export can be retried separately. */ }
+          }
+          items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件，备注和描述可在项目设置中修改` };
+        }
+        await transferCache.clear(data.latestCommitSha);
+      } catch (error) { items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
+      setImportResults([...items]);
+    }
+    for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'error', message: '操作已取消，尚未导入，可重试' };
+    setImportResults([...items]); setIsLoading(false); setCurrentView('projects');
+  };
+
   const handleAddRepo = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!repoUrl.trim()) return;
@@ -950,9 +1070,12 @@ export default config;
     if (!token) return;
     startOperation(); setIsUploadingToPrivate(true);
     try {
-      const target = await boundTarget(singleUploadTargetRepo, token) || await githubClient.ensurePrivateRepo(token, singleUploadRepoName.trim(), singleUploadDescription.trim(), singleUploadRemark.trim());
+      const existing = await boundTarget(singleUploadTargetRepo, token);
+      const target = existing || await githubClient.ensurePrivateRepo(token, singleUploadRepoName.trim(), singleUploadDescription.trim(), singleUploadRemark.trim());
+      const branch = existing?.branch || sourceOf(singleUploadTargetRepo).branch;
+      assertDestinationBranch(singleUploadTargetRepo, { ...target, branch });
       const files = await versionFiles(singleUploadTargetRepo);
-      const result = await githubClient.push(target.owner, target.repo, target.defaultBranch, token, files, `Sync ${singleUploadTargetRepo.repo} @ ${singleUploadTargetRepo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), sourceOf(singleUploadTargetRepo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
+      const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${singleUploadTargetRepo.repo} @ ${singleUploadTargetRepo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), sourceOf(singleUploadTargetRepo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
       await recordUpload(singleUploadTargetRepo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
       setIsSingleUploadModalOpen(false);
       alert(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
@@ -979,6 +1102,8 @@ export default config;
         remoteSha = manifest.latestCommitSha;
       } else {
         target = await githubClient.ensurePrivateRepo(token, forkRepoName.trim(), sourceProject.description, sourceProject.remark);
+        target.defaultBranch = origin.branch;
+        assertDestinationBranch(sourceProject, { ...target, branch: origin.branch });
         copiedFiles = await versionFiles(sourceProject);
         const uploaded = await githubClient.push(target.owner, target.repo, target.defaultBranch, token, copiedFiles, `Save source branch ${origin.branch} @ ${sourceProject.latestCommitSha}`, sourceProject.description, sourceProject.remark, origin.url, { rebaseOnConflict: true, expectedRepoId: target.id });
         remoteSha = uploaded.commitSha;
@@ -989,7 +1114,7 @@ export default config;
       const previous = reposRef.current.find(item => item.id === id);
       const snapshot: RemoteSnapshot = { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, sourceSha: manifest.latestCommitSha, htmlUrl: `${target.htmlUrl}/tree/${target.defaultBranch}` };
       const managed: TrackedRepo = { ...sourceProject, ...manifest, id, owner: target.owner, repo: target.repo, url: target.htmlUrl, origin: originForCopy, branch: manifest.branch, repoMeta: { ...manifest.repoMeta, htmlUrl: target.htmlUrl },
-        backups: previous?.backups || [], savedCopies: previous?.savedCopies || [], privateRepoUrl: forkScope === 'current' ? target.htmlUrl : undefined,
+        backups: previous?.backups || [], savedCopies: previous?.savedCopies || [], branchTargets: undefined, branchUploadPending: false, privateRepoUrl: forkScope === 'current' ? target.htmlUrl : undefined,
         forkScope, forkTarget: forkScope === 'full' ? { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, htmlUrl: target.htmlUrl, branches: target.branches } : undefined,
         uploadTarget: { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, purgeAfterUpload: singleUploadPurgeCache, token, kind: forkScope }, remoteSnapshot: snapshot,
         isCachePurged: !copiedFiles || singleUploadPurgeCache, cachedFilesCount: copiedFiles && !singleUploadPurgeCache ? copiedFiles.length : 0, lastSyncedAt: new Date().toISOString(), hasUpdate: false };
@@ -1052,18 +1177,28 @@ export default config;
   };
 
   // Traditional Push / Upload to custom target
+  const handleOpenPush = (repo: TrackedRepo, version?: BackupVersion | null) => {
+    const branch = version?.branch || sourceOf(repo).branch;
+    const target = targetForBranch(repo, branch);
+    setPushCopyMode(false); setPushBackupTarget(version || null);
+    setPushTargetRepo(target ? `${target.owner}/${target.repo}` : ''); setPushTargetBranch(target?.branch || branch); setPushToken(''); setIsPushModalOpen(true);
+  };
   const handlePushProjectToGitHub = async (e: React.FormEvent) => {
     e.preventDefault(); if (!activeRepo || !pushTargetRepo.trim()) return;
     const token = pushToken.trim() || activeRepo.uploadTarget?.token || globalToken || activeRepo.token;
     if (!token) return alert('请填写 GitHub Token');
     startOperation();
     try {
-      const target = !pushCopyMode && activeRepo.uploadTarget ? await boundTarget(activeRepo, token) : parseRepository(pushTargetRepo);
-      if (!target) throw new Error('目标仓库未指定');
       const version = pushBackupTarget || viewingBackup || undefined;
+      const sourceBranch = version?.branch || sourceOf(activeRepo).branch;
+      const requested = parseRepository(pushTargetRepo);
+      const target = !pushCopyMode && activeRepo.uploadTarget ? await boundTarget(activeRepo, token, sourceBranch) : await githubClient.repository(requested.owner, requested.repo, token);
+      if (!target) throw new Error('目标仓库未指定');
+      const destinationBranch = !pushCopyMode && activeRepo.uploadTarget ? targetForBranch(activeRepo, sourceBranch)!.branch : pushTargetBranch.trim() || sourceBranch;
+      assertDestinationBranch(activeRepo, { ...target, branch: destinationBranch }, sourceBranch);
       const files = await versionFiles(activeRepo, version);
-      const result = await githubClient.push(target.owner, target.repo, !pushCopyMode && activeRepo.uploadTarget ? activeRepo.uploadTarget.branch : pushTargetBranch.trim(), token, files, pushCommitMsg.trim() || `Sync ${activeRepo.repo} @ ${version?.commitSha || activeRepo.latestCommitSha}`, activeRepo.description, activeRepo.remark, sourceOf(activeRepo).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: !pushCopyMode ? activeRepo.uploadTarget?.id : undefined });
-      await recordUpload(activeRepo, result, purgePushCacheOption, version, {}, token, !pushCopyMode);
+      const result = await githubClient.push(target.owner, target.repo, destinationBranch, token, files, pushCommitMsg.trim() || `Sync ${activeRepo.repo} @ ${version?.commitSha || activeRepo.latestCommitSha}`, activeRepo.description, activeRepo.remark, sourceOf(activeRepo).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: target.id });
+      await recordUpload(activeRepo, result, purgePushCacheOption, version, {}, token, !pushCopyMode && (!!activeRepo.uploadTarget || !version));
       setIsPushModalOpen(false); setPushBackupTarget(null);
       alert(`已验证上传 ${files.length} 个文件。${purgePushCacheOption ? '对应版本源码已清理，快照已保留。' : '对应版本源码已保留。'}`);
     } catch (error) { alert('上传未完成：' + (error as Error).message); }
@@ -1212,10 +1347,13 @@ export default config;
         try {
           status({ status: 'creating' });
           const auth = repo.uploadTarget?.token || token;
-          const target = await boundTarget(repo, auth) || await githubClient.ensurePrivateRepo(auth, repo.repo, repo.description, repo.remark);
+          const existing = await boundTarget(repo, auth);
+          const target = existing || await githubClient.ensurePrivateRepo(auth, repo.repo, repo.description, repo.remark);
+          const branch = existing?.branch || sourceOf(repo).branch;
+          assertDestinationBranch(repo, { ...target, branch });
           status({ status: 'uploading' });
           const files = await versionFiles(repo);
-          const result = await githubClient.push(target.owner, target.repo, target.defaultBranch, auth, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.description, repo.remark, sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
+          const result = await githubClient.push(target.owner, target.repo, branch, auth, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.description, repo.remark, sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
           await recordUpload(repo, result, purge, undefined, { privateRepoUrl: target.htmlUrl }, auth);
           status({ status: 'success', htmlUrl: target.htmlUrl });
         } catch (error) { status({ status: 'error', error: (error as Error).message }); }
@@ -1418,12 +1556,12 @@ export default config;
       if (!target) throw new Error('请先绑定上传目标');
       const entries = await githubClient.listHistory(target, token, historyPage);
       const loaded: BackupVersion[] = [];
-      const known = new Set(activeRepo.backups.map(item => item.remoteSnapshot?.commitSha));
+      const known = new Set(activeRepo.backups.filter(item => item.branch === sourceOf(activeRepo).branch || !item.branch && item.remoteSnapshot?.branch === target.branch).map(item => item.remoteSnapshot?.commitSha));
       for (const entry of entries) {
         operationSignal().throwIfAborted();
         if (known.has(entry.sha)) continue;
         const manifest = await githubClient.inspectRepo(target.htmlUrl, target.branch, token, entry.sha);
-        loaded.push({ id: `git-${entry.sha}`, versionNumber: 0, tag: entry.sha.slice(0, 12), annotation: entry.message.split('\n')[0], commitSha: entry.sha, commitMessage: entry.message, commitAuthor: entry.author, commitDate: entry.date, backedUpAt: entry.date, tree: manifest.tree, isCachePurged: true,
+        loaded.push({ branch: sourceOf(activeRepo).branch, id: `git-${entry.sha}-${target.branch}`, versionNumber: 0, tag: entry.sha.slice(0, 12), annotation: entry.message.split('\n')[0], commitSha: entry.sha, commitMessage: entry.message, commitAuthor: entry.author, commitDate: entry.date, backedUpAt: entry.date, tree: manifest.tree, isCachePurged: true,
           remoteSnapshot: { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.branch, commitSha: entry.sha, sourceSha: entry.sha, htmlUrl: `${target.htmlUrl}/commit/${entry.sha}` } });
       }
       patchRepo(activeRepo.id, { backups: [...activeRepo.backups, ...loaded] });
@@ -1444,16 +1582,17 @@ export default config;
     finally { setIsLoading(false); }
   };
   const handleRestoreVersion = async (version: BackupVersion) => {
-    if (!activeRepo || !confirm('将此历史版本恢复到已绑定的目标分支？会创建新提交，保留之后的全部历史。')) return;
+    if (!activeRepo || !confirm(`将此历史版本恢复到 ${version.branch || sourceOf(activeRepo).branch} 对应的目标分支？会创建新提交，保留之后的全部历史。`)) return;
     const token = activeRepo.uploadTarget?.token || globalToken || activeRepo.token;
     if (!token) return alert('请填写 GitHub Token');
     startOperation();
     try {
       const files = await versionFiles(activeRepo, version);
-      const result = await pushSnapshot(activeRepo, files, token, `Restore historical version ${version.remoteSnapshot?.commitSha || version.commitSha}`);
+      const branch = version.branch || sourceOf(activeRepo).branch;
+      const result = await pushSnapshot(activeRepo, files, token, `Restore historical version ${version.remoteSnapshot?.commitSha || version.commitSha}`, branch);
       const restored = { ...activeRepo, latestCommitSha: version.commitSha, tree: version.tree, commitMessage: version.commitMessage, commitAuthor: version.commitAuthor, commitDate: version.commitDate };
-      await recordUpload(restored, result, false, undefined, {}, token);
-      alert('历史版本已恢复为目标分支的新提交，原有历史全部保留。');
+      await recordUpload(restored, result, false, branch === sourceOf(activeRepo).branch ? undefined : version, {}, token);
+      alert(`历史版本已恢复为目标分支 ${result.branch} 的新提交，原有历史全部保留。`);
     } catch (error) { alert('恢复未完成，本地文件保留：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
@@ -2477,6 +2616,21 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     )}
                   </div>
 
+                  <div className="flex flex-row flex-wrap items-center gap-2 mt-2">
+                    <span className="text-xs text-[#5D6F5A] font-mono">当前分支：{activeRepo.branch}</span>
+                    <button type="button" onClick={() => handleOpenProjectSettings(activeRepo, 'basic')} className="text-xs text-[#5D6F5A] hover:underline">编辑备注与描述</button>
+                  </div>
+                  <div className="flex flex-row flex-wrap items-center gap-2 mt-2">
+                    {workbenchBranches.length ? <select aria-label="工作台分支" value={workbenchBranchInput} onChange={e => setWorkbenchBranchInput(e.target.value)} className="max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#2E2B27]">
+                      {!workbenchBranches.includes(workbenchBranchInput) && <option value={workbenchBranchInput}>{workbenchBranchInput}</option>}
+                      {workbenchBranches.map(branch => <option key={branch} value={branch}>{branch}</option>)}
+                    </select> : <input aria-label="工作台分支" placeholder="输入要切换的分支" value={workbenchBranchInput} onChange={e => setWorkbenchBranchInput(e.target.value)} className="max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#2E2B27]" />}
+                    <button type="button" disabled={workbenchBranchLoading || isLoading} onClick={handleWorkbenchBranches} className="text-xs text-[#5D6F5A] hover:underline disabled:opacity-40">{workbenchBranchLoading ? '获取分支中…' : '获取可切换分支'}</button>
+                    <button type="button" disabled={isLoading || !workbenchBranchInput.trim() || workbenchBranchInput.trim() === activeRepo.branch} onClick={handleSwitchBranch} className="px-3 py-2 bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl text-xs text-[#4D5E4A] disabled:opacity-40">切换并重新拉取</button>
+                  </div>
+                  {activeRepo.uploadTarget && <p className="text-[11px] text-[#7A7367] mt-1 break-all">上传分支：{activeRepo.uploadTarget.owner}/{activeRepo.uploadTarget.repo} · {activeRepo.uploadTarget.branch}</p>}
+                  {workbenchBranchError && <p role="alert" className="text-xs text-[#8C5D54] mt-1 break-words">{workbenchBranchError}</p>}
+
                   {activeRepo.description && (
                     <p className="text-xs text-[#554F45] mt-1.5 leading-relaxed">
                       <span className="font-semibold text-[#474239]">描述: </span>
@@ -2508,7 +2662,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <span>分叉与私有仓</span>
                 </button>
                 <button
-                  onClick={() => { setPushCopyMode(false); setPushBackupTarget(viewingBackup); setPushTargetRepo(activeRepo.uploadTarget ? `${activeRepo.uploadTarget.owner}/${activeRepo.uploadTarget.repo}` : ''); setPushTargetBranch(activeRepo.uploadTarget?.branch || 'main'); setIsPushModalOpen(true); }}
+                  onClick={() => handleOpenPush(activeRepo, viewingBackup)}
                   className="px-3 py-2 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#4D5E4A] rounded-xl text-xs font-semibold border border-[#DCD5CB] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <UploadCloud className="w-3.5 h-3.5 shrink-0" /><span>上传指定仓库</span>
@@ -2846,7 +3000,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                                 )}
                               </div>
                               <p className="text-[11px] text-[#7A7367] font-mono whitespace-nowrap">
-                                SHA: <code>{backup.commitSha.slice(0, 7)}</code> | 归档于: {new Date(backup.backedUpAt).toLocaleString()}
+                                分支: <code>{backup.branch || activeRepo.branch}</code> | SHA: <code>{backup.commitSha.slice(0, 7)}</code> | 归档于: {new Date(backup.backedUpAt).toLocaleString()}
                               </p>
                             </div>
                           </div>
@@ -2876,7 +3030,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                             <button onClick={() => handleDownloadVersion(backup)} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">下载</button>
                             <button onClick={() => { setDiffBackupTarget(backup); setIsDiffModalOpen(true); }} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">对比</button>
                             {activeRepo.uploadTarget && <button onClick={() => handleRestoreVersion(backup)} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">恢复此版本</button>}
-                            <button onClick={() => { setPushCopyMode(true); setPushBackupTarget(backup); setPushTargetRepo(''); setIsPushModalOpen(true); }} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">上传此版本</button>
+                            <button onClick={() => handleOpenPush(activeRepo, backup)} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">上传此版本</button>
                           </div>
                         </div>
                       );
@@ -2916,7 +3070,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
       {/* ================= MODAL 1: ADD / PULL REPO ================= */}
       {isAddModalOpen && (
         <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
-          <div className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl max-w-lg w-full p-6 shadow-xl flex flex-col gap-5">
+          <div className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl max-w-lg w-full p-6 shadow-xl flex flex-col gap-5 max-h-[90vh] overflow-y-auto">
             <div className="flex flex-row items-center justify-between border-b border-[#EDE7DF] pb-4 whitespace-nowrap">
               <h3 className="text-base font-bold font-serif text-[#2B2723] flex flex-row items-center gap-2">
                 <Plus className="w-5 h-5 text-[#8E9F8B] shrink-0" />
@@ -2927,6 +3081,25 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               </button>
             </div>
 
+            <div className="flex flex-row gap-4 border-b border-[#EDE7DF]">
+              <button type="button" onClick={() => { setImportMode('single'); setErrorMsg(''); }} className={`pb-2 text-xs font-semibold border-b-2 ${importMode === 'single' ? 'border-[#8E9F8B] text-[#4D5E4A]' : 'border-transparent text-[#7A7367]'}`}>单个链接</button>
+              <button type="button" onClick={() => { setImportMode('batch'); setErrorMsg(''); }} className={`pb-2 text-xs font-semibold border-b-2 ${importMode === 'batch' ? 'border-[#8E9F8B] text-[#4D5E4A]' : 'border-transparent text-[#7A7367]'}`}>批量导入链接</button>
+            </div>
+            {importMode === 'batch' ? <form onSubmit={e => { e.preventDefault(); void handleBatchImport(); }} className="flex flex-col gap-4">
+              <p className="text-xs text-[#7A7367] leading-relaxed">每行一个仓库链接，也支持空格或逗号分隔。只需填写链接，统一拉取仓库默认主分支（main、master 等）；链接里的分支会忽略。备注和描述稍后可在项目设置中修改。</p>
+              <textarea aria-label="批量仓库链接" required rows={6} value={batchLinks} onChange={e => { setBatchLinks(e.target.value); setImportResults([]); }} placeholder="https://github.com/owner/repo\nowner/another-repo" className="w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              <label className="text-xs text-[#474239]">GitHub Token（可选，留空使用全局设置）<input type="password" aria-label="批量导入 Token" value={tokenInput} onChange={e => setTokenInput(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27]" /></label>
+              {errorMsg && <p role="alert" className="text-xs text-[#8C5D54]">{errorMsg}</p>}
+              {importResults.length > 0 && <div className="max-h-48 overflow-y-auto flex flex-col gap-2">
+                <p role="status" className="text-xs text-[#5D6F5A]">成功 {importResults.filter(item => item.status === 'success').length} · 跳过 {importResults.filter(item => item.status === 'skipped').length} · 失败 {importResults.filter(item => item.status === 'error').length}</p>
+                {importResults.map((item, i) => <div key={i} className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl p-2 text-xs break-all"><span className="font-mono">{item.input}</span><p className={item.status === 'error' ? 'text-[#8C5D54]' : 'text-[#5D6F5A]'}>{item.message || '等待中'}</p></div>)}
+              </div>}
+              <div className="flex flex-row flex-wrap justify-end gap-3 pt-3 border-t border-[#EDE7DF]">
+                <button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs">关闭</button>
+                {importResults.some(item => item.status === 'error' && item.url) && <button type="button" onClick={() => handleBatchImport(true)} className="px-3 py-2 text-xs text-[#5D6F5A]">重试失败链接</button>}
+                <button type="submit" className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold">开始批量导入</button>
+              </div>
+            </form> : (
             <form onSubmit={handleAddRepo} className="flex flex-col gap-4">
               {errorMsg && (
                 <div className="bg-[#B6847A]/15 border border-[#B6847A]/30 text-[#8C5D54] p-3 rounded-xl text-xs flex flex-row items-start gap-2 overflow-hidden max-w-full">
@@ -3056,7 +3229,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 <button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs font-medium whitespace-nowrap shrink-0">取消</button>
                 <button type="submit" className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold shadow-xs whitespace-nowrap shrink-0">确认拉取进入本地</button>
               </div>
-            </form>
+            </form>)}
           </div>
         </div>
       )}
@@ -3112,7 +3285,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   </div>
                   {singleUploadTargetRepo.uploadTarget && <p className="text-xs text-[#5D6F5A]">已绑定：{singleUploadTargetRepo.uploadTarget.owner}/{singleUploadTargetRepo.uploadTarget.repo} · {singleUploadTargetRepo.uploadTarget.branch}</p>}
                   <p className="text-[11px] text-[#7A7367] leading-relaxed">
-                    首次上传创建名为 <code>{singleUploadRepoName}</code> 的私人仓库；绑定后始终更新该仓库和固定分支，每次提交保留历史，名称仅通过“修改项目名称”按钮更改。
+                    首次上传使用名为 <code>{singleUploadRepoName}</code> 的私人仓库并写入当前来源分支；切换分支后上传到对应分支，每次提交保留历史，名称仅通过“修改项目名称”按钮更改。
                   </p>
                 </div>
 
@@ -3318,9 +3491,9 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               <label className="text-xs font-semibold text-[#474239]">目标仓库
                 <input required readOnly={!!activeRepo.uploadTarget && !pushCopyMode} value={pushTargetRepo} onChange={e => setPushTargetRepo(e.target.value)} placeholder="owner/repo" className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
               </label>
-              {activeRepo.uploadTarget && <button type="button" onClick={() => { setPushCopyMode(true); setPushTargetRepo(''); setPushTargetBranch('main'); }} className="text-xs text-[#5D6F5A] hover:underline">另存副本到其他仓库（不改变原绑定）</button>}
+              {activeRepo.uploadTarget && <button type="button" onClick={() => { setPushCopyMode(true); setPushTargetRepo(''); setPushTargetBranch(pushBackupTarget?.branch || sourceOf(activeRepo).branch); }} className="text-xs text-[#5D6F5A] hover:underline">另存副本到其他仓库（不改变原绑定）</button>}
               <label className="text-xs font-semibold text-[#474239]">目标分支
-                <input readOnly={!!activeRepo.uploadTarget && !pushCopyMode} value={pushTargetBranch} onChange={e => setPushTargetBranch(e.target.value)} placeholder="留空使用目标默认分支" className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+                <input readOnly={!!activeRepo.uploadTarget && !pushCopyMode} value={pushTargetBranch} onChange={e => setPushTargetBranch(e.target.value)} placeholder="留空使用当前来源分支" className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
               </label>
               <label className="text-xs font-semibold text-[#474239]">提交说明
                 <input value={pushCommitMsg} onChange={e => setPushCommitMsg(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />

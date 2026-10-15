@@ -34,6 +34,8 @@ beforeEach(async () => {
     requests.push({ path, payload });
     if (path === '/repos/destination/backup') return ok({ default_branch: 'main' });
     if (path === '/repos/destination/backup/git/ref/heads/release') return ok({ object: { sha: !failUpload && requests.some(r => r.path.endsWith('/git/refs/heads/release')) ? 'uploaded' : 'parent' } });
+    if (path === '/repos/destination/backup/git/ref/heads/develop') return requests.some(r => r.payload?.ref === 'refs/heads/develop') ? ok({ object: { sha: 'uploaded' } }) : ok({ message: 'Not Found' }, 404);
+    if (path === '/repos/destination/backup/git/refs') return ok({ object: { sha: 'uploaded' } });
     if (path.endsWith('/git/commits/parent')) return ok({ tree: { sha: 'old-tree' } });
     if (path.includes('/git/trees/old-tree')) return ok({ tree: [] });
     if (path.endsWith('/git/blobs')) { uploadedContents.push(payload.content); return ok({ sha: sha(payload.content) }); }
@@ -82,7 +84,7 @@ async function input(placeholder: string, value: string) {
 async function upload(purge: boolean) {
   await click('上传指定仓库');
   await input('owner/repo', 'destination/backup');
-  await input('留空使用目标默认分支', 'release');
+  await input('留空使用当前来源分支', 'release');
   const checkbox = [...document.querySelectorAll<HTMLInputElement>('input[type=checkbox]')].find(e => e.parentElement?.textContent?.includes('上传验证成功后清理'))!;
   if (purge) await act(async () => checkbox.click());
   const submit = buttons().find(b => b.textContent === '确认上传')!;
@@ -96,7 +98,7 @@ test('historical file view reads its exact version rather than current cache', a
   const row = [...document.querySelectorAll('span')].find(s => s.textContent === 'a.txt')!;
   assert.ok(row);
   await act(async () => { row.parentElement!.dispatchEvent(new MouseEvent('click', { bubbles: true })); await new Promise(r => setTimeout(r, 20)); });
-  assert.ok(document.querySelector('pre')?.textContent?.includes('old'));
+  await waitFor(() => document.querySelector('pre')?.textContent === 'old');
 });
 
 test('verified upload with keep option retains cache and records remote commit', async () => {
@@ -165,7 +167,7 @@ test('updates save new content, retain old version, and upload to the remembered
 
 test('history upload sends old bytes and purges only that selected version', async () => {
   await enterWorkbench(); await click('版本归档库 (1)'); await click('上传此版本');
-  await input('owner/repo', 'destination/backup'); await input('留空使用目标默认分支', 'release');
+  await input('owner/repo', 'destination/backup'); await input('留空使用当前来源分支', 'release');
   const checkbox = [...document.querySelectorAll<HTMLInputElement>('input[type=checkbox]')].find(e => e.parentElement?.textContent?.includes('上传验证成功后清理'))!;
   await act(async () => checkbox.click());
   const submit = buttons().find(b => b.textContent === '确认上传')!;
@@ -360,6 +362,7 @@ test('current-branch copy saves exact downloaded version and adds a separate man
   const managed = saved.find((item: any) => item.origin);
   assert.ok(managed, alerts.join(' ')); assert.equal(saved.length, 2);
   assert.equal(managed.origin.branch, 'develop'); assert.equal(managed.uploadTarget.repo, 'backup');
+  assert.equal(managed.uploadTarget.branch, 'develop');
   assert.equal(managed.remoteSnapshot.sourceSha, 'v2'); assert.ok(uploadedContents.includes('new'));
   assert.ok(!requests.some(r => r.path.endsWith('/forks')));
 });
@@ -388,4 +391,204 @@ test('complete Fork uses original repository, verifies all branches, and adds it
   assert.ok(managed, alerts.join(' ')); assert.equal(managed.owner, 'me'); assert.equal(managed.forkTarget.branches.length, 2);
   assert.equal(managed.isCachePurged, true); assert.equal(managed.origin.url, 'https://github.com/source/project');
   assert.ok(!requests.some(r => r.path.includes('/git/blobs/')));
+});
+
+async function setField(field: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string) {
+  await act(async () => {
+    const proto = field.tagName === 'TEXTAREA' ? dom.window.HTMLTextAreaElement.prototype : field.tagName === 'SELECT' ? dom.window.HTMLSelectElement.prototype : dom.window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(field, value);
+    field.dispatchEvent(new Event('input', { bubbles: true })); field.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+}
+function branchFixtures() {
+  const base = globalThis.fetch; let featureUploaded = false;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    const payload = init.body ? JSON.parse(init.body as string) : null;
+    const respond = (data: unknown, status = 200) => { requests.push({ path, payload }); return ok(data, status); };
+    if (path === '/repos/source/project') return respond({ default_branch: 'develop', html_url: 'https://github.com/source/project' });
+    if (path.startsWith('/repos/source/project/branches?')) return respond([{ name: 'develop' }, { name: 'feature/demo' }, { name: 'release' }]);
+    if (path.startsWith('/repos/source/project/commits/')) {
+      const branch = decodeURIComponent(path.split('/commits/')[1]);
+      if (!['develop', 'feature/demo', 'release'].includes(branch)) return respond({ message: 'missing branch' }, 404);
+      return respond({ sha: branch === 'develop' ? 'v2' : 'feature-v1', commit: { tree: { sha: branch === 'develop' ? 'tree-develop' : 'tree-feature' }, message: branch, author: { name: 'author', date: '2026-10-15' } } });
+    }
+    if (path.includes('/git/trees/tree-')) return respond({ tree: [entry(path.includes('tree-develop') ? 'new' : 'feature content')] });
+    if (path.startsWith('/repos/source/project/git/blobs/')) return respond({ encoding: 'base64', content: Buffer.from(path.endsWith(sha('new')) ? 'new' : 'feature content').toString('base64') });
+    if (path.endsWith('/git/ref/heads/feature/demo')) return featureUploaded ? respond({ object: { sha: 'uploaded' } }) : respond({ message: 'Not Found' }, 404);
+    if (path === '/repos/destination/backup/git/refs') { featureUploaded = true; return respond({ object: { sha: 'uploaded' } }); }
+    return base(url, init);
+  };
+}
+async function switchBranch(branch: string) {
+  await setField(document.querySelector<HTMLInputElement | HTMLSelectElement>('[aria-label="工作台分支"]')!, branch);
+  await click('切换并重新拉取');
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].branch === branch || !!document.querySelector('[role=alert]'));
+}
+
+test('workbench switch downloads the slash branch and uploads only to its matching branch in the bound repository', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures();
+  await enterWorkbench(); await click('获取可切换分支');
+  await waitFor(() => !!document.querySelector('select[aria-label="工作台分支"]'));
+  await switchBranch('feature/demo');
+  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.branch, 'feature/demo'); assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'feature/demo');
+  assert.equal(saved.branchTargets.develop.branch, 'release'); assert.equal(saved.backups[0].branch, 'develop');
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.equal((await localCache.getProjectFiles('tracked', 'feature-v1'))[0].content, 'feature content');
+  await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
+  assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
+  assert.ok(!requests.some(r => r.path.endsWith('/git/refs/heads/release')));
+  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  await reloadProject(saved); await enterWorkbench(); await switchBranch('develop');
+  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.uploadTarget.branch, 'release'); assert.equal(saved.branchTargets['feature/demo'].branch, 'feature/demo');
+  assert.ok(requests.filter(r => r.path === '/repos/source/project/commits/develop').length > 0);
+});
+
+test('failed branch switch retains the current branch, files and existing upload binding', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench();
+  await switchBranch('missing');
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.branch, 'develop'); assert.equal(saved.latestCommitSha, 'v2'); assert.equal(saved.uploadTarget.branch, 'release');
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.ok(document.querySelector('[role=alert]')?.textContent?.includes('切换未完成'));
+});
+
+test('a branch cannot overwrite another source branch binding and switching back remains usable', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench();
+  await switchBranch('release');
+  await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
+  await waitFor(() => alerts.some(message => message.includes('不能用 release 覆盖')));
+  assert.ok(!requests.some(r => r.path.endsWith('/git/commits') || r.path.endsWith('/git/refs/heads/release')));
+  // Close the failed upload dialog and switch back without reserving the conflicting pending binding.
+  const dialog = buttons().find(b => b.textContent === '更新已绑定仓库（保留历史）')!.closest('form')!.parentElement!;
+  await act(async () => { dialog.querySelector<HTMLButtonElement>('button')!.click(); });
+  await switchBranch('develop');
+  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].uploadTarget.branch, 'release');
+  await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'release');
+});
+
+test('restoring a historical branch never redirects it into the branch currently shown in the workbench', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
+  await click('版本归档库 (2)'); await click('恢复此版本');
+  await waitFor(() => alerts.some(message => message.includes('历史版本已恢复')));
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.branch, 'feature/demo'); assert.equal(saved.latestCommitSha, 'feature-v1'); assert.equal(saved.uploadTarget.branch, 'feature/demo');
+  assert.equal(saved.backups[0].remoteSnapshot.branch, 'release');
+  assert.ok(requests.some(r => r.path.endsWith('/git/refs/heads/release')));
+  assert.ok(!requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
+});
+
+test('batch import needs only links, uses repository default branches, skips duplicates and retries only failed entries', async () => {
+  let failed = true;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', ''); requests.push({ path, payload: null });
+    const name = path.split('/')[3];
+    if (path === '/repos/demo/one' || path === '/repos/demo/two') return name === 'two' && failed ? ok({ message: 'temporary failure' }, 503) : ok({ name, default_branch: name === 'one' ? 'master' : 'main', html_url: `https://github.com/demo/${name}` });
+    if (path.includes('/commits/')) return ok({ sha: `commit-${name}`, commit: { tree: { sha: `tree-${name}` }, message: 'default branch', author: {} } });
+    if (path.includes('/git/trees/')) return ok({ tree: [entry(name)] });
+    if (path.includes('/git/blobs/')) return ok({ encoding: 'base64', content: Buffer.from(name).toString('base64') });
+    throw new Error(path);
+  };
+  await click('新建链接/拉取项目'); await click('批量导入链接');
+  await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, 'https://github.com/demo/one/tree/feature\ndemo/two\nDEMO/one.git\nhttps://example.com/demo/bad');
+  assert.ok(!document.querySelector('input[placeholder="例如: 生产核心源码 / 模块A"]'));
+  await click('开始批量导入');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 2');
+  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const imported = saved.find((item: any) => item.owner === 'demo');
+  assert.equal(imported.branch, 'master'); assert.equal(imported.remark, '未备注项目'); assert.equal(imported.files, undefined);
+  assert.equal((await localCache.getProjectFiles(imported.id, imported.latestCommitSha))[0].content, 'one');
+  assert.ok(!requests.some(r => r.path.includes('/commits/feature')));
+  const oneReads = requests.filter(r => r.path === '/repos/demo/one').length;
+  failed = false; await click('重试失败链接');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 1 · 失败 1');
+  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 2);
+  assert.equal(requests.filter(r => r.path === '/repos/demo/one').length, oneReads);
+  const previousReads = requests.filter(r => r.path.includes('/commits/')).length;
+  await click('开始批量导入');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 3 · 失败 1');
+  assert.equal(requests.filter(r => r.path.includes('/commits/')).length, previousReads);
+});
+
+test('cancelling a batch keeps completed projects and leaves remaining links available for retry', async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', ''); requests.push({ path, payload: null });
+    if (path === '/repos/demo/two') return new Promise<Response>((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true }));
+    if (path === '/repos/demo/one') return ok({ default_branch: 'main' });
+    if (path.includes('/commits/')) return ok({ sha: 'imported', commit: { tree: { sha: 'imported-tree' }, message: '', author: {} } });
+    if (path.includes('/git/trees/')) return ok({ tree: [entry('one')] });
+    if (path.includes('/git/blobs/')) return ok({ encoding: 'base64', content: Buffer.from('one').toString('base64') });
+    throw new Error(path);
+  };
+  await click('新建链接/拉取项目'); await click('批量导入链接');
+  await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, 'demo/one\ndemo/two\ndemo/three');
+  await click('开始批量导入'); await waitFor(() => requests.some(r => r.path === '/repos/demo/two'));
+  await click('取消');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 0 · 失败 2');
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 1);
+  assert.ok(!requests.some(r => r.path === '/repos/demo/three'));
+  assert.ok(buttons().some(b => b.textContent === '重试失败链接'));
+});
+
+test('workbench metadata can be edited without pulling files or altering branch bindings', async () => {
+  await reloadProject(boundProject()); await enterWorkbench(); await click('编辑备注与描述');
+  const form = buttons().find(b => b.textContent === '保存修改')!.closest('form')!;
+  await setField(form.querySelector<HTMLInputElement>('input')!, 'new remark');
+  await setField(form.querySelector<HTMLTextAreaElement>('textarea')!, 'new description');
+  await click('保存修改'); await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.remark, 'new remark'); assert.equal(saved.description, 'new description');
+  assert.equal(saved.uploadTarget.branch, 'release'); assert.equal(saved.latestCommitSha, 'v2');
+  assert.equal(requests.length, 0);
+});
+
+test('batch upload after switching uses the matching slash branch and preserves the previously uploaded branch', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
+  (globalThis as any).confirm = () => false;
+  await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量上传至私人仓库'); await click('开始批量上传');
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
+  assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
+  assert.ok(!requests.some(r => r.path.endsWith('/git/refs/heads/release')));
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.branchTargets.develop.branch, 'release'); assert.equal(saved.branchTargets['feature/demo'].repo, 'backup');
+});
+
+test('private upload into an existing named repository creates the source branch rather than overwriting its default branch', async () => {
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith('/user')) return ok({ login: 'destination' });
+    if (String(url) === 'https://api.github.com/repos/destination/backup') return ok({ id: 77, private: true, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' });
+    return base(url, init);
+  };
+  await enterWorkbench(); await click('分叉与私有仓');
+  const name = [...document.querySelectorAll<HTMLInputElement>('input')].find(field => field.value === 'project')!;
+  await setField(name, 'backup'); await click('立即新建私人仓库并上传');
+  await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(saved.uploadTarget.branch, 'develop');
+  assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/develop'));
+  assert.ok(!requests.some(r => r.path.includes('/heads/main') || r.path.endsWith('/git/refs/heads/release')));
+});
+
+test('manual copy mode cannot bypass another branch binding in the same uploaded repository', async () => {
+  await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
+  await click('上传指定仓库'); await click('另存副本到其他仓库（不改变原绑定）');
+  await input('owner/repo', 'destination/backup'); await input('留空使用当前来源分支', 'release');
+  await click('确认上传'); await waitFor(() => alerts.some(message => message.includes('不能用 feature/demo 覆盖')));
+  assert.ok(!requests.some(r => r.path.endsWith('/git/commits') || r.path.endsWith('/git/refs/heads/release')));
+});
+
+test('managed copies switch their original source branch while keeping the destination identity and name', async () => {
+  const saved = { ...boundProject(), owner: 'destination', repo: 'backup', url: 'https://github.com/destination/backup', repoMeta: { htmlUrl: 'https://github.com/destination/backup' }, origin: { owner: 'source', repo: 'project', url: 'https://github.com/source/project', branch: 'develop' }, forkScope: 'current' };
+  await reloadProject(saved); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
+  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(updated.owner, 'destination'); assert.equal(updated.repo, 'backup'); assert.equal(updated.repoMeta.htmlUrl, saved.url);
+  assert.equal(updated.origin.branch, 'feature/demo'); assert.equal(updated.uploadTarget.branch, 'feature/demo');
+  assert.ok(requests.some(r => r.path === '/repos/source/project/commits/feature%2Fdemo'));
 });

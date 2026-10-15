@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sourceOf, savedSnapshot, renamedProject, archiveVersion } from '../src/utils/projectModel';
+import { sourceOf, savedSnapshot, renamedProject, archiveVersion, targetForBranch, assertBranchTarget } from '../src/utils/projectModel';
 
 test('renaming a bound repository updates copies and all history links without changing source', () => {
   const target = { id: 77, owner: 'me', repo: 'chosen-name', branch: 'release', purgeAfterUpload: false };
@@ -23,4 +23,25 @@ test('restoring an old target does not make it the cache source for a newer sour
   const archived = archiveVersion({ ...project, latestCommitSha: 'new', tree: [], commitMessage: '', commitAuthor: '', commitDate: '' });
   assert.equal(archived.remoteSnapshot?.sourceSha, 'new');
   assert.equal(archived.remoteSnapshot?.commitSha, 'previous-current');
+});
+
+test('branch routing remembers explicit legacy bindings and uses slash branch names for new branches', () => {
+  const uploadTarget = { id: 77, owner: 'me', repo: 'chosen', branch: 'release', purgeAfterUpload: false };
+  const project = { owner: 'author', repo: 'template', url: 'author/template', branch: 'develop', uploadTarget, branchTargets: { develop: uploadTarget } };
+  assert.equal(targetForBranch(project, 'develop')?.branch, 'release');
+  const next = targetForBranch(project, 'feature/demo')!;
+  assert.equal(next.branch, 'feature/demo'); assert.equal(next.id, 77);
+  assert.doesNotThrow(() => assertBranchTarget(project, 'feature/demo', next));
+  assert.throws(() => assertBranchTarget(project, 'release', { ...next, branch: 'release' }), /不能用 release 覆盖/);
+  assert.equal(targetForBranch(project, '__proto__')?.branch, '__proto__');
+});
+
+test('renaming a repository updates every branch binding and retains the source branch of archived versions', () => {
+  const source = { owner: 'author', repo: 'template', url: 'author/template', branch: 'feature/demo' };
+  const uploadTarget = { id: 77, owner: 'me', repo: 'chosen', branch: 'feature/demo', purgeAfterUpload: false };
+  const project = { ...source, uploadTarget, branchTargets: { develop: { ...uploadTarget, branch: 'release' }, 'feature/demo': uploadTarget }, repoMeta: {}, backups: [], latestCommitSha: 'source', tree: [], commitMessage: '', commitAuthor: '', commitDate: '' };
+  const renamed = renamedProject(project, uploadTarget, { id: 77, owner: 'me', repo: 'new-name', htmlUrl: 'https://github.com/me/new-name' });
+  assert.equal(renamed.branchTargets.develop.repo, 'new-name'); assert.equal(renamed.branchTargets.develop.branch, 'release');
+  assert.equal(renamed.branchTargets['feature/demo'].repo, 'new-name');
+  assert.equal(archiveVersion(project).branch, 'feature/demo');
 });
