@@ -30,11 +30,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
 
-      - name: Install compatible dependencies
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and regression tests
         run: |
-          npm install --save-dev --save-exact esbuild@0.28.2
-          npm install react-is@19
+          npm run lint
+          npm test
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

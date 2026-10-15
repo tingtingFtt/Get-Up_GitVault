@@ -12,10 +12,10 @@ import {
   FolderDown, FolderCheck, Smartphone, CheckCircle, Wifi,
   FileText, Shield, Save
 } from 'lucide-react';
-import JSZip from 'jszip';
-import { Treemap, ResponsiveContainer } from 'recharts';
-import { localCache, CachedFile } from './utils/localCache';
-import { githubClient } from './utils/githubClient';
+const RepoHeatmap = React.lazy(() => import('./components/RepoHeatmap'));
+import { localCache, transferCache, CachedFile } from './utils/localCache';
+import { githubClient, beginGithubOperation, cancelGithubOperation, operationSignal, parseRepository, gitBlobSha } from './utils/githubClient';
+import { safeFetchJson } from './utils/api';
 
 interface RepoTreeItem {
   path: string;
@@ -25,7 +25,17 @@ interface RepoTreeItem {
   size?: number;
 }
 
+interface RemoteSnapshot {
+  owner: string;
+  repo: string;
+  branch: string;
+  commitSha: string;
+  sourceSha: string;
+  htmlUrl: string;
+}
+
 interface BackupVersion {
+  remoteSnapshot?: RemoteSnapshot;
   id: string;
   versionNumber: number;
   tag: string;
@@ -42,6 +52,9 @@ interface BackupVersion {
 }
 
 interface TrackedRepo {
+  remoteSnapshot?: RemoteSnapshot;
+  uploadTarget?: { owner: string; repo: string; branch: string; purgeAfterUpload: boolean; token?: string };
+  forkTarget?: { owner: string; repo: string; branch: string; htmlUrl: string };
   id: string;
   url: string;
   owner: string;
@@ -136,39 +149,10 @@ function formatFileSize(bytes?: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
-// Safe fetch helper that guards against empty body and unexpected JSON errors
-async function safeFetchJson(url: string, options?: RequestInit): Promise<any> {
-  let res: Response;
-  try {
-    res = await fetch(url, options);
-  } catch (netErr: any) {
-    throw new Error(`网络连接失败: 无法连接服务 (${netErr.message || '网络中断'})`);
-  }
-
-  const text = await res.text();
-  let data: any = {};
-  if (text && text.trim().length > 0) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      if (!res.ok) {
-        throw new Error(`服务异常 (${res.status}): ${text.slice(0, 100)}`);
-      }
-      throw new Error(`服务返回非JSON数据 (${res.status}): ${text.slice(0, 80)}`);
-    }
-  } else {
-    if (!res.ok) {
-      throw new Error(`请求失败，服务返回空响应 (HTTP ${res.status} ${res.statusText})`);
-    }
-    return {};
-  }
-
-  if (!res.ok) {
-    throw new Error(data.error || data.message || `请求失败 (HTTP ${res.status})`);
-  }
-
-  return data;
+function publicProjectRecord({ token, uploadTarget, ...repo }: TrackedRepo) {
+  return { ...repo, uploadTarget: uploadTarget ? { ...uploadTarget, token: undefined } : undefined };
 }
+function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
 export default function App() {
   const [repos, setRepos] = useState<TrackedRepo[]>(() => {
@@ -220,7 +204,7 @@ export default function App() {
 
   // Batch Release & Cache Purge state in Backups tab
   const [selectedBackupIds, setSelectedBackupIds] = useState<string[]>([]);
-  const [purgeCacheOption, setPurgeCacheOption] = useState<boolean>(true);
+  const [purgeCacheOption, setPurgeCacheOption] = useState<boolean>(false);
   const [isBatchReleaseModalOpen, setIsBatchReleaseModalOpen] = useState(false);
   const [batchReleaseProgress, setBatchReleaseProgress] = useState<BatchReleaseItemStatus[]>([]);
   const [batchReleaseTitlePrefix, setBatchReleaseTitlePrefix] = useState('归档发布');
@@ -243,7 +227,7 @@ export default function App() {
   const [selectedFolderToDownload, setSelectedFolderToDownload] = useState<string>('/');
   const [folderFilterQuery, setFolderFilterQuery] = useState<string>('');
   const [apkTargetDirectory, setApkTargetDirectory] = useState<string>('');
-  const [includeApkManifest, setIncludeApkManifest] = useState<boolean>(true);
+  const [includeApkManifest, setIncludeApkManifest] = useState<boolean>(false);
   const [isDownloadingFolder, setIsDownloadingFolder] = useState<boolean>(false);
   const [projectRemark, setProjectRemark] = useState('');
   const [projectDescription, setProjectDescription] = useState('');
@@ -259,7 +243,7 @@ export default function App() {
   const [pushToken, setPushToken] = useState('');
   const [pushCommitMsg, setPushCommitMsg] = useState('');
   const [pushBackupTarget, setPushBackupTarget] = useState<BackupVersion | null>(null);
-  const [purgePushCacheOption, setPurgePushCacheOption] = useState<boolean>(true);
+  const [purgePushCacheOption, setPurgePushCacheOption] = useState<boolean>(false);
 
   // Single Private Repo Upload state
   const [singleUploadRepoName, setSingleUploadRepoName] = useState('');
@@ -272,7 +256,7 @@ export default function App() {
 
   // Form states for adding repo (Link)
   const [repoUrl, setRepoUrl] = useState('');
-  const [branchInput, setBranchInput] = useState('main');
+  const [branchInput, setBranchInput] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [remarkInput, setRemarkInput] = useState('');
   const [descriptionInput, setDescriptionInput] = useState('');
@@ -316,9 +300,85 @@ export default function App() {
            (ua.includes('android') && ua.includes('version/'));
   }, []);
 
+  const reposRef = useRef(repos);
+  reposRef.current = repos;
+  const checkingRepos = useRef(new Set<string>());
+  const fileRequest = useRef(0);
+  const [visibleFileCount, setVisibleFileCount] = useState(150);
+  const startOperation = () => { beginGithubOperation(); setIsLoading(true); };
+  useEffect(() => {
+    const listener = (event: Event) => setLoadingText((event as CustomEvent<string>).detail);
+    window.addEventListener('gitvault-progress', listener);
+    return () => window.removeEventListener('gitvault-progress', listener);
+  }, []);
+  useEffect(() => { setVisibleFileCount(150); }, [activeRepoId, viewingBackup?.id, fileSearchQuery]);
+
+  // Persist a reviewable record before deleting any local source content.
+  const persistRepos = (next: TrackedRepo[]) => {
+    localStorage.setItem('gitvault_repos_v8', JSON.stringify(next));
+    reposRef.current = next;
+    setRepos(next);
+  };
+  const patchRepo = (id: string, patch: Partial<TrackedRepo>) => {
+    persistRepos(reposRef.current.map(repo => repo.id === id ? { ...repo, ...patch } : repo));
+  };
+  const versionFiles = async (repo: TrackedRepo, version?: BackupVersion): Promise<CachedFile[]> => {
+    const sha = version?.commitSha || repo.latestCommitSha;
+    let files = await localCache.getProjectFiles(repo.id, sha);
+    if (!files.length && !version) {
+      // Migrate old unversioned caches only after matching every byte to the stored tree.
+      const legacy = await localCache.getProjectFiles(repo.id);
+      const entries = repo.tree.filter(f => f.type === 'blob');
+      if (legacy.length && legacy.length === entries.length) {
+        const byPath = new Map(legacy.map(f => [f.path, f]));
+        let matches = true;
+        for (const entry of entries) {
+          const file = byPath.get(entry.path);
+          if (!file) { matches = false; break; }
+          const bytes = file.isBase64 ? Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0)) : new TextEncoder().encode(file.content);
+          if (await gitBlobSha(bytes) !== entry.sha) { matches = false; break; }
+          file.sha = entry.sha; file.mode = entry.mode;
+        }
+        if (matches) { await localCache.saveProjectFiles(repo.id, legacy, sha); files = legacy; }
+      }
+    }
+    if (files.length) return files;
+    const remote = version?.remoteSnapshot || (!version ? repo.remoteSnapshot : undefined);
+    let data: Awaited<ReturnType<typeof githubClient.fetchRepo>>;
+    if (remote) {
+      data = await githubClient.fetchRepo(`${remote.owner}/${remote.repo}`, remote.branch, repo.uploadTarget?.token || globalToken || repo.token, { ref: remote.commitSha });
+      const sourcePaths = new Map((version?.tree || repo.tree).filter(f => f.type === 'blob').map(f => [f.path, f]));
+      // Only the source manifest belongs to this snapshot; generated metadata is excluded.
+      if (sourcePaths.size) data.files = data.files.filter(f => sourcePaths.has(f.path));
+    } else {
+      data = await githubClient.fetchRepo(repo.url, repo.branch, repo.token || globalToken, { ref: sha === 'HEAD' ? undefined : sha });
+      if (sha === 'HEAD') throw new Error('旧记录缺少准确提交，请先执行更新再上传');
+    }
+    await localCache.saveProjectFiles(repo.id, data.files, sha);
+    await transferCache.clear(data.latestCommitSha);
+    return data.files;
+  };
+  const recordUpload = async (repo: TrackedRepo, result: any, purge: boolean, version?: BackupVersion, extra: Partial<TrackedRepo> = {}, uploadToken?: string) => {
+    const sourceSha = version?.commitSha || repo.latestCommitSha;
+    if (!result.verified) throw new Error('远程版本尚未验证，本地缓存已保留');
+    const snapshot: RemoteSnapshot = { owner: result.owner, repo: result.repo, branch: result.branch, commitSha: result.commitSha, sourceSha, htmlUrl: result.htmlUrl };
+    await localCache.saveSyncReceipt(repo.id, sourceSha, snapshot);
+    const current = reposRef.current.find(r => r.id === repo.id) || repo;
+    if (version) patchRepo(repo.id, { backups: current.backups.map(b => b.id === version.id ? { ...b, remoteSnapshot: snapshot } : b) });
+    else patchRepo(repo.id, { ...extra, remoteSnapshot: snapshot, uploadTarget: { owner: result.owner, repo: result.repo, branch: result.branch, purgeAfterUpload: purge, token: uploadToken || current.uploadTarget?.token }, lastUploadedToPrivateAt: new Date().toISOString() });
+    if (purge) {
+      try {
+        await localCache.deleteProjectFiles(repo.id, sourceSha);
+        if (version) patchRepo(repo.id, { backups: (reposRef.current.find(r => r.id === repo.id)?.backups || []).map(b => b.id === version.id ? { ...b, isCachePurged: true } : b) });
+        else patchRepo(repo.id, { isCachePurged: true, cachedFilesCount: 0 });
+      } catch (error) { throw new Error(`上传已验证成功，缓存清理未完成，可稍后重试：${(error as Error).message}`); }
+    } else if (!version) patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: (await localCache.getProjectFiles(repo.id, sourceSha)).length });
+  };
+
   // Save to localStorage
   useEffect(() => {
-    localStorage.setItem('gitvault_repos_v8', JSON.stringify(repos));
+    try { localStorage.setItem('gitvault_repos_v8', JSON.stringify(repos)); }
+    catch (error) { setErrorMsg('项目记录保存失败，请导出备份并检查浏览器存储空间'); }
   }, [repos]);
 
   // Validate GitHub Token on mount or when changed
@@ -330,31 +390,10 @@ export default function App() {
 
   const validateGitHubToken = async (token: string) => {
     if (!token) return;
+    if (operationSignal().aborted) beginGithubOperation();
     setIsValidatingToken(true);
-    try {
-      let data: any = null;
-      try {
-        data = await safeFetchJson('/api/github/validate-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token })
-        });
-      } catch (proxyErr) {
-        // Fall back to direct browser client call to api.github.com
-        data = await githubClient.validateToken(token);
-      }
-
-      if (data && data.valid) {
-        setUserProfile(data.user);
-        setRateLimit(data.rate || data.rateLimit);
-      } else {
-        setUserProfile(null);
-      }
-    } catch {
-      setUserProfile(null);
-    } finally {
-      setIsValidatingToken(false);
-    }
+    try { const data = await githubClient.validateToken(token); setUserProfile(data.user); setRateLimit(data.rateLimit); }
+    catch { setUserProfile(null); } finally { setIsValidatingToken(false); }
   };
 
   // Dedicated Test GitHub Connection handler
@@ -366,31 +405,22 @@ export default function App() {
       return;
     }
 
+    if (operationSignal().aborted) beginGithubOperation();
     setTestStatus('testing');
     setTestMsg('正在连接 GitHub API 节点并校验用户权限...');
 
     try {
-      let data: any = null;
-      try {
-        data = await safeFetchJson('/api/github/validate-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token })
-        });
-      } catch {
-        // Direct browser client fallback
-        data = await githubClient.validateToken(token);
-      }
+      const data = await githubClient.validateToken(token);
 
       if (data && data.valid) {
         setUserProfile(data.user);
-        const rateInfo = data.rate || data.rateLimit;
+        const rateInfo = data.rateLimit;
         setRateLimit(rateInfo);
         setTestStatus('success');
         setTestMsg(`GitHub 连接成功！已验证账号: @${data.user.login} (${data.user.name}) · 剩余 API 配额: ${rateInfo ? `${rateInfo.remaining}/${rateInfo.limit}` : '正常'}`);
       } else {
         setTestStatus('error');
-        setTestMsg(data?.error || 'Token 验证失败，请确认是否具有 repo 权限');
+        setTestMsg('Token 验证失败，请确认是否具有 repo 权限');
       }
     } catch (err: any) {
       setTestStatus('error');
@@ -405,6 +435,7 @@ export default function App() {
       return;
     }
 
+    if (operationSignal().aborted) beginGithubOperation();
     setProjectTokenTestStatus('testing');
     setProjectTokenTestMsg('正在验证项目专属 Token...');
 
@@ -446,12 +477,12 @@ export default function App() {
         version: '2.5',
         exportedAt: new Date().toISOString(),
         settings: {
-          globalToken: globalToken,
+          globalToken: '',
           globalUsername: globalUsername,
           apkDownloadDirectory: apkDownloadDirectory,
         },
         projectsCount: repos.length,
-        projects: repos
+        projects: repos.map(publicProjectRecord)
       };
 
       const jsonStr = JSON.stringify(backupData, null, 2);
@@ -499,6 +530,10 @@ export default function App() {
           setRepos(data.projects);
         }
 
+        // Imported metadata does not imply that source files exist on this device.
+        const importedIds = new Set(data.projects.map((project: TrackedRepo) => project.id));
+        setRepos(prev => prev.map(repo => importedIds.has(repo.id) ? { ...repo, isCachePurged: true, cachedFilesCount: 0 } : repo));
+
         // Restore settings if included
         if (data.settings) {
           if (data.settings.globalToken) {
@@ -528,6 +563,7 @@ export default function App() {
   // Export as HTML / ZIP offline package
   const handleExportHtmlBundle = async () => {
     try {
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       const htmlContent = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -551,7 +587,7 @@ export default function App() {
   <div class="card">
     <h3>项目列表</h3>
     <ul>
-      ${repos.map(r => `<li><strong>${r.owner}/${r.repo}</strong> - ${r.remark || '无备注'} (${r.description || '无描述'})</li>`).join('')}
+      ${repos.map(r => `<li><strong>${escapeHtml(r.owner)}/${escapeHtml(r.repo)}</strong> - ${escapeHtml(r.remark || '无备注')} (${escapeHtml(r.description || '无描述')})</li>`).join('')}
     </ul>
   </div>
 </body>
@@ -561,7 +597,7 @@ export default function App() {
       const backupData = {
         version: 1,
         exportDate: new Date().toISOString(),
-        repos,
+        repos: repos.map(publicProjectRecord),
         globalUsername,
       };
       zip.file("gitvault_backup.json", JSON.stringify(backupData, null, 2));
@@ -584,6 +620,7 @@ export default function App() {
   // Download Electron / EXE packaging configuration
   const handleDownloadElectronConfig = async () => {
     try {
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       
       const mainJs = `const { app, BrowserWindow } = require('electron');
@@ -669,6 +706,7 @@ app.on('window-all-closed', () => {
   // Download Capacitor / APK packaging configuration
   const handleDownloadCapacitorConfig = async () => {
     try {
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
 
       const capacitorConfig = `import { CapacitorConfig } from '@capacitor/cli';
@@ -781,48 +819,22 @@ export default config;
 
   // Status check logic
   const checkSingleRepoStatus = async (repoId: string, isBackground = false) => {
-    const repo = repos.find(r => r.id === repoId);
-    if (!repo) return;
-
-    if (!isBackground) {
-      setIsLoading(true);
-      setLoadingText(`正在检测项目 ${repo.repo} 的最新状态...`);
-    }
-
+    const repo = reposRef.current.find(r => r.id === repoId);
+    if (!repo || checkingRepos.current.has(repoId)) return;
+    checkingRepos.current.add(repoId);
+    if (operationSignal().aborted && isBackground) return;
+    if (!isBackground) { startOperation(); setLoadingText(`正在检测 ${repo.repo} 的更新…`); }
     try {
-      const tokenToUse = repo.token || globalToken;
-      const data = await safeFetchJson('/api/github/check-update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          owner: repo.owner,
-          repo: repo.repo,
-          branch: repo.branch,
-          currentSha: repo.latestCommitSha,
-          token: tokenToUse || undefined
-        })
-      });
-
-      setRepos(prev => prev.map(r => {
-        if (r.id === repoId) {
-          return {
-            ...r,
-            hasUpdate: data.hasUpdate,
-            latestRemoteCommit: data.latestCommit,
-            lastCheckedAt: new Date().toISOString()
-          };
-        }
-        return r;
-      }));
-    } catch (err) {
-      console.error('Status check failed:', err);
-    } finally {
-      if (!isBackground) setIsLoading(false);
-    }
+      const data = await githubClient.checkUpdate(repo.owner, repo.repo, repo.branch, repo.latestCommitSha, repo.token || globalToken);
+      patchRepo(repo.id, { hasUpdate: data.hasUpdate, latestRemoteCommit: data.latestCommit, lastCheckedAt: new Date().toISOString() });
+    } catch (error) {
+      patchRepo(repo.id, { lastCheckedAt: new Date().toISOString() });
+      if (!isBackground) alert('检测失败：' + (error as Error).message);
+    } finally { checkingRepos.current.delete(repoId); if (!isBackground) setIsLoading(false); }
   };
 
   const checkAllUpdates = async () => {
-    setIsLoading(true);
+    startOperation();
     setLoadingText('正在批量检测所有已链接项目状态...');
     for (const r of repos) {
       await checkSingleRepoStatus(r.id, true);
@@ -834,101 +846,25 @@ export default config;
   const handleAddRepo = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!repoUrl.trim()) return;
-
-    setIsLoading(true);
-    setErrorMsg('');
-    setLoadingText(
-      isApkEnvironment
-        ? `正在从 GitHub 拉取项目并下载保存至 APK 本地目录 [${apkDownloadDirectory}]...`
-        : '正在直接拉取项目完整代码树与元数据进入本地存储...'
-    );
-
+    startOperation(); setErrorMsg(''); setLoadingText('正在获取完整项目…');
     try {
-      const tokenToUse = tokenInput.trim() || globalToken;
-      let data: any = null;
-
-      try {
-        data = await safeFetchJson('/api/github/fetch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: repoUrl.trim(),
-            branch: branchInput.trim() || 'main',
-            token: tokenToUse || undefined
-          })
-        });
-      } catch (proxyErr) {
-        // Direct browser client fallback to GitHub API
-        data = await githubClient.fetchRepo(
-          repoUrl.trim(),
-          branchInput.trim() || 'main',
-          tokenToUse || undefined
-        );
-      }
-
-      const tagsArray = tagsInput.split(',').map(t => t.trim()).filter(Boolean);
-      const fileCount = data.files ? data.files.length : 0;
-
+      const data = await githubClient.fetchRepo(repoUrl.trim(), branchInput.trim() || undefined, tokenInput.trim() || globalToken);
       const newRepo: TrackedRepo = {
-        id: `${data.owner}-${data.repo}-${Date.now()}`,
-        url: repoUrl.trim(),
-        owner: data.owner,
-        repo: data.repo,
-        branch: data.branch,
-        token: tokenInput.trim() || undefined,
-        remark: remarkInput.trim() || '未备注项目',
-        description: descriptionInput.trim() || data.repoMeta?.description || '',
-        tags: tagsArray.length > 0 ? tagsArray : ['默认'],
-        checkInterval: 0,
-        lastCheckedAt: new Date().toISOString(),
-        latestCommitSha: data.latestCommitSha,
-        commitMessage: data.commitMessage,
-        commitAuthor: data.commitAuthor,
-        commitDate: data.commitDate,
-        lastSyncedAt: new Date().toISOString(),
-        repoMeta: data.repoMeta,
-        tree: data.tree,
-        backups: [],
-        hasUpdate: false,
-        isCachePurged: false,
-        cachedFilesCount: fileCount
+        id: `${data.owner}-${data.repo}-${Date.now()}`, url: repoUrl.trim(), owner: data.owner, repo: data.repo, branch: data.branch,
+        token: tokenInput.trim() || undefined, remark: remarkInput.trim() || '未备注项目', description: descriptionInput.trim() || data.repoMeta.description,
+        tags: tagsInput.split(',').map(t => t.trim()).filter(Boolean), checkInterval: 0, lastCheckedAt: new Date().toISOString(),
+        latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate,
+        lastSyncedAt: new Date().toISOString(), repoMeta: data.repoMeta, tree: data.tree, backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length,
       };
-
-      // 1. Persist full downloaded project files in browser IndexedDB localCache
-      if (data.files && data.files.length > 0) {
-        try {
-          await localCache.saveProjectFiles(newRepo.id, data.files);
-        } catch (cacheErr) {
-          console.warn('Failed to save to localCache:', cacheErr);
-        }
-      }
-
-      // 2. If running inside APK native bridge, trigger file saving to apkDownloadDirectory
+      await localCache.saveProjectFiles(newRepo.id, data.files, data.latestCommitSha);
+      persistRepos([newRepo, ...reposRef.current]);
       if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
-        try {
-          (window as any).AndroidBridge.saveProjectFolder(
-            `${apkDownloadDirectory}/${newRepo.repo}`,
-            JSON.stringify({ repo: newRepo.repo, sha: newRepo.latestCommitSha, tree: newRepo.tree, fileCount })
-          );
-        } catch {}
+        (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${newRepo.repo}`, JSON.stringify({ repo: newRepo.repo, sha: newRepo.latestCommitSha, files: data.files }));
       }
-
-      setRepos(prev => [newRepo, ...prev]);
-      setIsAddModalOpen(false);
-      setRepoUrl('');
-      setBranchInput('main');
-      setTokenInput('');
-      setRemarkInput('');
-      setDescriptionInput('');
-      setCurrentView('projects');
-      if (fileCount > 0) {
-        alert(`🎉 项目拉取成功！\n已将完整项目（共 ${fileCount} 个文件）下载并保存在本地缓存中，随时可离线浏览并一键上传至私人仓集。`);
-      }
-    } catch (err: any) {
-      setErrorMsg(err.message || '拉取项目失败');
-    } finally {
-      setIsLoading(false);
-    }
+      setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
+      alert(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。`);
+    } catch (error) { setErrorMsg((error as Error).message || '操作已取消'); }
+    finally { setIsLoading(false); }
   };
 
   // Open modal for uploading single project to user's private repo
@@ -943,148 +879,19 @@ export default config;
 
   // Execute upload single project to private repository
   const handleExecuteSingleUploadToPrivate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!singleUploadTargetRepo) return;
-
-    let token = singleUploadTargetRepo.token || globalToken;
-    if (!token) {
-      const entered = prompt('上传至个人私人仓库需要 GitHub Token (PAT)，请输入：');
-      if (!entered) return;
-      token = entered.trim();
-    }
-
-    setIsUploadingToPrivate(true);
-    setIsLoading(true);
-    setLoadingText(`正在自动为项目 "${singleUploadRepoName}" 在您账号下创建私人仓库并同步备注与描述...`);
-
+    e.preventDefault(); if (!singleUploadTargetRepo) return;
+    const token = singleUploadTargetRepo.token || globalToken || prompt('请输入 GitHub Token：')?.trim();
+    if (!token) return;
+    startOperation(); setIsUploadingToPrivate(true);
     try {
-      // 1. Ensure private repository on user's GitHub account (Dual-channel: server or browser)
-      let ensureRes: any = null;
-      try {
-        ensureRes = await safeFetchJson('/api/github/ensure-private-repo', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            token,
-            repoName: singleUploadRepoName.trim(),
-            description: singleUploadDescription.trim(),
-            remark: singleUploadRemark.trim(),
-          })
-        });
-      } catch (proxyErr) {
-        ensureRes = await githubClient.ensurePrivateRepo(
-          token,
-          singleUploadRepoName.trim(),
-          singleUploadDescription.trim(),
-          singleUploadRemark.trim()
-        );
-      }
-
-      const targetOwner = ensureRes.owner;
-      const targetRepo = ensureRes.repo;
-
-      setLoadingText(`正在提取项目文件并提交推送至私人仓库: ${targetOwner}/${targetRepo}...`);
-
-      // 2. Fetch all project files from local IndexedDB cache (full source code, 100% complete)
-      let payloadFiles: CachedFile[] = await localCache.getProjectFiles(singleUploadTargetRepo.id);
-
-      if (payloadFiles.length === 0) {
-        // If local cache was purged or missing, fetch full project snapshot from source and cache it
-        setLoadingText(`正在从源仓库完整下载项目所有源码文件并载入本地缓存...`);
-        try {
-          let freshData: any = null;
-          try {
-            freshData = await safeFetchJson('/api/github/fetch', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                url: singleUploadTargetRepo.url,
-                branch: singleUploadTargetRepo.branch || 'main',
-                token: singleUploadTargetRepo.token || globalToken
-              })
-            });
-          } catch {
-            freshData = await githubClient.fetchRepo(
-              singleUploadTargetRepo.url,
-              singleUploadTargetRepo.branch || 'main',
-              singleUploadTargetRepo.token || globalToken
-            );
-          }
-
-          if (freshData.files && freshData.files.length > 0) {
-            await localCache.saveProjectFiles(singleUploadTargetRepo.id, freshData.files);
-            payloadFiles = freshData.files;
-          }
-        } catch (fetchErr) {
-          console.warn('Could not re-fetch full files:', fetchErr);
-        }
-      }
-
-      setLoadingText(`正在将完整项目 (共全部 ${payloadFiles.length} 个文件) 提交推送至私人仓库: ${targetOwner}/${targetRepo}...`);
-
-      // 3. Push complete project to newly created private repo (Dual-channel)
-      let pushRes: any = null;
-      try {
-        pushRes = await safeFetchJson('/api/github/push', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            targetOwner,
-            targetRepo,
-            targetBranch: 'main',
-            token,
-            files: payloadFiles,
-            commitMessage: `Initial private backup from GitVault: ${singleUploadRemark.trim() || singleUploadTargetRepo.repo}`,
-            description: singleUploadDescription.trim(),
-            remark: singleUploadRemark.trim(),
-            originalSourceUrl: singleUploadTargetRepo.url
-          })
-        });
-      } catch (proxyErr) {
-        pushRes = await githubClient.push(
-          targetOwner,
-          targetRepo,
-          'main',
-          token,
-          payloadFiles,
-          `Initial private backup from GitVault: ${singleUploadRemark.trim() || singleUploadTargetRepo.repo}`,
-          singleUploadDescription.trim(),
-          singleUploadRemark.trim(),
-          singleUploadTargetRepo.url
-        );
-      }
-
-      // Purge cache if requested
-      if (singleUploadPurgeCache) {
-        await localCache.deleteProjectFiles(singleUploadTargetRepo.id);
-      }
-
-      // Update repo in state
-      setRepos(prev => prev.map(r => {
-        if (r.id === singleUploadTargetRepo.id) {
-          return {
-            ...r,
-            remark: singleUploadRemark.trim() || r.remark,
-            description: singleUploadDescription.trim(),
-            privateRepoUrl: ensureRes.htmlUrl,
-            lastUploadedToPrivateAt: new Date().toISOString(),
-            isCachePurged: singleUploadPurgeCache ? true : r.isCachePurged,
-            cachedFilesCount: singleUploadPurgeCache ? 0 : payloadFiles.length,
-            tree: singleUploadPurgeCache ? [] : r.tree
-          };
-        }
-        return r;
-      }));
-
+      const target = await githubClient.ensurePrivateRepo(token, singleUploadRepoName.trim(), singleUploadDescription.trim(), singleUploadRemark.trim());
+      const files = await versionFiles(singleUploadTargetRepo);
+      const result = await githubClient.push(target.owner, target.repo, target.defaultBranch, token, files, `Sync ${singleUploadTargetRepo.repo} @ ${singleUploadTargetRepo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), singleUploadTargetRepo.url);
+      await recordUpload(singleUploadTargetRepo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
       setIsSingleUploadModalOpen(false);
-      const uploadedCount = pushRes.uploadedFilesCount || payloadFiles.length;
-      alert(`🎉 项目已成功完整上传至您的个人私人仓库！\n共完整上传全部 ${uploadedCount} 个文件。\n仓库地址: ${ensureRes.htmlUrl}\n项目备注与详细描述已同步写入。${singleUploadPurgeCache ? '\n已按您的设定释放本地缓存，随时可重新拉取！' : ''}`);
-    } catch (err: any) {
-      alert('上传至私人仓库失败: ' + err.message);
-    } finally {
-      setIsUploadingToPrivate(false);
-      setIsLoading(false);
-    }
+      alert(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
+    } catch (error) { alert('上传未完成：' + (error as Error).message); }
+    finally { setIsUploadingToPrivate(false); setIsLoading(false); }
   };
 
   // Execute create Fork on GitHub
@@ -1100,7 +907,7 @@ export default config;
     }
 
     setIsForking(true);
-    setIsLoading(true);
+    startOperation();
     setLoadingText(`正在您的 GitHub 账号下为 "${singleUploadTargetRepo.owner}/${singleUploadTargetRepo.repo}" 创建分叉 (Fork)...`);
 
     try {
@@ -1110,7 +917,7 @@ export default config;
         if (r.id === singleUploadTargetRepo.id) {
           return {
             ...r,
-            privateRepoUrl: forkRes.htmlUrl,
+            forkTarget: { owner: forkRes.owner, repo: forkRes.repo, branch: forkRes.defaultBranch, htmlUrl: forkRes.htmlUrl },
             lastSyncedAt: new Date().toISOString()
           };
         }
@@ -1129,225 +936,79 @@ export default config;
 
   // Sync fork with upstream repository
   const handleSyncUpstream = async (repo: TrackedRepo) => {
-    let token = repo.token || globalToken;
-    if (!token) {
-      const entered = prompt('同步上游需要 GitHub Token，请输入：');
-      if (!entered) return;
-      token = entered.trim();
-    }
-
-    setIsLoading(true);
-    setLoadingText(`正在将分叉 "${repo.owner}/${repo.repo}" 与上游源仓库进行合并同步...`);
-
+    const token = repo.token || globalToken || prompt('请输入 GitHub Token：')?.trim();
+    if (!token) return;
+    startOperation();
     try {
-      const res = await githubClient.syncFork(repo.owner, repo.repo, repo.branch, token);
-      alert(`🎉 同步上游成功！\n${res.message}`);
-      await checkSingleRepoStatus(repo.id);
-    } catch (err: any) {
-      alert(`同步上游失败: ${err.message}`);
-    } finally {
-      setIsLoading(false);
-    }
+      const target = repo.forkTarget || (repo.privateRepoUrl && !repo.uploadTarget ? { ...parseRepository(repo.privateRepoUrl), branch: repo.branch } : { owner: repo.owner, repo: repo.repo, branch: repo.branch });
+      const result = await githubClient.syncFork(target.owner, target.repo, target.branch, token);
+      alert(`分叉 ${target.owner}/${target.repo}：${result.message}`);
+    } catch (error) { alert('同步上游失败：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // Traditional Push / Upload to custom target
   const handlePushProjectToGitHub = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeRepo || !pushTargetRepo.trim()) return;
-
-    let cleanTarget = pushTargetRepo.trim().replace(/\/$/, '');
-    if (cleanTarget.startsWith('https://github.com/')) {
-      cleanTarget = cleanTarget.replace('https://github.com/', '');
-    }
-    const parts = cleanTarget.split('/');
-    if (parts.length < 2) {
-      alert('目标仓库格式错误，请使用 owner/repo 格式');
-      return;
-    }
-    const targetOwner = parts[0];
-    const targetRepo = parts[1];
-    const tokenToUse = pushToken.trim() || activeRepo.token || globalToken;
-
-    if (!tokenToUse) {
-      alert('请提供有效的 GitHub Token (可在全局设置中配置或在此输入)');
-      return;
-    }
-
-    setIsLoading(true);
-    setLoadingText('正在获取本地缓存完整代码文件并推送到目标 GitHub 仓库...');
-    setIsPushModalOpen(false);
-
+    e.preventDefault(); if (!activeRepo || !pushTargetRepo.trim()) return;
+    const token = pushToken.trim() || activeRepo.token || globalToken;
+    if (!token) return alert('请填写 GitHub Token');
+    startOperation();
     try {
-      let payloadFiles: CachedFile[] = await localCache.getProjectFiles(activeRepo.id);
-
-      if (payloadFiles.length === 0) {
-        setLoadingText('正在从源仓库完整下载文件快照并载入本地缓存...');
-        try {
-          let freshData: any = null;
-          try {
-            freshData = await safeFetchJson('/api/github/fetch', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                url: activeRepo.url,
-                branch: activeRepo.branch,
-                token: tokenToUse
-              })
-            });
-          } catch {
-            freshData = await githubClient.fetchRepo(activeRepo.url, activeRepo.branch, tokenToUse);
-          }
-          if (freshData.files && freshData.files.length > 0) {
-            await localCache.saveProjectFiles(activeRepo.id, freshData.files);
-            payloadFiles = freshData.files;
-          }
-        } catch {}
-      }
-
-      let data: any = null;
-      try {
-        data = await safeFetchJson('/api/github/push', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            targetOwner,
-            targetRepo,
-            targetBranch: pushTargetBranch.trim() || 'main',
-            token: tokenToUse,
-            files: payloadFiles,
-            commitMessage: pushCommitMsg.trim() || `Upload project ${activeRepo.repo} via GitVault`,
-            description: activeRepo.description,
-            remark: activeRepo.remark,
-            originalSourceUrl: activeRepo.url
-          })
-        });
-      } catch (proxyErr) {
-        data = await githubClient.push(
-          targetOwner,
-          targetRepo,
-          pushTargetBranch.trim() || 'main',
-          tokenToUse,
-          payloadFiles,
-          pushCommitMsg.trim() || `Upload project ${activeRepo.repo} via GitVault`,
-          activeRepo.description,
-          activeRepo.remark,
-          activeRepo.url
-        );
-      }
-
-      // Purge local cache if user opted-in
-      if (purgePushCacheOption) {
-        await localCache.deleteProjectFiles(activeRepo.id);
-        if (pushBackupTarget) {
-          setRepos(prev => prev.map(r => {
-            if (r.id === activeRepo.id) {
-              const updated = r.backups.map(b => b.id === pushBackupTarget.id ? { ...b, isCachePurged: true, tree: [] } : b);
-              return { ...r, backups: updated };
-            }
-            return r;
-          }));
-        } else {
-          setRepos(prev => prev.map(r => {
-            if (r.id === activeRepo.id) {
-              return { ...r, isCachePurged: true, cachedFilesCount: 0, tree: [] };
-            }
-            return r;
-          }));
-          setSelectedFilePath(null);
-          setFileContent(null);
-        }
-      }
-
-      alert(`项目已成功独立上传/推送至目标仓库！\n共完整上传 ${data.uploadedFilesCount || payloadFiles.length} 个文件\n访问地址: ${data.htmlUrl}${purgePushCacheOption ? '\n\n已按您的设置自动释放本地大文件缓存以节省空间。软件内已完整保留项目元数据与历史记录，可随时从 GitHub 重新拉取还原（同源互通）！' : ''}`);
-      setPushTargetRepo('');
-      setPushToken('');
-      setPushCommitMsg('');
-      setPushBackupTarget(null);
-    } catch (err: any) {
-      alert('上传推送失败: ' + err.message);
-    } finally {
-      setIsLoading(false);
-    }
+      const target = parseRepository(pushTargetRepo);
+      const version = pushBackupTarget || viewingBackup || undefined;
+      const files = await versionFiles(activeRepo, version);
+      const result = await githubClient.push(target.owner, target.repo, pushTargetBranch.trim(), token, files, pushCommitMsg.trim() || `Sync ${activeRepo.repo} @ ${version?.commitSha || activeRepo.latestCommitSha}`, activeRepo.description, activeRepo.remark, activeRepo.url);
+      await recordUpload(activeRepo, result, purgePushCacheOption, version, {}, token);
+      setIsPushModalOpen(false); setPushBackupTarget(null);
+      alert(`已验证上传 ${files.length} 个文件。${purgePushCacheOption ? '对应版本源码已清理，快照已保留。' : '对应版本源码已保留。'}`);
+    } catch (error) { alert('上传未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   const handleOneClickUpdate = async (repo: TrackedRepo) => {
-    setIsLoading(true);
-    setLoadingText(`正在一键更新项目 ${repo.repo} 并自动归档旧版...`);
-    setErrorMsg('');
-
+    startOperation(); setErrorMsg('');
     try {
-      const tokenToUse = repo.token || globalToken;
-      const data = await safeFetchJson('/api/github/fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: `https://github.com/${repo.owner}/${repo.repo}`,
-          branch: repo.branch,
-          token: tokenToUse
-        })
-      });
-
-      const isNewCommit = data.latestCommitSha !== repo.latestCommitSha;
-
-      setRepos(prev => prev.map(item => {
-        if (item.id === repo.id) {
-          let updatedBackups = [...item.backups];
-          if (isNewCommit) {
-            const newBackupNum = updatedBackups.length + 1;
-            const backup: BackupVersion = {
-              id: `backup-${Date.now()}`,
-              versionNumber: newBackupNum,
-              tag: `v${newBackupNum}.0-backup`,
-              annotation: `自动归档版本: ${item.commitMessage.slice(0, 30) || '自动同步备份'}`,
-              commitSha: item.latestCommitSha,
-              commitMessage: item.commitMessage,
-              commitAuthor: item.commitAuthor,
-              commitDate: item.commitDate,
-              backedUpAt: new Date().toISOString(),
-              tree: item.tree,
-              isCachePurged: false
-            };
-            updatedBackups = [backup, ...updatedBackups];
-          }
-
-          return {
-            ...item,
-            latestCommitSha: data.latestCommitSha,
-            commitMessage: data.commitMessage,
-            commitAuthor: data.commitAuthor,
-            commitDate: data.commitDate,
-            lastSyncedAt: new Date().toISOString(),
-            repoMeta: data.repoMeta,
-            tree: data.tree,
-            backups: updatedBackups,
-            hasUpdate: false,
-            latestRemoteCommit: undefined,
-            lastCheckedAt: new Date().toISOString(),
-            isCachePurged: false
-          };
-        }
-        return item;
-      }));
-
-      alert(isNewCommit ? '一键更新成功！旧版本已自动归档备份并标记。' : '当前项目已是最新版本，无需更新。');
-    } catch (err: any) {
-      alert('一键更新出错: ' + err.message);
-    } finally {
-      setIsLoading(false);
-    }
+      const token = repo.token || globalToken;
+      const status = await githubClient.checkUpdate(repo.owner, repo.repo, repo.branch, repo.latestCommitSha, token);
+      if (!status.hasUpdate) {
+        patchRepo(repo.id, { hasUpdate: false, lastCheckedAt: new Date().toISOString() });
+        if (repo.uploadTarget && repo.remoteSnapshot?.sourceSha !== repo.latestCommitSha) {
+          const target = repo.uploadTarget;
+          const files = await versionFiles(repo);
+          const result = await githubClient.push(target.owner, target.repo, target.branch, target.token || globalToken || token, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.description, repo.remark, repo.url);
+          await recordUpload(repo, result, target.purgeAfterUpload);
+          alert('已完成上次待上传的版本，并验证成功。');
+        } else alert('当前已是最新版本');
+        return;
+      }
+      let cached = await localCache.getProjectFiles(repo.id, repo.latestCommitSha);
+      if (!cached.length && !repo.isCachePurged && repo.latestCommitSha !== 'HEAD') cached = await versionFiles(repo);
+      const data = await githubClient.fetchRepo(repo.url, repo.branch, token, { ref: status.latestSha, cachedFiles: cached });
+      await localCache.saveProjectFiles(repo.id, data.files, data.latestCommitSha);
+      const old: BackupVersion = { id: `backup-${Date.now()}`, versionNumber: repo.backups.length + 1, tag: `backup-${repo.latestCommitSha.slice(0, 12)}`, annotation: repo.commitMessage.slice(0, 60), commitSha: repo.latestCommitSha, commitMessage: repo.commitMessage, commitAuthor: repo.commitAuthor, commitDate: repo.commitDate, backedUpAt: new Date().toISOString(), tree: repo.tree, isCachePurged: repo.isCachePurged, remoteSnapshot: repo.remoteSnapshot };
+      const updated: TrackedRepo = { ...repo, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree, repoMeta: data.repoMeta, backups: repo.latestCommitSha === 'HEAD' ? repo.backups : [old, ...repo.backups], remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString(), hasUpdate: true };
+      // Persist the newly downloaded version even if its subsequent upload fails.
+      patchRepo(repo.id, { latestCommitSha: updated.latestCommitSha, commitMessage: updated.commitMessage, commitAuthor: updated.commitAuthor, commitDate: updated.commitDate, tree: updated.tree, repoMeta: updated.repoMeta, backups: updated.backups, remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: updated.lastSyncedAt, hasUpdate: false, latestRemoteCommit: undefined });
+      if (repo.uploadTarget) {
+        const target = repo.uploadTarget;
+        const result = await githubClient.push(target.owner, target.repo, target.branch, target.token || globalToken || token, data.files, `Sync ${repo.repo} @ ${data.latestCommitSha}`, repo.description, repo.remark, repo.url);
+        await recordUpload(updated, result, target.purgeAfterUpload);
+        alert('新版本已更新并验证上传；旧版本记录已保留。');
+      } else alert('新版本已完整保存，旧版本已归档。请使用现有上传入口选择目标仓库。');
+      setFileContent(null); setSelectedFilePath(null); setViewingBackup(null);
+    } catch (error) { alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
-  const handleDeleteRepo = (repoId: string, e: React.MouseEvent) => {
+  const handleDeleteRepo = async (repoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm('确定要移除该链接项目吗？本地记录与备份将被清除。')) {
-      localCache.deleteProjectFiles(repoId);
-      setRepos(prev => prev.filter(r => r.id !== repoId));
+    if (!confirm('确定移除该项目的本地记录和缓存？远程仓库不会删除。')) return;
+    try {
+      await localCache.deleteProjectFiles(repoId);
+      persistRepos(reposRef.current.filter(r => r.id !== repoId));
       setSelectedProjectIds(prev => prev.filter(id => id !== repoId));
-      if (activeRepoId === repoId) {
-        setActiveRepoId(null);
-        setCurrentView('projects');
-      }
-    }
+      if (activeRepoId === repoId) { setActiveRepoId(null); setCurrentView('projects'); }
+    } catch (error) { alert('删除未完成：' + (error as Error).message); }
   };
 
   // ================= BATCH OPERATIONS ON PROJECTS =================
@@ -1377,17 +1038,13 @@ export default config;
   };
 
   // Batch Delete Projects
-  const handleBatchDeleteProjects = () => {
-    if (selectedProjectIds.length === 0) return;
-    if (confirm(`确定要批量删除选中的 ${selectedProjectIds.length} 个项目吗？本地记录与文件将被移除。`)) {
-      selectedProjectIds.forEach(id => localCache.deleteProjectFiles(id));
-      setRepos(prev => prev.filter(r => !selectedProjectIds.includes(r.id)));
-      if (activeRepoId && selectedProjectIds.includes(activeRepoId)) {
-        setActiveRepoId(null);
-        setCurrentView('projects');
-      }
+  const handleBatchDeleteProjects = async () => {
+    if (!selectedProjectIds.length || !confirm('删除所选项目的本地记录和缓存？远程仓库不会删除。')) return;
+    try {
+      for (const id of selectedProjectIds) { await localCache.deleteProjectFiles(id); persistRepos(reposRef.current.filter(r => r.id !== id)); }
+      if (activeRepoId && selectedProjectIds.includes(activeRepoId)) { setActiveRepoId(null); setCurrentView('projects'); }
       setSelectedProjectIds([]);
-    }
+    } catch (error) { alert('部分删除未完成：' + (error as Error).message); }
   };
 
   // Open Batch Add Tag Modal
@@ -1433,154 +1090,35 @@ export default config;
 
   // Execute Batch Upload to User's GitHub Private Repositories
   const handleStartBatchUpload = async () => {
-    let token = globalToken;
-    if (!token) {
-      const entered = prompt('批量上传至个人私人仓库需要 GitHub Token (PAT)，请输入：');
-      if (!entered) return;
-      token = entered.trim();
-    }
-
-    const selectedRepos = repos.filter(r => selectedProjectIds.includes(r.id));
-    setIsBatchUploading(true);
-
-    const updatedReposMap = new Map<string, Partial<TrackedRepo>>();
-
-    for (let i = 0; i < selectedRepos.length; i++) {
-      const target = selectedRepos[i];
-
-      // Update status to creating
-      setBatchUploadStatusList(prev => prev.map((item, idx) =>
-        idx === i ? { ...item, status: 'creating' } : item
-      ));
-
-      try {
-        const tokenToUse = target.token || token;
-
-        // 1. Ensure private repo on user's GitHub account (Dual-channel)
-        let ensureRes: any = null;
+    const token = globalToken || prompt('请输入 GitHub Token：')?.trim();
+    if (!token) return;
+    const purge = confirm('上传验证成功后是否清理本地源码？\n确定：清理源码并保留快照；取消：保留源码。');
+    beginGithubOperation(); setIsBatchUploading(true);
+    try {
+      for (const repo of reposRef.current.filter(r => selectedProjectIds.includes(r.id))) {
+        if (operationSignal().aborted) break;
+        const status = (value: Partial<BatchUploadItemStatus>) => setBatchUploadStatusList(prev => prev.map(item => item.id === repo.id ? { ...item, ...value } : item));
         try {
-          ensureRes = await safeFetchJson('/api/github/ensure-private-repo', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              token: tokenToUse,
-              repoName: target.repo,
-              description: target.description || target.repoMeta?.description || '',
-              remark: target.remark
-            })
-          });
-        } catch {
-          ensureRes = await githubClient.ensurePrivateRepo(
-            tokenToUse,
-            target.repo,
-            target.description || target.repoMeta?.description || '',
-            target.remark
-          );
-        }
-
-        // 2. Fetch full project files from local cache
-        setBatchUploadStatusList(prev => prev.map((item, idx) =>
-          idx === i ? { ...item, status: 'uploading' } : item
-        ));
-
-        let payloadFiles: CachedFile[] = await localCache.getProjectFiles(target.id);
-        if (payloadFiles.length === 0) {
-          try {
-            let freshData: any = null;
-            try {
-              freshData = await safeFetchJson('/api/github/fetch', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  url: target.url,
-                  branch: target.branch || 'main',
-                  token: tokenToUse
-                })
-              });
-            } catch {
-              freshData = await githubClient.fetchRepo(target.url, target.branch || 'main', tokenToUse);
-            }
-
-            if (freshData.files && freshData.files.length > 0) {
-              await localCache.saveProjectFiles(target.id, freshData.files);
-              payloadFiles = freshData.files;
-            }
-          } catch {}
-        }
-
-        // 3. Push complete project to private repo (Dual-channel)
-        try {
-          await safeFetchJson('/api/github/push', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              targetOwner: ensureRes.owner,
-              targetRepo: ensureRes.repo,
-              targetBranch: 'main',
-              token: tokenToUse,
-              files: payloadFiles,
-              commitMessage: `Batch uploaded via GitVault: ${target.remark || target.repo}`,
-              description: target.description || target.repoMeta?.description || '',
-              remark: target.remark,
-              originalSourceUrl: target.url
-            })
-          });
-        } catch {
-          await githubClient.push(
-            ensureRes.owner,
-            ensureRes.repo,
-            'main',
-            tokenToUse,
-            payloadFiles,
-            `Batch uploaded via GitVault: ${target.remark || target.repo}`,
-            target.description || target.repoMeta?.description || '',
-            target.remark,
-            target.url
-          );
-        }
-
-        updatedReposMap.set(target.id, {
-          privateRepoUrl: ensureRes.htmlUrl,
-          lastUploadedToPrivateAt: new Date().toISOString(),
-          cachedFilesCount: payloadFiles.length
-        });
-
-        setBatchUploadStatusList(prev => prev.map((item, idx) =>
-          idx === i ? { ...item, status: 'success', htmlUrl: ensureRes.htmlUrl } : item
-        ));
-      } catch (err: any) {
-        setBatchUploadStatusList(prev => prev.map((item, idx) =>
-          idx === i ? { ...item, status: 'error', error: err.message || '上传失败' } : item
-        ));
+          status({ status: 'creating' });
+          const auth = repo.token || token;
+          const target = await githubClient.ensurePrivateRepo(auth, repo.repo, repo.description, repo.remark);
+          status({ status: 'uploading' });
+          const files = await versionFiles(repo);
+          const result = await githubClient.push(target.owner, target.repo, target.defaultBranch, auth, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.description, repo.remark, repo.url);
+          await recordUpload(repo, result, purge, undefined, { privateRepoUrl: target.htmlUrl }, auth);
+          status({ status: 'success', htmlUrl: target.htmlUrl });
+        } catch (error) { status({ status: 'error', error: (error as Error).message }); }
       }
-    }
-
-    // Apply updates to repos state
-    if (updatedReposMap.size > 0) {
-      setRepos(prev => prev.map(r => {
-        if (updatedReposMap.has(r.id)) {
-          return { ...r, ...updatedReposMap.get(r.id)! };
-        }
-        return r;
-      }));
-    }
-
-    setIsBatchUploading(false);
+    } finally { setIsBatchUploading(false); }
   };
 
   // Batch Purge Local Cache for selected projects
-  const handleBatchPurgeCache = () => {
-    if (selectedProjectIds.length === 0) return;
-    if (confirm(`确定要释放选中的 ${selectedProjectIds.length} 个项目的本地文件缓存吗？\n软件内将完整保留项目名称、备注、描述、标签与归档记录，云端数据保持不变，随时可一键重新拉取还原！`)) {
-      setRepos(prev => prev.map(r => {
-        if (selectedProjectIds.includes(r.id)) {
-          return { ...r, isCachePurged: true, tree: [] };
-        }
-        return r;
-      }));
-      alert(`已成功释放 ${selectedProjectIds.length} 个项目的本地缓存空间！`);
-      setSelectedProjectIds([]);
-    }
+  const handleBatchPurgeCache = async () => {
+    if (!selectedProjectIds.length || !confirm('清理所选项目的本地源码？项目快照和版本记录会保留。')) return;
+    try {
+      for (const id of selectedProjectIds) { await localCache.deleteProjectFiles(id); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
+      setSelectedProjectIds([]); alert('本地源码已清理，快照已保留。');
+    } catch (error) { alert('缓存清理未完成：' + (error as Error).message); }
   };
 
   // Selection Experience Enhancements for Backups
@@ -1642,6 +1180,7 @@ export default config;
     }
 
     const selectedBackups = activeRepo.backups.filter(b => selectedBackupIds.includes(b.id));
+    beginGithubOperation();
     setIsBatchPublishing(true);
 
     let successCount = 0;
@@ -1659,8 +1198,9 @@ export default config;
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            owner: activeRepo.owner,
-            repo: activeRepo.repo,
+            owner: b.remoteSnapshot?.owner || activeRepo.owner,
+            repo: b.remoteSnapshot?.repo || activeRepo.repo,
+            commitSha: b.remoteSnapshot?.commitSha || b.commitSha,
             tagName: b.tag,
             releaseName: `${batchReleaseTitlePrefix.trim()} ${b.tag}`,
             body: releaseBody,
@@ -1675,13 +1215,14 @@ export default config;
             isReleased: true,
             releaseUrl: res.releaseUrl,
             isCachePurged: purgeCacheOption ? true : updatedBackups[targetIdx].isCachePurged,
-            tree: purgeCacheOption ? [] : updatedBackups[targetIdx].tree
+            tree: updatedBackups[targetIdx].tree
           };
         }
 
         setBatchReleaseProgress(prev => prev.map((item, idx) =>
           idx === i ? { ...item, status: 'success', releaseUrl: res.releaseUrl } : item
         ));
+        if (purgeCacheOption) await localCache.deleteProjectFiles(activeRepo.id, b.commitSha);
         successCount++;
       } catch (err: any) {
         setBatchReleaseProgress(prev => prev.map((item, idx) =>
@@ -1702,127 +1243,57 @@ export default config;
   };
 
   // Purge local cache for single backup
-  const handlePurgeBackupCache = (backupId: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    if (!activeRepo) return;
-    if (confirm('确认销毁此归档版本的本地文件大缓存？\n软件内将完整保留版本标签、提交记录、SHA 与发布链接，云端保持不变，可随时同源拉取还原。')) {
-      setRepos(prev => prev.map(r => {
-        if (r.id === activeRepo.id) {
-          const updated = r.backups.map(b => b.id === backupId ? { ...b, isCachePurged: true, tree: [] } : b);
-          return { ...r, backups: updated };
-        }
-        return r;
-      }));
-    }
+  const handlePurgeBackupCache = async (backupId: string, e?: React.MouseEvent) => {
+    e?.stopPropagation(); if (!activeRepo) return;
+    const backup = activeRepo.backups.find(b => b.id === backupId);
+    if (!backup || !confirm('清理此版本的本地源码？版本快照会保留。')) return;
+    try {
+      await localCache.deleteProjectFiles(activeRepo.id, backup.commitSha);
+      patchRepo(activeRepo.id, { backups: activeRepo.backups.map(b => b.id === backupId ? { ...b, isCachePurged: true } : b) });
+    } catch (error) { alert('清理失败：' + (error as Error).message); }
   };
 
   // Purge local cache for the active project
   const handlePurgeProjectCache = async (repoId: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    if (confirm('确认销毁该项目的本地文件大缓存？\n销毁后将释放本地空间，GitVault 会完整保留项目名称、备注、描述、标签及归档元数据，随时可一键从 GitHub 重新拉取还原（同源互通）！')) {
+    e?.stopPropagation(); if (!confirm('清理该项目的本地源码？项目快照和历史版本记录会保留。')) return;
+    try {
       await localCache.deleteProjectFiles(repoId);
-      setRepos(prev => prev.map(r => {
-        if (r.id === repoId) {
-          return { ...r, isCachePurged: true, cachedFilesCount: 0, tree: [] };
-        }
-        return r;
-      }));
-      if (activeRepoId === repoId) {
-        setSelectedFilePath(null);
-        setFileContent(null);
-      }
-    }
+      patchRepo(repoId, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === repoId)?.backups || []).map(b => ({ ...b, isCachePurged: true })) });
+      if (activeRepoId === repoId) { setSelectedFilePath(null); setFileContent(null); }
+    } catch (error) { alert('清理失败：' + (error as Error).message); }
   };
 
   // Re-pull and restore cache from GitHub for a project
   const handleRepullProjectCache = async (repoId: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    const repo = repos.find(r => r.id === repoId);
-    if (!repo) return;
-
-    setIsLoading(true);
-    setLoadingText(`正在从 GitHub 重新拉取项目 ${repo.repo} 完整文件树并还原本地缓存...`);
-
+    e?.stopPropagation(); const repo = reposRef.current.find(r => r.id === repoId); if (!repo) return;
+    startOperation();
     try {
-      const tokenToUse = repo.token || globalToken;
-      const data = await safeFetchJson('/api/github/fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: repo.url,
-          branch: repo.branch,
-          token: tokenToUse
-        })
-      });
-
-      if (data.files && data.files.length > 0) {
-        await localCache.saveProjectFiles(repoId, data.files);
-      }
-
-      setRepos(prev => prev.map(r => {
-        if (r.id === repoId) {
-          return {
-            ...r,
-            tree: data.tree,
-            latestCommitSha: data.latestCommitSha,
-            commitMessage: data.commitMessage,
-            commitAuthor: data.commitAuthor,
-            commitDate: data.commitDate,
-            lastSyncedAt: new Date().toISOString(),
-            isCachePurged: false,
-            cachedFilesCount: data.files ? data.files.length : r.cachedFilesCount
-          };
-        }
-        return r;
-      }));
-
-      alert(`🎉 项目 ${repo.repo} 完整源码已成功从 GitHub 重新拉取！\n本地缓存已还原（共 ${data.files ? data.files.length : 0} 个文件），支持离线查看。`);
-    } catch (err: any) {
-      alert('重新拉取还原失败: ' + err.message);
-    } finally {
-      setIsLoading(false);
-    }
+      const files = await versionFiles(repo);
+      patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: files.length });
+      alert(`已恢复当前快照的 ${files.length} 个文件；获取新版本请使用更新操作。`);
+    } catch (error) { alert('恢复未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // File viewing logic (Checks local IndexedDB cache first for 0ms offline display)
   const handleSelectFile = async (filePath: string) => {
-    if (!activeRepo) return;
-    setSelectedFilePath(filePath);
-    setFileLoading(true);
-    setFileContent(null);
-    setMobileFileView('view');
-
+    if (!activeRepo || activeTree.find(f => f.path === filePath)?.type !== 'blob') return;
+    if (operationSignal().aborted) beginGithubOperation();
+    const requestId = ++fileRequest.current;
+    const version = viewingBackup;
+    const sha = version?.commitSha || activeRepo.latestCommitSha;
+    setSelectedFilePath(filePath); setFileLoading(true); setFileContent(null); setMobileFileView('view');
     try {
-      // 1. Try reading from local IndexedDB cache first
-      const cached = await localCache.getProjectFile(activeRepo.id, filePath);
-      if (cached) {
-        setFileContent(cached.content);
-        setFileContentType(cached.isBase64 ? 'base64' : 'text');
-        setFileLoading(false);
-        return;
+      const cached = await localCache.getProjectFile(activeRepo.id, filePath, sha);
+      let data: { type: string; content: string };
+      if (cached) data = { content: cached.content, type: cached.isBase64 ? 'base64' : 'text' };
+      else {
+        const remote = version?.remoteSnapshot || (!version ? activeRepo.remoteSnapshot : undefined);
+        data = await githubClient.getFile(remote?.owner || activeRepo.owner, remote?.repo || activeRepo.repo, filePath, remote ? activeRepo.uploadTarget?.token || globalToken || activeRepo.token : activeRepo.token || globalToken, remote?.commitSha || sha);
       }
-
-      // 2. Fall back to remote API
-      const tokenToUse = activeRepo.token || globalToken;
-      const data = await safeFetchJson('/api/github/file', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          owner: activeRepo.owner,
-          repo: activeRepo.repo,
-          path: filePath,
-          token: tokenToUse || undefined
-        })
-      });
-
-      setFileContent(data.content);
-      setFileContentType(data.type);
-    } catch (err: any) {
-      setFileContent(`读取文件失败: ${err.message}`);
-      setFileContentType('text');
-    } finally {
-      setFileLoading(false);
-    }
+      if (requestId === fileRequest.current) { setFileContent(data.content); setFileContentType(data.type); }
+    } catch (error) { if (requestId === fileRequest.current) { setFileContent('读取失败：' + (error as Error).message); setFileContentType('text'); } }
+    finally { if (requestId === fileRequest.current) setFileLoading(false); }
   };
 
   // AI Changelog generation
@@ -1838,7 +1309,7 @@ export default config;
           repoName: activeRepo.repo,
           oldCommitMsg: activeRepo.backups[0]?.commitMessage || '初始版本',
           newCommitMsg: activeRepo.commitMessage,
-          fileChangesCount: activeRepo.tree.length
+          fileChangesCount: activeRepo.backups[0] ? Object.values(computeDiff(activeRepo.backups[0], activeRepo.tree)).reduce((n, paths) => n + paths.length, 0) : activeRepo.tree.filter(f => f.type === 'blob').length
         })
       });
 
@@ -1849,7 +1320,7 @@ export default config;
         return r;
       }));
     } catch (err) {
-      console.error('Changelog failed:', err);
+      alert('日志生成失败：' + (err as Error).message);
     } finally {
       setAiLoading(false);
     }
@@ -1857,9 +1328,11 @@ export default config;
 
   // Compare diff between backup and current
   const computeDiff = (backup: BackupVersion, currentTree: RepoTreeItem[]) => {
-    const backupPaths = new Set(backup.tree.map(i => i.path));
+    const backupFiles = backup.tree.filter(item => item.type === 'blob');
+    currentTree = currentTree.filter(item => item.type === 'blob');
+    const backupPaths = new Set(backupFiles.map(i => i.path));
     const currentPaths = new Set(currentTree.map(i => i.path));
-    const backupMap = new Map(backup.tree.map(i => [i.path, i.sha]));
+    const backupMap = new Map(backupFiles.map(i => [i.path, i.sha]));
     const currentMap = new Map(currentTree.map(i => [i.path, i.sha]));
 
     const added: string[] = [];
@@ -1995,41 +1468,27 @@ export default config;
   const handleDownloadSelectedFolder = async () => {
     if (!projectSettingsTarget || filesInSelectedFolder.length === 0) return;
     setIsDownloadingFolder(true);
-    setIsLoading(true);
+    startOperation();
     setLoadingText(`正在为 APK/移动端 打包自选文件夹 [${selectedFolderToDownload}] (共 ${filesInSelectedFolder.length} 个文件)...`);
 
     try {
+      const { default: JSZip } = await import('jszip');
       const zip = new JSZip();
       const cleanFolderName = selectedFolderToDownload === '/' ? 'root' : selectedFolderToDownload.replace(/\//g, '_');
       const zipRootFolderName = `${projectSettingsTarget.repo}-${cleanFolderName}`;
       const rootZipFolder = zip.folder(zipRootFolderName);
 
       let fetchedCount = 0;
-      const filesToFetch = filesInSelectedFolder.slice(0, 100);
-
+      const filesToFetch = filesInSelectedFolder;
+      const fullSnapshot = await versionFiles(projectSettingsTarget);
+      const filesByPath = new Map(fullSnapshot.map(file => [file.path, file]));
       for (const file of filesToFetch) {
-        try {
-          const data = await safeFetchJson('/api/github/file', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              owner: projectSettingsTarget.owner,
-              repo: projectSettingsTarget.repo,
-              path: file.path,
-              token: projectSettingsTarget.token || globalToken
-            })
-          });
-          let relPath = file.path;
-          if (selectedFolderToDownload !== '/' && file.path.startsWith(selectedFolderToDownload + '/')) {
-            relPath = file.path.slice(selectedFolderToDownload.length + 1);
-          }
-          if (data.type === 'text') {
-            rootZipFolder?.file(relPath, data.content);
-          } else if (data.type === 'base64') {
-            rootZipFolder?.file(relPath, data.content, { base64: true });
-          }
-          fetchedCount++;
-        } catch {}
+        operationSignal().throwIfAborted();
+        const cached = filesByPath.get(file.path);
+        if (!cached) throw new Error(`文件缺失，导出已停止：${file.path}`);
+        const relPath = selectedFolderToDownload === '/' ? file.path : file.path.slice(selectedFolderToDownload.length + 1);
+        rootZipFolder?.file(relPath, cached.content, { base64: cached.isBase64 });
+        setLoadingText(`正在打包 ${++fetchedCount}/${filesToFetch.length}：${file.path}`);
       }
 
       // Add APK / Mobile export manifest
@@ -2846,7 +2305,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     ) : (
                       <span className="text-xs bg-[#8E9F8B]/20 text-[#3D4F3A] px-2.5 py-0.5 rounded border border-[#8E9F8B]/30 font-mono flex flex-row items-center gap-1 whitespace-nowrap shrink-0 font-medium">
                         <HardDrive className="w-3 h-3 text-[#5D6F5A] shrink-0" />
-                        <span>源码已完整本地缓存 ({activeRepo.cachedFilesCount || activeRepo.tree.length} 文件，已离线)</span>
+                        <span>源码已本地保存 ({activeRepo.cachedFilesCount ?? activeRepo.tree.length} 文件)</span>
                       </span>
                     )}
                     {viewingBackup && (
@@ -2885,6 +2344,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 >
                   <GitBranch className="w-3.5 h-3.5 shrink-0" />
                   <span>分叉与私有仓</span>
+                </button>
+                <button
+                  onClick={() => { setPushBackupTarget(viewingBackup); setPushTargetRepo(activeRepo.uploadTarget ? `${activeRepo.uploadTarget.owner}/${activeRepo.uploadTarget.repo}` : ''); setPushTargetBranch(activeRepo.uploadTarget?.branch || 'main'); setIsPushModalOpen(true); }}
+                  className="px-3 py-2 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#4D5E4A] rounded-xl text-xs font-semibold border border-[#DCD5CB] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <UploadCloud className="w-3.5 h-3.5 shrink-0" /><span>上传指定仓库</span>
                 </button>
 
                 <button
@@ -3024,15 +2489,9 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           暂无文件数据可供生成热力图
                         </div>
                       ) : (
-                        <ResponsiveContainer width="100%" height="100%">
-                          <Treemap
-                            data={heatmapData}
-                            dataKey="size"
-                            aspectRatio={4 / 3}
-                            stroke="#FAF8F5"
-                            content={<CustomizedTreemapContent />}
-                          />
-                        </ResponsiveContainer>
+                        <React.Suspense fallback={<span className="text-xs text-[#7A7367]">正在加载图表…</span>}>
+                          <RepoHeatmap data={heatmapData} content={<CustomizedTreemapContent />} />
+                        </React.Suspense>
                       )}
                     </div>
                   </div>
@@ -3055,7 +2514,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       <div className="flex-1 overflow-y-auto flex flex-col gap-1 pr-1">
                         {activeTree
                           .filter(t => t.path.toLowerCase().includes(fileSearchQuery.toLowerCase()))
-                          .slice(0, 150)
+                          .slice(0, visibleFileCount)
                           .map(item => {
                             const isSelected = selectedFilePath === item.path;
                             return (
@@ -3077,6 +2536,9 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                               </div>
                             );
                           })}
+                        {activeTree.filter(t => t.path.toLowerCase().includes(fileSearchQuery.toLowerCase())).length > visibleFileCount && (
+                          <button type="button" onClick={() => setVisibleFileCount(n => n + 150)} className="px-3 py-2 text-xs text-[#5D6F5A] hover:underline">加载更多文件</button>
+                        )}
                       </div>
                     </div>
 
@@ -3241,12 +2703,14 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                             <button
                               onClick={() => {
                                 setViewingBackup(viewingBackup?.id === backup.id ? null : backup);
+                                fileRequest.current++; setSelectedFilePath(null); setFileContent(null);
                                 setWorkbenchTab('files');
                               }}
                               className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0"
                             >
                               {viewingBackup?.id === backup.id ? '取消查看' : '查看此版本'}
                             </button>
+                            <button onClick={() => { setPushBackupTarget(backup); setPushTargetRepo(''); setIsPushModalOpen(true); }} className="px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition shrink-0">上传此版本</button>
                           </div>
                         </div>
                       );
@@ -3369,6 +2833,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       type="button"
                       onClick={async () => {
                         if (!repoUrl.trim()) return;
+                        if (operationSignal().aborted) beginGithubOperation();
                         setIsLoadingBranches(true);
                         try {
                           const branches = await githubClient.fetchBranches(repoUrl.trim(), tokenInput.trim() || globalToken);
@@ -3400,7 +2865,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   ) : (
                     <input
                       type="text"
-                      placeholder="main (可点右侧获取全部分支)"
+                      placeholder="留空自动识别（支持链接指定分支）"
                       value={branchInput}
                       onChange={e => setBranchInput(e.target.value)}
                       className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] placeholder-[#91887C] focus:outline-none focus:border-[#8E9F8B]"
@@ -3672,6 +3137,37 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 {isBatchUploading ? '正在批量处理...' : '开始批量上传'}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {isPushModalOpen && activeRepo && (
+        <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl max-w-xl w-full p-6 shadow-xl flex flex-col gap-5">
+            <div className="flex items-center justify-between border-b border-[#EDE7DF] pb-4">
+              <h3 className="text-base font-bold font-serif text-[#2B2723]">上传指定仓库</h3>
+              <button type="button" onClick={() => setIsPushModalOpen(false)} className="text-[#91887C] hover:text-[#2E2B27]"><X className="w-5 h-5" /></button>
+            </div>
+            <form onSubmit={handlePushProjectToGitHub} className="flex flex-col gap-4">
+              <p className="text-xs text-[#7A7367]">上传版本：{(pushBackupTarget?.commitSha || activeRepo.latestCommitSha).slice(0, 12)}。目标分支会同步为该版本的完整文件，包括删除的文件。</p>
+              <label className="text-xs font-semibold text-[#474239]">目标仓库
+                <input required value={pushTargetRepo} onChange={e => setPushTargetRepo(e.target.value)} placeholder="owner/repo" className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              </label>
+              <label className="text-xs font-semibold text-[#474239]">目标分支
+                <input value={pushTargetBranch} onChange={e => setPushTargetBranch(e.target.value)} placeholder="留空使用目标默认分支" className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              </label>
+              <label className="text-xs font-semibold text-[#474239]">提交说明
+                <input value={pushCommitMsg} onChange={e => setPushCommitMsg(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              </label>
+              <label className="text-xs font-semibold text-[#474239]">上传 Token（留空使用项目或全局 Token）
+                <input type="password" value={pushToken} onChange={e => setPushToken(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              </label>
+              <label className="flex items-center gap-2 text-xs text-[#474239]"><input type="checkbox" checked={purgePushCacheOption} onChange={e => setPurgePushCacheOption(e.target.checked)} className="accent-[#8E9F8B]" />上传验证成功后清理对应版本的本地源码，保留快照</label>
+              <div className="flex justify-end gap-3 pt-3 border-t border-[#EDE7DF]">
+                <button type="button" onClick={() => setIsPushModalOpen(false)} className="px-4 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs font-medium">取消</button>
+                <button type="submit" className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold shadow-xs">确认上传</button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -4338,7 +3834,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         <div className="fixed inset-0 bg-[#33302C]/30 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl p-6 shadow-xl flex flex-row items-center gap-3.5 max-w-sm w-full whitespace-nowrap">
             <Loader2 className="w-6 h-6 text-[#8E9F8B] animate-spin shrink-0" />
-            <span className="text-xs font-medium text-[#2E2B27] truncate">{loadingText}</span>
+            <span className="text-xs font-medium text-[#2E2B27] truncate" title={loadingText}>{loadingText}</span>
+            <button type="button" onClick={cancelGithubOperation} className="text-xs text-[#8C5D54] shrink-0 hover:underline">取消</button>
           </div>
         </div>
       )}
