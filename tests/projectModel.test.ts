@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sourceOf, savedSnapshot, renamedProject } from '../src/utils/projectModel';
+import { sourceOf, savedSnapshot, renamedProject, archiveVersion } from '../src/utils/projectModel';
 
 test('renaming a bound repository updates copies and all history links without changing source', () => {
   const target = { id: 77, owner: 'me', repo: 'chosen-name', branch: 'release', purgeAfterUpload: false };
@@ -20,4 +20,7 @@ test('restoring an old target does not make it the cache source for a newer sour
   const project = { remoteSnapshot: old, backups: [{ id: 'new', versionNumber: 1, tag: '', annotation: '', commitSha: 'new', commitMessage: '', commitAuthor: '', commitDate: '', backedUpAt: '', tree: [], remoteSnapshot: current }] };
   assert.equal(savedSnapshot(project, 'new')?.commitSha, 'previous-current');
   assert.equal(savedSnapshot(project, 'old')?.commitSha, 'restored');
+  const archived = archiveVersion({ ...project, latestCommitSha: 'new', tree: [], commitMessage: '', commitAuthor: '', commitDate: '' });
+  assert.equal(archived.remoteSnapshot?.sourceSha, 'new');
+  assert.equal(archived.remoteSnapshot?.commitSha, 'previous-current');
 });
