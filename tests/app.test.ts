@@ -18,12 +18,13 @@ let root: Root;
 let alerts: string[];
 let requests: Array<{ path: string; payload: any }>;
 let failUpload: boolean;
+let rejectionStatus: number;
 let uploadedContents: string[];
 const ok = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 beforeEach(async () => {
   beginGithubOperation(); localStorage.clear(); document.body.innerHTML = '<div id="root"></div>';
   await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase('GitVault_Storage_v1'); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
-  alerts = []; requests = []; uploadedContents = []; failUpload = false;
+  alerts = []; requests = []; uploadedContents = []; failUpload = false; rejectionStatus = 403;
   (globalThis as any).alert = (message: string) => alerts.push(message);
   (globalThis as any).confirm = () => true;
   (globalThis as any).prompt = () => 'fake-test-token';
@@ -32,13 +33,13 @@ beforeEach(async () => {
     const payload = init.body ? JSON.parse(init.body as string) : null;
     requests.push({ path, payload });
     if (path === '/repos/destination/backup') return ok({ default_branch: 'main' });
-    if (path === '/repos/destination/backup/git/ref/heads/release') return ok({ object: { sha: requests.some(r => r.path.endsWith('/git/refs/heads/release')) ? 'uploaded' : 'parent' } });
+    if (path === '/repos/destination/backup/git/ref/heads/release') return ok({ object: { sha: !failUpload && requests.some(r => r.path.endsWith('/git/refs/heads/release')) ? 'uploaded' : 'parent' } });
     if (path.endsWith('/git/commits/parent')) return ok({ tree: { sha: 'old-tree' } });
     if (path.includes('/git/trees/old-tree')) return ok({ tree: [] });
     if (path.endsWith('/git/blobs')) { uploadedContents.push(payload.content); return ok({ sha: sha(payload.content) }); }
     if (path.endsWith('/git/trees')) return ok({ sha: 'uploaded-tree' });
     if (path.endsWith('/git/commits')) return ok({ sha: 'uploaded' });
-    if (path.endsWith('/git/refs/heads/release')) return failUpload ? ok({ message: 'rejected' }, 403) : ok({ object: { sha: 'uploaded' } });
+    if (path.endsWith('/git/refs/heads/release')) return failUpload ? ok({ message: rejectionStatus === 422 ? 'Update is not a fast forward' : 'rejected' }, rejectionStatus) : ok({ object: { sha: 'uploaded' } });
     if (path.endsWith('/git/commits/uploaded')) return ok({ tree: { sha: 'uploaded-tree' } });
     if (path.endsWith('/forks')) return ok({ owner: { login: 'me' }, name: 'project-fork', default_branch: 'develop', html_url: 'https://github.com/me/project-fork' });
     if (path === '/repos/me/project-fork') return ok({ fork: true, parent: { full_name: 'source/project' }, default_branch: 'develop' });
@@ -249,4 +250,14 @@ test('editing repository URL clears obsolete branches and ignores late responses
 test('branch lookup prompts for a repository URL instead of silently doing nothing', async () => {
   await click('新建链接/拉取项目'); await click('获取全部分支');
   assert.ok(document.querySelector('[role=alert]')?.textContent?.includes('请先填写'));
+});
+
+
+test('non-fast-forward rejection never clears the selected local snapshot', async () => {
+  failUpload = true; rejectionStatus = 422;
+  await enterWorkbench(); await upload(true);
+  await waitFor(() => alerts.length > 0);
+  assert.ok(alerts.some(message => message.includes('非快进更新')));
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
 });

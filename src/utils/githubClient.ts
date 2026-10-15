@@ -273,8 +273,10 @@ export const githubClient = {
     const meta = await json(base, token);
     const branch = targetBranch || meta.default_branch || 'main';
     const refUrl = `${base}/git/ref/heads/${refPath(branch)}`;
+    const readHead = async () => (await json(refUrl, token, { cache: 'no-store' }, signal)).object.sha as string;
+    const conflict = (latest: string) => new Error(`目标分支 ${targetOwner}/${targetRepo}:${branch} 在上传期间已变化（${parent.slice(0, 7) || '未创建'} → ${latest.slice(0, 7)}），本次未强制覆盖；本地文件已保留。请重新读取目标分支后重试，或上传到新分支。`);
     let parent = '';
-    try { parent = (await json(refUrl, token)).object.sha; }
+    try { parent = await readHead(); }
     catch (error) { if (!(error instanceof GitHubError) || error.status !== 404 && error.status !== 409) throw error; }
     const allFiles = [...files];
     if (description || remark || originalSourceUrl) {
@@ -317,14 +319,41 @@ export const githubClient = {
     const commit = parent && parentTree === treeSha ? { sha: parent } : await json(`${base}/git/commits`, token, body('POST', { message: commitMessage || 'Sync complete project snapshot via GitVault', tree: treeSha, parents: parent ? [parent] : [] }));
     signal.throwIfAborted();
     if (parent) {
-      const current = await json(refUrl, token);
-      if (current.object.sha !== parent) throw new Error('目标分支在上传期间已变化，请重新比较后重试；本地文件已保留');
-      await json(`${base}/git/refs/heads/${refPath(branch)}`, token, body('PATCH', { sha: commit.sha, force: false }));
-    } else await json(`${base}/git/refs`, token, body('POST', { ref: `refs/heads/${branch}`, sha: commit.sha }));
+      const current = await readHead();
+      if (current !== parent && current !== commit.sha) throw conflict(current);
+      // Identical snapshots are already present. Do not update a ref to its own SHA.
+      if (current !== commit.sha) {
+        try {
+          await json(`${base}/git/refs/heads/${refPath(branch)}`, token, body('PATCH', { sha: commit.sha, force: false }), signal);
+        } catch (error) {
+          signal.throwIfAborted();
+          if (error instanceof GitHubError && error.status < 500 && ![409, 422].includes(error.status)) throw error;
+          let actual: string;
+          try { actual = await readHead(); } catch { throw error; }
+          // A successful write can lose its HTTP response. Verify it instead of repeating the mutation.
+          if (actual !== commit.sha) {
+            if (actual !== parent) throw conflict(actual);
+            if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) {
+              throw new Error(`目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`);
+            }
+            throw error;
+          }
+        }
+      }
+    } else {
+      try { await json(`${base}/git/refs`, token, body('POST', { ref: `refs/heads/${branch}`, sha: commit.sha }), signal); }
+      catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof GitHubError && error.status < 500 && ![409, 422].includes(error.status)) throw error;
+        let actual: string;
+        try { actual = await readHead(); } catch { throw error; }
+        if (actual !== commit.sha) throw conflict(actual);
+      }
+    }
     progress('正在验证目标提交和分支…');
-    const verifiedRef = await json(refUrl, token);
+    const verifiedHead = await readHead();
     const verifiedCommit = await json(`${base}/git/commits/${commit.sha}`, token);
-    if (verifiedRef.object.sha !== commit.sha || verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
+    if (verifiedHead !== commit.sha || verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
     return { success: true, verified: true, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
   },
 
