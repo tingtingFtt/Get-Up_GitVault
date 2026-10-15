@@ -328,15 +328,30 @@ export const githubClient = {
     return { success: true, verified: true, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
   },
 
-  async fetchBranches(url: string, token?: string): Promise<string[]> {
+  async fetchBranches(url: string, token?: string, signal?: AbortSignal): Promise<string[]> {
     const { owner, repo } = parseRepository(url);
-    const names: string[] = [];
-    for (let page = 1; ; page++) {
-      const data = await json(`${root(owner, repo)}/branches?per_page=100&page=${page}`, token);
-      names.push(...data.map((b: { name: string }) => b.name));
-      if (data.length < 100) break;
+    // Branch lookup is independent of any cancelled download/upload operation.
+    const deadline = AbortSignal.timeout(20000);
+    const lookupSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    try {
+      const meta = await json(root(owner, repo), token, {}, lookupSignal);
+      const names = new Set<string>();
+      for (let page = 1; ; page++) {
+        const data = await json(`${root(owner, repo)}/branches?per_page=100&page=${page}`, token, {}, lookupSignal);
+        if (!Array.isArray(data)) throw new Error('GitHub 返回的分支列表格式异常，请重试');
+        for (const branch of data) if (typeof branch.name === 'string') names.add(branch.name);
+        if (data.length < 100) break;
+      }
+      if (!names.size) throw new Error('仓库暂无分支，请确认仓库已经创建首次提交');
+      return [...names].sort((a, b) => a === meta.default_branch ? -1 : b === meta.default_branch ? 1 : a.localeCompare(b));
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      if (deadline.aborted) throw new Error('获取分支超时（20 秒），请检查 GitHub API 连接后重试');
+      if (error instanceof GitHubError && error.status === 401) throw new Error('GitHub Token 无效或已过期。公开仓库可清空专属及全局 Token 后重试；私有仓库请更换有效 Token');
+      if (error instanceof GitHubError && error.status === 404) throw new Error('仓库不存在，或当前 Token 没有访问此私有仓库的权限');
+      if (error instanceof TypeError) throw new Error('无法连接 GitHub 分支接口，请检查网络连接后重试');
+      throw error;
     }
-    return names;
   },
 
   async createFork(url: string, token: string, newRepoName?: string) {

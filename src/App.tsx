@@ -263,6 +263,9 @@ export default function App() {
   const [tagsInput, setTagsInput] = useState('默认');
   const [availableBranches, setAvailableBranches] = useState<string[]>([]);
   const [isLoadingBranches, setIsLoadingBranches] = useState(false);
+  const [branchError, setBranchError] = useState('');
+  const branchLookup = useRef<AbortController | null>(null);
+  const branchLookupId = useRef(0);
 
   // Workbench state
   const [workbenchTab, setWorkbenchTab] = useState<'files' | 'backups' | 'changelog'>('files');
@@ -277,6 +280,37 @@ export default function App() {
 
   // Mobile drawer / drill-down state in File Viewer
   const [mobileFileView, setMobileFileView] = useState<'list' | 'view'>('list');
+
+  // Cancel obsolete lookups so an old repository response cannot overwrite the current form.
+  useEffect(() => {
+    branchLookup.current?.abort();
+    branchLookupId.current++;
+    setIsLoadingBranches(false); setAvailableBranches([]); setBranchError('');
+    return () => { branchLookup.current?.abort(); branchLookupId.current++; };
+  }, [repoUrl, tokenInput, globalToken, isAddModalOpen]);
+
+  const handleFetchBranches = async () => {
+    if (!repoUrl.trim()) { setBranchError('请先填写 GitHub 仓库地址'); return; }
+    branchLookup.current?.abort();
+    const controller = new AbortController();
+    branchLookup.current = controller;
+    const requestId = ++branchLookupId.current;
+    setIsLoadingBranches(true); setBranchError('');
+    try {
+      const branches = await githubClient.fetchBranches(repoUrl.trim(), tokenInput.trim() || globalToken.trim(), controller.signal);
+      if (requestId !== branchLookupId.current) return;
+      setAvailableBranches(branches);
+      const linked = parseRepository(repoUrl).linkedRef;
+      const linkedBranch = branches.filter(name => linked === name || linked.startsWith(name + '/')).sort((a, b) => b.length - a.length)[0];
+      setBranchInput(branches.includes(branchInput) ? branchInput : linkedBranch || branches[0]);
+    } catch (error) {
+      if (requestId !== branchLookupId.current || controller.signal.aborted) return;
+      setAvailableBranches([]);
+      setBranchError((error as Error).message || '获取分支失败，请重试');
+    } finally {
+      if (requestId === branchLookupId.current) setIsLoadingBranches(false);
+    }
+  };
 
   // Async / Operation Loading
   const [isLoading, setIsLoading] = useState(false);
@@ -2780,7 +2814,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   type="text"
                   placeholder="https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo"
                   value={repoUrl}
-                  onChange={e => setRepoUrl(e.target.value)}
+                  onChange={e => { branchLookup.current?.abort(); branchLookupId.current++; setRepoUrl(e.target.value); setBranchInput(''); }}
                   required
                   className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] placeholder-[#91887C] focus:outline-none focus:border-[#8E9F8B]"
                 />
@@ -2831,27 +2865,16 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     <label className="text-xs font-semibold text-[#474239]">拉取分支</label>
                     <button
                       type="button"
-                      onClick={async () => {
-                        if (!repoUrl.trim()) return;
-                        if (operationSignal().aborted) beginGithubOperation();
-                        setIsLoadingBranches(true);
-                        try {
-                          const branches = await githubClient.fetchBranches(repoUrl.trim(), tokenInput.trim() || globalToken);
-                          if (branches && branches.length > 0) {
-                            setAvailableBranches(branches);
-                            if (!branches.includes(branchInput)) {
-                              setBranchInput(branches[0]);
-                            }
-                          }
-                        } catch {}
-                        setIsLoadingBranches(false);
-                      }}
+                      onClick={handleFetchBranches}
+                      disabled={isLoadingBranches}
                       className="text-[10px] text-[#5D6F5A] hover:underline font-medium shrink-0 flex items-center gap-1"
                     >
                       {isLoadingBranches ? <Loader2 className="w-3 h-3 animate-spin" /> : <GitBranch className="w-3 h-3" />}
-                      <span>获取全部分支</span>
+                      <span>{isLoadingBranches ? '正在获取分支…' : '获取全部分支'}</span>
                     </button>
                   </div>
+                  {branchError && <p role="alert" className="text-[11px] text-[#8C5D54] break-words">{branchError}</p>}
+                  {availableBranches.length > 0 && <p role="status" className="text-[10px] text-[#7A7367]">已获取 {availableBranches.length} 个分支，请在下方选择</p>}
                   {availableBranches.length > 0 ? (
                     <select
                       value={branchInput}

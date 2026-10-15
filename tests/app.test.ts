@@ -209,3 +209,44 @@ test('file list can reveal entries beyond the original 150 item limit', async ()
   await click('加载更多文件');
   assert.ok(document.body.textContent?.includes('file-159.txt'));
 });
+
+const repositoryPlaceholder = 'https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo';
+test('new-link branch lookup displays returned branches and selects the URL branch', async () => {
+  globalThis.fetch = async url => String(url).includes('/branches?') ? ok([{ name: 'test' }, { name: 'feature/demo' }, { name: 'main' }]) : ok({ default_branch: 'main' });
+  await click('新建链接/拉取项目');
+  await input(repositoryPlaceholder, 'https://github.com/demo/project/tree/feature/demo');
+  await click('获取全部分支');
+  await waitFor(() => !!document.querySelector('select'));
+  const select = document.querySelector('select')!;
+  assert.deepEqual([...select.options].map(o => o.value), ['main', 'feature/demo', 'test']);
+  assert.equal(select.value, 'feature/demo');
+  assert.ok(document.querySelector('[role=status]')?.textContent?.includes('3 个分支'));
+});
+
+test('new-link branch lookup shows a network error and allows retry', async () => {
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  await click('新建链接/拉取项目'); await input(repositoryPlaceholder, 'demo/project'); await click('获取全部分支');
+  await waitFor(() => !!document.querySelector('[role=alert]'));
+  assert.ok(document.querySelector('[role=alert]')?.textContent?.includes('无法连接 GitHub 分支接口'));
+  assert.equal(buttons().find(b => b.textContent?.trim() === '获取全部分支')?.disabled, false);
+  globalThis.fetch = async url => String(url).includes('/branches?') ? ok([{ name: 'main' }]) : ok({ default_branch: 'main' });
+  await click('获取全部分支'); await waitFor(() => !!document.querySelector('select'));
+  assert.equal(document.querySelector('[role=alert]'), null);
+});
+
+test('editing repository URL clears obsolete branches and ignores late responses', async () => {
+  let resolveOld: (r: Response) => void = () => {};
+  globalThis.fetch = async url => String(url).includes('/demo/old') ? new Promise<Response>(resolve => { resolveOld = resolve; }) : String(url).includes('/branches?') ? ok([{ name: 'develop' }]) : ok({ default_branch: 'develop' });
+  await click('新建链接/拉取项目'); await input(repositoryPlaceholder, 'demo/old'); await click('获取全部分支');
+  await input(repositoryPlaceholder, 'demo/new'); await click('获取全部分支');
+  await waitFor(() => !!document.querySelector('select'));
+  await act(async () => { resolveOld(ok({ default_branch: 'old-branch' })); await new Promise(r => setTimeout(r, 20)); });
+  assert.equal(document.querySelector('select')?.value, 'develop');
+  await input(repositoryPlaceholder, 'demo/third');
+  assert.equal(document.querySelector('select'), null);
+});
+
+test('branch lookup prompts for a repository URL instead of silently doing nothing', async () => {
+  await click('新建链接/拉取项目'); await click('获取全部分支');
+  assert.ok(document.querySelector('[role=alert]')?.textContent?.includes('请先填写'));
+});

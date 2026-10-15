@@ -191,3 +191,29 @@ test('truncated recursive trees are walked completely', async () => {
   const result = await githubClient.fetchRepo('demo/project');
   assert.equal(result.files[0].path, 'folder/a.txt');
 });
+
+test('branch lookup paginates, keeps slash names, and puts the default branch first', async () => {
+  handler = path => {
+    if (path === '/repos/demo/project') return response({ default_branch: 'main' });
+    if (path.endsWith('page=1')) return response(Array.from({ length: 100 }, (_, i) => ({ name: `feature/${i}` })));
+    if (path.endsWith('page=2')) return response([{ name: 'main' }, { name: 'test' }]);
+    throw new Error(path);
+  };
+  const branches = await githubClient.fetchBranches('demo/project');
+  assert.equal(branches.length, 102); assert.equal(branches[0], 'main'); assert.ok(branches.includes('feature/99'));
+});
+
+test('branch lookup remains usable after a download was cancelled', async () => {
+  cancelGithubOperation();
+  handler = path => path === '/repos/demo/project' ? response({ default_branch: 'main' }) : response([{ name: 'main' }, { name: 'test' }]);
+  assert.deepEqual(await githubClient.fetchBranches('demo/project'), ['main', 'test']);
+});
+
+test('branch lookup explains invalid tokens, private access errors and empty repos', async () => {
+  handler = () => response({ message: 'Bad credentials' }, 401);
+  await assert.rejects(() => githubClient.fetchBranches('demo/project', 'expired'), /Token 无效或已过期/);
+  handler = () => response({ message: 'Not Found' }, 404);
+  await assert.rejects(() => githubClient.fetchBranches('demo/project'), /私有仓库/);
+  handler = path => path === '/repos/demo/project' ? response({ default_branch: 'main' }) : response([]);
+  await assert.rejects(() => githubClient.fetchBranches('demo/project'), /暂无分支/);
+});
