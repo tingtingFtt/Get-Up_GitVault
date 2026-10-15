@@ -107,18 +107,22 @@ test('cache failure cannot be reported as durable memory-only success', async ()
 
 function destination(options: { race?: boolean; badVerification?: boolean; failPatch?: boolean; sameTree?: boolean } = {}) {
   let reads = 0;
+  let written = false;
   handler = (path, init) => {
     if (path === '/repos/me/backup') return response({ default_branch: 'main' });
     if (path === '/repos/me/backup/git/ref/heads/release') {
       reads++;
-      return response({ object: { sha: reads === 1 ? 'parent' : reads === 2 ? options.race ? 'raced' : 'parent' : options.badVerification ? 'wrong' : options.sameTree ? 'parent' : 'new-commit' } });
+      return response({ object: { sha: reads >= 2 && options.race ? 'raced' : written ? options.badVerification ? 'wrong' : 'new-commit' : 'parent' } });
     }
     if (path.endsWith('/git/commits/parent')) return response({ tree: { sha: options.sameTree ? 'new-tree' : 'old-tree' } });
     if (path.includes('/git/trees/old-tree') || path.includes('/git/trees/new-tree')) return response({ tree: [{ path: 'removed.txt', type: 'blob', sha: sha('old'), mode: '100644' }] });
     if (path.endsWith('/git/blobs')) { const p = JSON.parse(init.body as string); return response({ sha: sha(p.encoding === 'base64' ? Buffer.from(p.content, 'base64') : p.content) }); }
     if (path.endsWith('/git/trees')) return response({ sha: 'new-tree' });
     if (path.endsWith('/git/commits')) return response({ sha: 'new-commit' });
-    if (path.endsWith('/git/refs/heads/release')) return options.failPatch ? response({ message: 'protected' }, 403) : response({ object: { sha: 'new-commit' } });
+    if (path.endsWith('/git/refs/heads/release')) {
+      if (options.failPatch) return response({ message: 'protected' }, 403);
+      written = true; return response({ object: { sha: 'new-commit' } });
+    }
     if (path.endsWith('/git/commits/new-commit')) return response({ tree: { sha: 'new-tree' } });
     throw new Error(`Unexpected destination request: ${path}`);
   };
@@ -147,6 +151,7 @@ test('unchanged target tree reuses the existing commit on retry', async () => {
   destination({ sameTree: true });
   const result = await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync');
   assert.equal(result.commitSha, 'parent');
+  assert.ok(!calls.some(c => c.init.method === 'PATCH'));
   assert.ok(!calls.some(c => c.path.endsWith('/git/commits') && c.init.method === 'POST'));
 });
 test('release uses the selected commit and rejects an existing mismatched tag', async () => {
@@ -216,4 +221,49 @@ test('branch lookup explains invalid tokens, private access errors and empty rep
   await assert.rejects(() => githubClient.fetchBranches('demo/project'), /私有仓库/);
   handler = path => path === '/repos/demo/project' ? response({ default_branch: 'main' }) : response([]);
   await assert.rejects(() => githubClient.fetchBranches('demo/project'), /暂无分支/);
+});
+
+
+test('non-fast-forward rejection after the preflight check reports a branch conflict without force', async () => {
+  destination(); const base = handler;
+  let moved = false;
+  handler = (path, init) => {
+    if (init.method === 'PATCH') { moved = true; return response({ message: 'Update is not a fast forward' }, 422); }
+    if (moved && path.endsWith('/git/ref/heads/release')) return response({ object: { sha: 'concurrent-commit' } });
+    return base(path, init);
+  };
+  await assert.rejects(() => githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync'), /已变化.*本地文件已保留/);
+  const patches = calls.filter(c => c.init.method === 'PATCH');
+  assert.equal(patches.length, 1); assert.equal(JSON.parse(patches[0].init.body as string).force, false);
+});
+
+test('lost successful update response is verified without sending another write', async () => {
+  destination(); const base = handler;
+  let written = false;
+  handler = (path, init) => {
+    if (init.method === 'PATCH') { written = true; throw new TypeError('response lost'); }
+    if (written && path.endsWith('/git/ref/heads/release')) return response({ object: { sha: 'new-commit' } });
+    return base(path, init);
+  };
+  const result = await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync');
+  assert.equal(result.verified, true); assert.equal(calls.filter(c => c.init.method === 'PATCH').length, 1);
+});
+
+test('reference reads bypass stale caches and new commits use the target parent', async () => {
+  destination(); await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync');
+  assert.ok(calls.filter(c => c.path.endsWith('/git/ref/heads/release')).every(c => c.init.cache === 'no-store'));
+  const commit = calls.find(c => c.path.endsWith('/git/commits') && c.init.method === 'POST')!;
+  assert.deepEqual(JSON.parse(commit.init.body as string).parents, ['parent']);
+});
+
+test('same-head non-fast-forward errors remain actionable and never force a retry', async () => {
+  destination(); const base = handler;
+  let rejected = false;
+  handler = (path, init) => {
+    if (init.method === 'PATCH') { rejected = true; return response({ message: 'Update is not a fast forward' }, 422); }
+    if (rejected && path.endsWith('/git/ref/heads/release')) return response({ object: { sha: 'parent' } });
+    return base(path, init);
+  };
+  await assert.rejects(() => githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync'), /非快进更新.*源码已保留/);
+  assert.equal(calls.filter(c => c.init.method === 'PATCH').length, 1);
 });
