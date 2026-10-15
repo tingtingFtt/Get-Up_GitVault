@@ -2,7 +2,7 @@ name: Deploy Static Content to GitHub Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main"] # 如果你的默认分支是 master，请把 main 改为 master
   workflow_dispatch:
 
 permissions:
@@ -20,19 +20,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
+
       - name: Install dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
+
       - name: Build
         run: npm run build
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: './dist'
+
       - name: Deployment
         uses: actions/deploy-pages@v4
