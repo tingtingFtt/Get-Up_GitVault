@@ -2252,7 +2252,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           </div>
                         </div>
 
-                        <p className="text-xs font-medium text-[#4D5E4A] italic truncate">备注: {repo.remark}</p>
+                        <p className="text-xs font-medium text-[#4D5E4A] italic break-words">备注: {repo.remark}</p>
                         {repo.description && (
                           <p className="text-[11px] text-[#6B6358] line-clamp-2">描述: {repo.description}</p>
                         )}
