@@ -49,6 +49,9 @@ jobs:
       - name: Check build output
         run: test -f dist/index.html
 
+      - name: Check responsive layouts in Chrome
+        run: npm run test:layout
+
       - name: Disable Jekyll
         run: touch dist/.nojekyll
 

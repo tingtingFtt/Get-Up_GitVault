@@ -6,7 +6,7 @@ import 'fake-indexeddb/auto';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
-import { beginGithubOperation } from '../src/utils/githubClient';
+import { beginGithubOperation, githubClient } from '../src/utils/githubClient';
 import App from '../src/App';
 
 const originalFetch = globalThis.fetch;
@@ -367,7 +367,7 @@ test('current-branch copy saves exact downloaded version and adds a separate man
   assert.ok(!requests.some(r => r.path.endsWith('/forks')));
 });
 
-test('complete Fork uses original repository, verifies all branches, and adds it without downloading source files', async () => {
+function completeForkFixture() {
   let created = false;
   globalThis.fetch = async (url, init = {}) => {
     const path = String(url).replace('https://api.github.com', '');
@@ -382,6 +382,10 @@ test('complete Fork uses original repository, verifies all branches, and adds it
     if (path.includes('/git/trees/fork-tree')) return ok({ tree: [entry('new')] });
     throw new Error(path);
   };
+}
+
+test('complete Fork uses original repository, verifies all branches, and adds it without downloading source files', async () => {
+  completeForkFixture();
   await enterWorkbench(); await click('分叉与私有仓'); await click('板块二：创建分叉与上游同步');
   const select = [...document.querySelectorAll('select')].find(item => [...item.options].some(option => option.value === 'full'))!;
   await act(async () => { select.value = 'full'; select.dispatchEvent(new Event('change', { bubbles: true })); });
@@ -494,13 +498,13 @@ test('batch import needs only links, uses repository default branches, skips dup
     throw new Error(path);
   };
   await click('新建链接/拉取项目'); await click('批量导入链接');
-  await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, 'https://github.com/demo/one/tree/feature\ndemo/two\nDEMO/one.git\nhttps://example.com/demo/bad');
+  await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, '带 空格的备注  https://github.com/demo/one/tree/feature\ndemo/two\nDEMO/one.git\nhttps://example.com/demo/bad');
   assert.ok(!document.querySelector('input[placeholder="例如: 生产核心源码 / 模块A"]'));
   await click('开始批量导入');
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 2');
   let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   const imported = saved.find((item: any) => item.owner === 'demo');
-  assert.equal(imported.branch, 'master'); assert.equal(imported.remark, '未备注项目'); assert.equal(imported.files, undefined);
+  assert.equal(imported.branch, 'master'); assert.equal(imported.remark, '带 空格的备注'); assert.equal(imported.files, undefined);
   assert.equal((await localCache.getProjectFiles(imported.id, imported.latestCommitSha))[0].content, 'one');
   assert.ok(!requests.some(r => r.path.includes('/commits/feature')));
   const oneReads = requests.filter(r => r.path === '/repos/demo/one').length;
@@ -508,6 +512,7 @@ test('batch import needs only links, uses repository default branches, skips dup
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 1 · 失败 1');
   saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 2);
+  assert.equal(saved.find((item: any) => item.repo === 'two').remark, '');
   assert.equal(requests.filter(r => r.path === '/repos/demo/one').length, oneReads);
   const previousReads = requests.filter(r => r.path.includes('/commits/')).length;
   await click('开始批量导入');
@@ -591,4 +596,122 @@ test('managed copies switch their original source branch while keeping the desti
   assert.equal(updated.owner, 'destination'); assert.equal(updated.repo, 'backup'); assert.equal(updated.repoMeta.htmlUrl, saved.url);
   assert.equal(updated.origin.branch, 'feature/demo'); assert.equal(updated.uploadTarget.branch, 'feature/demo');
   assert.ok(requests.some(r => r.path === '/repos/source/project/commits/feature%2Fdemo'));
+});
+
+async function reloadProjects(saved: any[]) {
+  await act(async () => root.unmount());
+  localStorage.setItem('gitvault_repos_v8', JSON.stringify(saved));
+  root = createRoot(document.getElementById('root')!);
+  await act(async () => root.render(React.createElement(App)));
+}
+async function openBatch(label: string, count = 1) {
+  await click(`仓库已有项目 (${count})`); await click('全选所有'); await click(label);
+}
+function batchStatus() { return document.querySelector('[role=dialog] [role=status]')?.textContent || ''; }
+
+test('complete batch Fork creates one verified destination and associates duplicate source branches with it', async () => {
+  await reloadProjects([repo(), { ...repo(), id: 'second', branch: 'other' }]); completeForkFixture();
+  await openBatch('批量分叉', 2); await click('开始批量分叉');
+  await waitFor(() => batchStatus() === '成功 1 · 失败 0 · 跳过 1 · 取消 0');
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.filter((item: any) => item.forkScope === 'full').length, 1);
+  assert.equal(saved.find((item: any) => item.id === 'second').forkTarget.repo, 'project');
+  assert.equal(requests.filter(r => r.path.endsWith('/forks')).length, 1);
+  assert.equal(alerts.length, 0);
+});
+
+test('batch current-branch copies use the exact cached source snapshot and corresponding branch', async () => {
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith('/user')) return ok({ login: 'destination' });
+    if (String(url) === 'https://api.github.com/repos/destination/backup') return ok({ id: 77, private: true, owner: { login: 'destination' }, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' });
+    return base(url, init);
+  };
+  await openBatch('批量分叉');
+  await setField(document.querySelector<HTMLSelectElement>('[aria-label="批量分叉范围"]')!, 'current');
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="目标名称 1"]')!, 'backup');
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="批量操作 Token"]')!, 'test-target-token');
+  await click('开始批量分叉');
+  await waitFor(() => batchStatus() === '成功 1 · 失败 0 · 跳过 0 · 取消 0');
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const copy = saved.find((item: any) => item.forkScope === 'current');
+  assert.equal(copy.uploadTarget.branch, 'develop'); assert.equal(copy.remoteSnapshot.sourceSha, 'v2');
+  assert.ok(uploadedContents.includes('new')); assert.ok(!requests.some(r => r.path.endsWith('/forks')));
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+});
+
+test('batch updates retain successful uploads, preserve files on a failing project and retry only the failure', async () => {
+  let failSecond = true;
+  const first = { ...boundProject(), hasUpdate: true };
+  const second = { ...repo(), id: 'second', owner: 'other', repo: 'broken', url: 'https://github.com/other/broken', hasUpdate: true };
+  await reloadProjects([first, second]); identifyDestination();
+  await localCache.saveProjectFiles('second', [file('new')], 'v2');
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    if (path.startsWith('/repos/source/project') || path.startsWith('/repos/other/broken')) {
+      requests.push({ path, payload: null });
+      if (failSecond && path.startsWith('/repos/other/broken')) return ok({ message: 'temporary failure' }, 503);
+      if (path.endsWith('/project') || path.endsWith('/broken')) return ok({ default_branch: 'develop' });
+      if (path.includes('/commits/')) return ok({ sha: 'v3', commit: { tree: { sha: 'new-tree' }, message: 'updated', author: {} } });
+      if (path.includes('/git/trees/')) return ok({ tree: [entry('newest')] });
+      if (path.includes('/git/blobs/')) return ok({ content: Buffer.from('newest').toString('base64') });
+    }
+    return base(url, init);
+  };
+  await click('仓库已有项目 (2)'); await click('仅选有更新'); await click('批量更新'); await click('开始批量更新');
+  await waitFor(() => batchStatus() === '成功 1 · 失败 1 · 跳过 0 · 取消 0');
+  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved[0].remoteSnapshot.branch, 'release'); assert.equal(saved[0].latestCommitSha, 'v3');
+  assert.equal(saved[1].latestCommitSha, 'v2');
+  assert.equal((await localCache.getProjectFiles('second', 'v2'))[0].content, 'new');
+  const firstReads = requests.filter(r => r.path.startsWith('/repos/source/project')).length;
+  failSecond = false; await click('重试失败项目');
+  await waitFor(() => batchStatus() === '成功 2 · 失败 0 · 跳过 0 · 取消 0');
+  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved[1].latestCommitSha, 'v3'); assert.equal(requests.filter(r => r.path.startsWith('/repos/source/project')).length, firstReads);
+  assert.equal(alerts.length, 0);
+});
+
+test('batch upstream sync uses recorded Fork identities and reports partial branch failures as failures', async () => {
+  const source = { ...repo(), forkTarget: { owner: 'me', repo: 'project-fork', branch: 'develop', htmlUrl: '', branches: ['develop', 'other'] } };
+  await reloadProject(source);
+  const original = githubClient.syncAllForkBranches;
+  const destinations: string[] = [];
+  githubClient.syncAllForkBranches = async (owner, name) => {
+    destinations.push(`${owner}/${name}`);
+    return [{ branch: 'develop', success: true, sourceSha: 'v2', commitSha: 'uploaded' }, { branch: 'other', success: false, error: 'protected branch' }];
+  };
+  try {
+    await openBatch('批量分叉同步'); await click('开始批量同步');
+    await waitFor(() => batchStatus() === '成功 0 · 失败 1 · 跳过 0 · 取消 0');
+    assert.deepEqual(destinations, ['me/project-fork']);
+    assert.ok(document.querySelector('[role=dialog]')?.textContent?.includes('1/2 成功'));
+    assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  } finally { githubClient.syncAllForkBranches = original; }
+});
+
+test('batch sync shares complete-Fork transfers but refreshes every selected managed record', async () => {
+  const target = { id: 77, owner: 'me', repo: 'project-fork', branch: 'develop', htmlUrl: 'https://github.com/me/project-fork', branches: ['develop', 'other'] };
+  const source = { ...repo(), forkTarget: target };
+  const managed = { ...repo(), id: 'managed', owner: 'me', repo: 'project-fork', url: target.htmlUrl, origin: { owner: 'source', repo: 'project', url: 'https://github.com/source/project', branch: 'develop' }, forkScope: 'full', forkTarget: target, uploadTarget: { ...target, token: 'target-token', purgeAfterUpload: true } };
+  await reloadProjects([source, managed]);
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url);
+    if (path.endsWith('/repos/me/project-fork')) return ok({ id: 77, name: 'project-fork', owner: { login: 'me' }, default_branch: 'develop', html_url: target.htmlUrl });
+    if (path.endsWith('/repos/source/project')) return ok({ default_branch: 'develop' });
+    if (path.includes('/repos/source/project/commits/')) return ok({ sha: 'source-new', commit: { tree: { sha: 'source-tree' }, message: 'new', author: {} } });
+    if (path.includes('/git/trees/source-tree')) return ok({ tree: [entry('newest')] });
+    return base(url, init);
+  };
+  const original = githubClient.syncAllForkBranches; let transfers = 0;
+  githubClient.syncAllForkBranches = async () => { transfers++; return [{ branch: 'develop', success: true, sourceSha: 'source-new', commitSha: 'target-new' }, { branch: 'other', success: true, sourceSha: 'other-new', commitSha: 'other-target' }]; };
+  try {
+    await openBatch('批量分叉同步', 2); await click('开始批量同步');
+    await waitFor(() => batchStatus() === '成功 2 · 失败 0 · 跳过 0 · 取消 0');
+    assert.equal(transfers, 1);
+    const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!).find((item: any) => item.id === 'managed');
+    assert.equal(updated.latestCommitSha, 'source-new'); assert.equal(updated.remoteSnapshot.commitSha, 'target-new'); assert.equal(updated.isCachePurged, true);
+  } finally { githubClient.syncAllForkBranches = original; }
 });

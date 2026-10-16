@@ -1,1 +1,46 @@
 @import "tailwindcss";
+
+/* Sizing applies to every screen, including resizable desktop windows and dialogs. */
+html, body, #root { width: 100%; min-width: 0; margin: 0; }
+.app-shell { width: 100%; min-width: 0; }
+.app-shell :where(div, main, section, form, header, nav, details) { min-width: 0; }
+.app-shell :where(.flex, .grid) > * { min-width: 0; max-width: 100%; }
+.app-shell :where(input, select, textarea, button, img, canvas, svg, pre) { max-width: 100%; }
+.app-shell :where(p, h1, h2, h3, h4, label, a, code, span):not(.truncate) { overflow-wrap: anywhere; }
+.app-shell .whitespace-nowrap:not(.truncate):not(.file-row) { white-space: normal; }
+.app-shell button { flex-shrink: 1; white-space: normal; overflow-wrap: anywhere; }
+.app-shell button > span { min-width: 0; flex-shrink: 1; }
+.app-shell button > svg { flex-shrink: 0; }
+.app-shell :where(div, nav).flex-row:not(.file-row) { flex-wrap: wrap; }
+.app-shell :where(.flex, .grid) > :where(div, form, section, details) { max-width: 100%; }
+.app-shell .app-header { flex-wrap: wrap; gap: .75rem; }
+.app-shell > main { max-width: 80rem; }
+.app-shell > .fixed.inset-0 { overflow-y: auto; padding: clamp(.5rem, 2vw, 1rem); }
+.app-shell > .fixed.inset-0 > div { min-width: 0; max-width: min(100%, var(--dialog-width, 36rem)); max-height: calc(100dvh - 2rem); overflow-y: auto; }
+.app-shell > .fixed.inset-0 > .max-w-sm { --dialog-width: 24rem; }
+.app-shell > .fixed.inset-0 > .max-w-md { --dialog-width: 28rem; }
+.app-shell > .fixed.inset-0 > .max-w-lg { --dialog-width: 32rem; }
+.app-shell > .fixed.inset-0 > .max-w-2xl { --dialog-width: 42rem; }
+.app-shell > .fixed.inset-0 > .max-w-3xl { --dialog-width: 48rem; }
+.app-shell > .fixed.inset-0 > .max-w-4xl { --dialog-width: 56rem; }
+.app-shell .workbench-banner > div:first-child { width: 100%; flex-wrap: nowrap; }
+.app-shell .workbench-banner > div:first-child > div { flex: 1; }
+.workbench-actions, .batch-actions { display: grid; gap: .5rem; width: 100%; grid-template-columns: repeat(auto-fit, minmax(min(100%, 8.5rem), 1fr)); }
+.app-shell :where(.workbench-actions, .batch-actions) > button { width: 100%; padding: .45rem .6rem; font-size: .6875rem; min-height: 2.125rem; justify-content: center; }
+.app-shell .batch-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .batch-secondary { display: flex; flex-wrap: wrap; gap: .5rem; }
+.app-shell .batch-secondary button { padding: .35rem .6rem; font-size: .6875rem; }
+.app-shell .batch-results { display: flex; flex-direction: column; gap: .5rem; overflow-y: auto; min-height: 0; max-height: 45dvh; }
+.app-shell .batch-result { padding: .75rem; border: 1px solid #DFD8CE; background: #FAF8F5; border-radius: .75rem; overflow-wrap: anywhere; }
+@media (min-width: 640px) { .app-shell .batch-actions { grid-template-columns: repeat(4, minmax(0, 1fr)); } .app-shell .workbench-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (min-width: 1280px) { .app-shell .workbench-actions { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+@media (max-width: 480px) {
+  .app-shell .app-header { padding: .625rem .75rem; }
+  .app-shell .app-header > div { flex: 1 1 auto; gap: .5rem; }
+  .app-shell .app-header > div:last-child { justify-content: flex-end; }
+  .app-shell main { padding-left: .75rem; padding-right: .75rem; }
+  .app-shell > .fixed.inset-0 > div { padding: 1rem; border-radius: 1rem; }
+  .app-shell .grid-cols-2 { grid-template-columns: minmax(0, 1fr); }
+  .app-shell button { font-size: .6875rem; }
+}

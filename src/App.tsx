@@ -18,6 +18,7 @@ import { githubClient, beginGithubOperation, cancelGithubOperation, operationSig
 import { safeFetchJson } from './utils/api';
 import { sourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
+import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 
 interface RepoTreeItem {
@@ -183,6 +184,13 @@ export default function App() {
   const [isBatchUploadModalOpen, setIsBatchUploadModalOpen] = useState(false);
   const [batchUploadStatusList, setBatchUploadStatusList] = useState<BatchUploadItemStatus[]>([]);
   const [isBatchUploading, setIsBatchUploading] = useState(false);
+  const [batchTask, setBatchTask] = useState<'fork' | 'update' | 'sync' | null>(null);
+  const [batchTaskItems, setBatchTaskItems] = useState<ProjectBatchItem[]>([]);
+  const [batchTaskRunning, setBatchTaskRunning] = useState(false);
+  const batchTaskLock = useRef(false);
+  const [batchForkScope, setBatchForkScope] = useState<'current' | 'full'>('full');
+  const [batchTaskToken, setBatchTaskToken] = useState('');
+  const [batchForkPurge, setBatchForkPurge] = useState(false);
 
   // Batch Release & Cache Purge state in Backups tab
   const [selectedBackupIds, setSelectedBackupIds] = useState<string[]>([]);
@@ -879,7 +887,7 @@ export default config;
       if (r.id === projectSettingsTarget.id) {
         return {
           ...r,
-          remark: projectRemark.trim() || '未备注项目',
+          remark: projectRemark.trim(),
           description: projectDescription.trim(),
           tags: tagsArray.length > 0 ? tagsArray : ['默认'],
           token: projectToken.trim() || undefined,
@@ -1008,7 +1016,7 @@ export default config;
         const exists = reposRef.current.some(item => { const source = sourceOf(item); return source.owner.toLowerCase() === data.owner.toLowerCase() && source.repo.toLowerCase() === data.repo.toLowerCase() && source.branch === data.branch && !item.origin; });
         if (exists) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
         else {
-          const newRepo: TrackedRepo = { ...data, id: `repo-${crypto.randomUUID()}`, url: items[i].url!, token: tokenInput.trim() || undefined, remark: '未备注项目', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length };
+          const newRepo: TrackedRepo = { ...data, id: `repo-${crypto.randomUUID()}`, url: items[i].url!, token: tokenInput.trim() || undefined, remark: items[i].remark || '', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length };
           // Keep file contents in IndexedDB only; never copy them into the project record.
           const { files, ...record } = newRepo as TrackedRepo & { files?: CachedFile[] };
           await localCache.saveProjectFiles(record.id, data.files, data.latestCommitSha);
@@ -1083,25 +1091,18 @@ export default config;
     finally { setIsUploadingToPrivate(false); setIsLoading(false); }
   };
 
-  // Execute create Fork on GitHub
-  const handleExecuteCreateFork = async (e: React.FormEvent) => {
-    e.preventDefault(); if (!singleUploadTargetRepo) return;
-    const sourceProject = singleUploadTargetRepo;
+  const createProjectCopy = async (sourceProject: TrackedRepo, scope: 'current' | 'full', name: string, token: string, purge: boolean) => {
     const origin = sourceOf(sourceProject);
-    const token = globalToken || sourceProject.token || prompt('请输入 GitHub Token：')?.trim();
-    if (!token) return;
-    startOperation(); setIsForking(true);
-    try {
       let target: { id?: number; owner: string; repo: string; htmlUrl: string; defaultBranch: string; branches?: string[] };
       let manifest: Awaited<ReturnType<typeof githubClient.inspectRepo>>;
       let remoteSha: string;
       let copiedFiles: CachedFile[] | undefined;
-      if (forkScope === 'full') {
-        target = await githubClient.createFork(origin.url, token, forkRepoName.trim() || origin.repo);
+      if (scope === 'full') {
+        target = await githubClient.createFork(origin.url, token, name.trim() || origin.repo);
         manifest = await githubClient.inspectRepo(target.htmlUrl, target.defaultBranch, token);
         remoteSha = manifest.latestCommitSha;
       } else {
-        target = await githubClient.ensurePrivateRepo(token, forkRepoName.trim(), sourceProject.description, sourceProject.remark);
+        target = await githubClient.ensurePrivateRepo(token, name.trim(), sourceProject.description, sourceProject.remark);
         target.defaultBranch = origin.branch;
         assertDestinationBranch(sourceProject, { ...target, branch: origin.branch });
         copiedFiles = await versionFiles(sourceProject);
@@ -1114,26 +1115,35 @@ export default config;
       const previous = reposRef.current.find(item => item.id === id);
       const snapshot: RemoteSnapshot = { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, sourceSha: manifest.latestCommitSha, htmlUrl: `${target.htmlUrl}/tree/${target.defaultBranch}` };
       const managed: TrackedRepo = { ...sourceProject, ...manifest, id, owner: target.owner, repo: target.repo, url: target.htmlUrl, origin: originForCopy, branch: manifest.branch, repoMeta: { ...manifest.repoMeta, htmlUrl: target.htmlUrl },
-        backups: previous?.backups || [], savedCopies: previous?.savedCopies || [], branchTargets: undefined, branchUploadPending: false, privateRepoUrl: forkScope === 'current' ? target.htmlUrl : undefined,
-        forkScope, forkTarget: forkScope === 'full' ? { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, htmlUrl: target.htmlUrl, branches: target.branches } : undefined,
-        uploadTarget: { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, purgeAfterUpload: singleUploadPurgeCache, token, kind: forkScope }, remoteSnapshot: snapshot,
-        isCachePurged: !copiedFiles || singleUploadPurgeCache, cachedFilesCount: copiedFiles && !singleUploadPurgeCache ? copiedFiles.length : 0, lastSyncedAt: new Date().toISOString(), hasUpdate: false };
+        backups: previous ? (previous.latestCommitSha !== manifest.latestCommitSha ? [archiveVersion(previous), ...previous.backups] : previous.backups) : [], savedCopies: previous?.savedCopies || [], branchTargets: undefined, branchUploadPending: false, privateRepoUrl: scope === 'current' ? target.htmlUrl : undefined,
+        forkScope: scope, forkTarget: scope === 'full' ? { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, htmlUrl: target.htmlUrl, branches: target.branches } : undefined,
+        uploadTarget: { id: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, purgeAfterUpload: purge, token, kind: scope }, remoteSnapshot: snapshot,
+        isCachePurged: !copiedFiles || purge, cachedFilesCount: copiedFiles && !purge ? copiedFiles.length : 0, lastSyncedAt: new Date().toISOString(), hasUpdate: false };
       await localCache.saveSyncReceipt(id, manifest.latestCommitSha, snapshot);
-      if (copiedFiles && !singleUploadPurgeCache) await localCache.saveProjectFiles(id, copiedFiles, manifest.latestCommitSha);
+      if (copiedFiles && !purge) await localCache.saveProjectFiles(id, copiedFiles, manifest.latestCommitSha);
       persistRepos([managed, ...reposRef.current.filter(item => item.id !== id)]);
-      if (forkScope === 'full') patchRepo(sourceProject.id, { forkTarget: managed.forkTarget });
-      if (copiedFiles && singleUploadPurgeCache) await recordUpload(sourceProject, { verified: true, repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, htmlUrl: snapshot.htmlUrl }, true, undefined, {}, token, false);
-      setIsSingleUploadModalOpen(false); setCurrentView('projects');
-      alert(forkScope === 'full' ? `完整分叉已验证并加入我的项目，共 ${target.branches?.length || 0} 个分支。` : `当前分支 ${origin.branch} 已保存为独立副本并加入我的项目，后续更新继续使用固定名称。`);
+      if (scope === 'full') patchRepo(sourceProject.id, { forkTarget: managed.forkTarget });
+      if (copiedFiles && purge) await recordUpload(sourceProject, { verified: true, repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, htmlUrl: snapshot.htmlUrl }, true, undefined, {}, token, false);
+    return scope === 'full' ? `完整分叉已验证并加入我的项目，共 ${target.branches?.length || 0} 个分支。` : `当前分支 ${origin.branch} 已保存为独立副本并加入我的项目，后续更新继续使用固定名称。`;
+  };
+
+  const handleExecuteCreateFork = async (e: React.FormEvent) => {
+    e.preventDefault(); if (!singleUploadTargetRepo) return;
+    const token = globalToken || singleUploadTargetRepo.token || prompt('请输入 GitHub Token：')?.trim();
+    if (!token) return;
+    startOperation(); setIsForking(true);
+    try {
+      const message = await createProjectCopy(singleUploadTargetRepo, forkScope, forkRepoName, token, singleUploadPurgeCache);
+      setIsSingleUploadModalOpen(false); setCurrentView('projects'); alert(message);
     } catch (error) { alert('创建副本未完成：' + (error as Error).message); }
     finally { setIsForking(false); setIsLoading(false); }
   };
 
-  const syncFullProject = async (repo: TrackedRepo, token: string) => {
+  const syncFullProject = async (repo: TrackedRepo, token: string, synced?: Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>) => {
     const target = repo.forkTarget;
     if (!target || !repo.uploadTarget) throw new Error('完整分叉尚未绑定目标仓库');
     await boundTarget(repo, token);
-    const results = await githubClient.syncAllForkBranches(target.owner, target.repo, token);
+    const results = synced || await githubClient.syncAllForkBranches(target.owner, target.repo, token);
     const source = sourceOf(repo);
     const current = results.find(result => result.branch === source.branch && result.success);
     if (current?.sourceSha && current.commitSha) {
@@ -1151,28 +1161,33 @@ export default config;
       await recordUpload(updated, { verified: true, repoId: repo.uploadTarget.id, owner: target.owner, repo: target.repo, branch: source.branch, commitSha: current.commitSha, htmlUrl: `${target.htmlUrl}/tree/${source.branch}` }, repo.uploadTarget.purgeAfterUpload);
     }
     const failed = results.filter(result => !result.success);
-    return `全部分支同步：${results.length - failed.length}/${results.length} 成功。${failed.map(result => `\n${result.branch}：${result.error}`).join('')}`;
+    const message = `全部分支同步：${results.length - failed.length}/${results.length} 成功。${failed.map(result => `\n${result.branch}：${result.error}`).join('')}`;
+    if (failed.length) throw new Error(message);
+    return message;
   };
 
-  // Sync fork with upstream repository
+  const syncProjectUpstream = async (repo: TrackedRepo, token: string, syncedTargets?: Map<string, Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>>): Promise<string> => {
+    if (repo.forkScope === 'current') return updateProject(repo, token);
+    const target = repo.forkTarget || { owner: repo.owner, repo: repo.repo, branch: repo.branch };
+    if (repo.forkScope === 'full' && repo.origin || repo.forkTarget?.branches?.length) {
+      const key = `${target.owner}/${target.repo}`.toLowerCase();
+      const results = syncedTargets?.get(key) || await githubClient.syncAllForkBranches(target.owner, target.repo, token);
+      syncedTargets?.set(key, results);
+      if (repo.forkScope === 'full' && repo.origin) return syncFullProject(repo, token, results);
+      const failed = results.filter(item => !item.success);
+      const message = `全部分支同步：${results.length - failed.length}/${results.length} 成功。${failed.map(item => `\n${item.branch}：${item.error}`).join('')}`;
+      if (failed.length) throw new Error(message);
+      return message;
+    }
+    const result = await githubClient.syncFork(target.owner, target.repo, target.branch, token);
+    return `分叉 ${target.owner}/${target.repo}：${result.message}`;
+  };
   const handleSyncUpstream = async (repo: TrackedRepo) => {
-    if (repo.forkScope === 'current') { await handleOneClickUpdate(repo); return; }
     const token = repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
     if (!token) return;
     startOperation();
-    try {
-      const target = repo.forkTarget || { owner: repo.owner, repo: repo.repo, branch: repo.branch };
-      if (repo.forkScope === 'full' && repo.origin) {
-        alert(await syncFullProject(repo, token));
-      } else if (repo.forkTarget?.branches?.length) {
-        const results = await githubClient.syncAllForkBranches(target.owner, target.repo, token);
-        const failed = results.filter(item => !item.success);
-        alert(`全部分支同步完成：${results.length - failed.length}/${results.length} 成功。${failed.map(item => `\n${item.branch}：${item.error}`).join('')}`);
-      } else {
-        const result = await githubClient.syncFork(target.owner, target.repo, target.branch, token);
-        alert(`分叉 ${target.owner}/${target.repo}：${result.message}`);
-      }
-    } catch (error) { alert('同步上游失败：' + (error as Error).message); }
+    try { alert(await syncProjectUpstream(repo, token)); }
+    catch (error) { alert('同步上游未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1205,16 +1220,14 @@ export default config;
     finally { setIsLoading(false); }
   };
 
-  const handleOneClickUpdate = async (repo: TrackedRepo) => {
-    startOperation(); setErrorMsg('');
-    try {
+  const updateProject = async (repo: TrackedRepo, authToken = ''): Promise<string> => {
       if (repo.forkScope === 'full' && repo.origin) {
-        const auth = repo.uploadTarget?.token || globalToken || repo.token;
+        const auth = repo.uploadTarget?.token || authToken || globalToken || repo.token;
         if (!auth) throw new Error('请填写 GitHub Token');
-        alert(await syncFullProject(repo, auth)); return;
+        return syncFullProject(repo, auth);
       }
       const source = sourceOf(repo);
-      const token = repo.token || globalToken;
+      const token = repo.token || authToken || globalToken;
       const status = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, token);
       if (!status.hasUpdate) {
         patchRepo(repo.id, { hasUpdate: false, lastCheckedAt: new Date().toISOString() });
@@ -1223,9 +1236,9 @@ export default config;
           const files = await versionFiles(repo);
           const result = await pushSnapshot(repo, files, target.token || globalToken || token, `Sync ${repo.repo} @ ${repo.latestCommitSha}`);
           await recordUpload(repo, result, target.purgeAfterUpload);
-          alert('已完成上次待上传的版本，并验证成功。');
-        } else alert('当前已是最新版本');
-        return;
+          return '已完成上次待上传的版本，并验证成功。';
+        }
+        return '当前已是最新版本';
       }
       let cached = await localCache.getProjectFiles(repo.id, repo.latestCommitSha);
       if (!cached.length && !repo.isCachePurged && repo.latestCommitSha !== 'HEAD') cached = await versionFiles(repo);
@@ -1235,14 +1248,20 @@ export default config;
       const updated: TrackedRepo = { ...repo, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree, repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl }, backups: repo.latestCommitSha === 'HEAD' ? repo.backups : [old, ...repo.backups], remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString(), hasUpdate: true };
       // Persist the newly downloaded version even if its subsequent upload fails.
       patchRepo(repo.id, { latestCommitSha: updated.latestCommitSha, commitMessage: updated.commitMessage, commitAuthor: updated.commitAuthor, commitDate: updated.commitDate, tree: updated.tree, repoMeta: updated.repoMeta, backups: updated.backups, remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: updated.lastSyncedAt, hasUpdate: false, latestRemoteCommit: undefined });
+      let message = '新版本已完整保存，旧版本已归档。请使用现有上传入口选择目标仓库。';
       if (repo.uploadTarget) {
         const target = repo.uploadTarget;
         const result = await pushSnapshot(updated, data.files, target.token || globalToken || token, `Sync ${repo.repo} @ ${data.latestCommitSha}`);
         await recordUpload(updated, result, target.purgeAfterUpload);
-        alert('新版本已更新并验证上传；旧版本记录已保留。');
-      } else alert('新版本已完整保存，旧版本已归档。请使用现有上传入口选择目标仓库。');
-      setFileContent(null); setSelectedFilePath(null); setViewingBackup(null);
-    } catch (error) { alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
+        message = '新版本已更新并验证上传；旧版本记录已保留。';
+      }
+      if (activeRepoId === repo.id) { setFileContent(null); setSelectedFilePath(null); setViewingBackup(null); }
+      return message;
+  };
+  const handleOneClickUpdate = async (repo: TrackedRepo) => {
+    startOperation(); setErrorMsg('');
+    try { alert(await updateProject(repo)); }
+    catch (error) { alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1258,6 +1277,59 @@ export default config;
   };
 
   // ================= BATCH OPERATIONS ON PROJECTS =================
+  const suggestedCopyName = (repo: TrackedRepo, scope: 'current' | 'full') => {
+    const source = sourceOf(repo);
+    if (repo.origin && repo.forkScope === scope) return repo.uploadTarget?.repo || repo.repo;
+    return (scope === 'full' ? source.repo : `${source.owner}-${source.repo}-${source.branch}`).replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 100);
+  };
+  const openProjectBatch = (task: 'fork' | 'update' | 'sync') => {
+    const items = reposRef.current.filter(repo => selectedProjectIds.includes(repo.id)).map(repo => ({ id: repo.id, label: `${repo.owner}/${repo.repo} · ${repo.branch}`, name: suggestedCopyName(repo, 'full'), status: 'pending' as const }));
+    if (!items.length) return;
+    setBatchTask(task); setBatchTaskItems(items); setBatchForkScope('full'); setBatchTaskToken(''); setBatchForkPurge(false);
+  };
+  const startProjectBatch = async (retry = false) => {
+    if (!batchTask || batchTaskLock.current) return;
+    const items = batchTaskItems.map(item => retry && ['error', 'cancelled'].includes(item.status) ? { ...item, status: 'pending' as const, message: undefined } : { ...item });
+    batchTaskLock.current = true; setBatchTaskRunning(true); beginGithubOperation();
+    const signal = operationSignal(); const seen = new Set<string>(); const targetNames = new Map<string, string>();
+    const syncedTargets = new Map<string, Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>>();
+    if (batchTask === 'fork') for (const item of items.filter(item => item.status === 'success')) {
+      const repo = reposRef.current.find(project => project.id === item.id);
+      if (!repo) continue;
+      const source = sourceOf(repo);
+      const key = `${source.owner}/${source.repo}`.toLowerCase() + (batchForkScope === 'current' ? `:${source.branch}` : '');
+      seen.add(key); targetNames.set(item.name.trim().toLowerCase(), key);
+    }
+    try {
+      await runProjectBatch(items, { signal, onChange: setBatchTaskItems, run: async item => {
+        const repo = reposRef.current.find(project => project.id === item.id);
+        if (!repo) throw new Error('项目已移除，未执行');
+        const token = batchTaskToken.trim() || repo.uploadTarget?.token || globalToken || repo.token || '';
+        if (batchTask !== 'update' && !token) throw new Error('请填写 GitHub Token 或配置全局 Token 后重试');
+        if (batchTask === 'update') return { message: await updateProject(repo, token) };
+        const source = sourceOf(repo);
+        if (batchTask === 'fork') {
+          const sourceKey = `${source.owner}/${source.repo}`.toLowerCase() + (batchForkScope === 'current' ? `:${source.branch}` : '');
+          if (seen.has(sourceKey)) {
+            if (batchForkScope === 'full') {
+              const managed = reposRef.current.find(project => project.forkScope === 'full' && project.origin?.owner.toLowerCase() === source.owner.toLowerCase() && project.origin?.repo.toLowerCase() === source.repo.toLowerCase());
+              if (managed?.forkTarget) patchRepo(repo.id, { forkTarget: managed.forkTarget });
+            }
+            return { skipped: true, message: '本批已处理同一来源，已关联现有完整分叉或跳过重复副本' };
+          }
+          const name = item.name.trim();
+          if (!/^[a-zA-Z0-9._-]{1,100}$/.test(name)) throw new Error('目标仓库名称需为 1–100 个字母、数字、点、横线或下划线');
+          const occupied = targetNames.get(name.toLowerCase());
+          if (occupied && occupied !== sourceKey) throw new Error('本批其他项目使用了相同目标名称，请修改名称后重试');
+          targetNames.set(name.toLowerCase(), sourceKey);
+          const message = await createProjectCopy(repo, batchForkScope, name, token, batchForkPurge);
+          seen.add(sourceKey); return { message };
+        }
+        return { message: await syncProjectUpstream(repo, token, syncedTargets) };
+      } });
+    } finally { batchTaskLock.current = false; setBatchTaskRunning(false); }
+  };
+
   const handleToggleSelectProject = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setSelectedProjectIds(prev =>
@@ -1903,9 +1975,9 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
   };
 
   return (
-    <div className="min-h-screen bg-[#F8F6F1] text-[#2E2B27] flex flex-col font-sans selection:bg-[#9CB09D] selection:text-white pb-24 md:pb-20">
+    <div className="app-shell min-h-screen bg-[#F8F6F1] text-[#2E2B27] flex flex-col font-sans selection:bg-[#9CB09D] selection:text-white pb-24 md:pb-20">
       {/* Top Navbar */}
-      <header className="border-b border-[#E5DFD7] bg-[#FFFFFF]/90 backdrop-blur sticky top-0 z-30 px-4 md:px-8 py-3 flex flex-row items-center justify-between shadow-xs">
+      <header className="app-header border-b border-[#E5DFD7] bg-[#FFFFFF]/90 backdrop-blur sticky top-0 z-30 px-4 md:px-8 py-3 flex flex-row items-center justify-between shadow-xs">
         <div className="flex flex-row items-center gap-4 md:gap-8">
           <div
             className="flex flex-row items-center gap-3 cursor-pointer group"
@@ -1926,7 +1998,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
           </div>
 
           {/* Desktop Navigation - Strictly single horizontal row */}
-          <nav className="hidden md:flex flex-row items-center gap-1.5 bg-[#EFECE6]/80 p-1 rounded-xl border border-[#DFD8CE] whitespace-nowrap">
+          <nav className="hidden xl:flex flex-row items-center gap-1.5 bg-[#EFECE6]/80 p-1 rounded-xl border border-[#DFD8CE] whitespace-nowrap">
             <button
               onClick={() => { setCurrentView('dashboard'); setActiveRepoId(null); setViewingBackup(null); }}
               className={`flex flex-row items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 transition ${
@@ -2018,7 +2090,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         {currentView === 'dashboard' && (
           <div className="flex flex-col gap-6">
             {/* Hero Welcome Banner */}
-            <div className="bg-gradient-to-r from-[#FFFFFF] via-[#FAF8F5] to-[#F1ECE4] border border-[#E5DFD7] rounded-3xl p-6 md:p-8 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-6">
+            <div className="bg-gradient-to-r from-[#FFFFFF] via-[#FAF8F5] to-[#F1ECE4] border border-[#E5DFD7] rounded-3xl p-6 md:p-8 shadow-xs flex flex-col xl:flex-row xl:items-center justify-between gap-6">
               <div className="flex flex-col gap-2 max-w-2xl">
                 <div className="flex flex-row items-center gap-2">
                   <span className="px-2.5 py-0.5 rounded-full bg-[#8E9F8B]/20 text-[#4D5E4A] text-xs font-semibold font-mono border border-[#8E9F8B]/30 whitespace-nowrap shrink-0">
@@ -2212,7 +2284,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         {/* SECTION 2: CONNECTED PROJECTS MANAGEMENT (仓库已有项目) WITH BATCH MANAGEMENT */}
         {currentView === 'projects' && (
           <div className="flex flex-col gap-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div>
                 <h2 className="text-xl md:text-2xl font-bold font-serif text-[#2B2723] flex flex-row items-center gap-2">
                   <FolderGit2 className="w-6 h-6 text-[#8E9F8B] shrink-0" />
@@ -2223,7 +2295,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 </p>
               </div>
 
-              <div className="flex flex-row items-center gap-2 flex-wrap sm:flex-nowrap whitespace-nowrap">
+              <div className="flex flex-row items-center gap-2 flex-wrap sm:flex-wrap whitespace-nowrap">
                 <button
                   onClick={checkAllUpdates}
                   className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#474239] rounded-xl text-xs font-medium border border-[#DFD8CE] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
@@ -2235,7 +2307,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
             </div>
 
             {/* BATCH ACTION TOOLBAR */}
-            <div className="bg-[#FAF8F5] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-xs">
+            <div className="batch-toolbar bg-[#FAF8F5] border border-[#E5DFD7] rounded-2xl p-3 md:p-4 flex flex-col gap-3 shadow-xs">
               <div className="flex flex-row items-center gap-2 flex-wrap whitespace-nowrap">
                 <button
                   onClick={handleSelectAllProjects}
@@ -2250,6 +2322,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 >
                   反选
                 </button>
+                <button type="button" onClick={() => setSelectedProjectIds(filteredRepos.filter(repo => repo.hasUpdate).map(repo => repo.id))} disabled={!filteredRepos.some(repo => repo.hasUpdate)} className="px-3 py-1.5 bg-[#FFFFFF] border border-[#DFD8CE] rounded-xl text-xs text-[#5D6F5A] disabled:opacity-40">仅选有更新</button>
                 {selectedProjectIds.length > 0 && (
                   <button
                     onClick={handleClearSelectProjects}
@@ -2265,7 +2338,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               </div>
 
               {/* Batch Action Buttons */}
-              <div className="flex flex-row items-center gap-2 flex-wrap whitespace-nowrap">
+              <div className="batch-actions">
                 <button
                   onClick={handleOpenBatchUploadModal}
                   disabled={selectedProjectIds.length === 0}
@@ -2276,6 +2349,13 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <span>批量上传至私人仓库</span>
                 </button>
 
+                <button type="button" onClick={() => openProjectBatch('fork')} disabled={!selectedProjectIds.length} className="px-3 py-1.5 bg-[#FFFFFF] border border-[#DFD8CE] rounded-xl text-xs text-[#4D5E4A] disabled:opacity-40">批量分叉</button>
+                <button type="button" onClick={() => openProjectBatch('update')} disabled={!selectedProjectIds.length} className="px-3 py-1.5 bg-[#FFFFFF] border border-[#DFD8CE] rounded-xl text-xs text-[#4D5E4A] disabled:opacity-40">批量更新</button>
+                <button type="button" onClick={() => openProjectBatch('sync')} disabled={!selectedProjectIds.length} className="px-3 py-1.5 bg-[#FFFFFF] border border-[#DFD8CE] rounded-xl text-xs text-[#4D5E4A] disabled:opacity-40">批量分叉同步</button>
+              </div>
+              <details className="text-xs text-[#6B6358]">
+                <summary className="cursor-pointer py-1">更多管理</summary>
+                <div className="batch-secondary mt-2">
                 <button
                   onClick={handleOpenBatchTagModal}
                   disabled={selectedProjectIds.length === 0}
@@ -2303,11 +2383,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <Trash2 className="w-3.5 h-3.5 text-[#B6847A] shrink-0" />
                   <span>批量删除</span>
                 </button>
-              </div>
+                </div>
+              </details>
             </div>
 
             {/* Filter Toolbar */}
-            <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-xs">
+            <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-3 shadow-xs">
               <div className="relative flex-1 max-w-md">
                 <Search className="w-4 h-4 text-[#91887C] absolute left-3 top-2.5" />
                 <input
@@ -2473,7 +2554,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       </div>
 
                       {/* Action Buttons - Single horizontal line, whitespace-nowrap */}
-                      <div className="flex flex-row items-center gap-2 flex-wrap sm:flex-nowrap shrink-0 whitespace-nowrap">
+                      <div className="flex flex-row items-center gap-2 flex-wrap sm:flex-wrap shrink-0 whitespace-nowrap">
                         {/* Single Upload to Private Repo Button */}
                         <button
                           onClick={() => handleOpenSingleUploadModal(repo)}
@@ -2566,8 +2647,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         {/* WORKBENCH VIEW */}
         {currentView === 'workbench' && activeRepo && (
           <div className="flex flex-col gap-6">
-            {/* Header Banner - Strictly single horizontal line */}
-            <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-3xl p-5 md:p-6 flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-xs">
+            {/* Repository details and actions each remain within the card width. */}
+            <div className="workbench-banner bg-[#FFFFFF] border border-[#E5DFD7] rounded-3xl p-4 md:p-5 flex flex-col gap-4 shadow-xs">
               <div className="flex flex-row items-start gap-3.5">
                 <button
                   onClick={() => { setCurrentView('projects'); setActiveRepoId(null); setViewingBackup(null); }}
@@ -2652,7 +2733,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               </div>
 
               {/* Workbench Actions */}
-              <div className="flex flex-row items-center gap-2 flex-wrap md:flex-nowrap whitespace-nowrap">
+              <div className="workbench-actions">
                 <button
                   onClick={() => handleOpenSingleUploadModal(activeRepo)}
                   className="px-3.5 py-2 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] hover:brightness-105 text-white rounded-xl text-xs font-semibold shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
@@ -2837,7 +2918,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                               <div
                                 key={item.path}
                                 onClick={() => handleSelectFile(item.path)}
-                                className={`flex flex-row items-center gap-2 px-3 py-2 rounded-xl text-xs cursor-pointer transition whitespace-nowrap overflow-hidden ${
+                                className={`file-row flex flex-row items-center gap-2 px-3 py-2 rounded-xl text-xs cursor-pointer transition whitespace-nowrap overflow-hidden ${
                                   isSelected
                                     ? 'bg-[#8E9F8B]/20 text-[#2B2723] font-semibold'
                                     : 'hover:bg-[#FAF8F5] text-[#554F45]'
@@ -2910,7 +2991,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               <div className="flex flex-col gap-4">
                 {activeRepo.uploadTarget && historyHasMore && <button type="button" onClick={handleLoadHistory} className="text-xs text-[#5D6F5A] hover:underline">获取 GitHub 历史记录</button>}
                 {/* Backups Action Toolbar */}
-                <div className="bg-[#FAF8F5] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-xs">
+                <div className="bg-[#FAF8F5] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-3 shadow-xs">
                   <div className="flex flex-row items-center gap-2 flex-wrap whitespace-nowrap">
                     <button
                       onClick={handleSelectAllBackups}
@@ -2969,7 +3050,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       return (
                         <div
                           key={backup.id}
-                          className={`bg-[#FFFFFF] border rounded-2xl p-4 md:p-5 flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-xs transition ${
+                          className={`bg-[#FFFFFF] border rounded-2xl p-4 md:p-5 flex flex-col xl:flex-row xl:items-center justify-between gap-4 shadow-xs transition ${
                             isSelected
                               ? 'border-[#8E9F8B] bg-[#FAF8F5]'
                               : 'border-[#E5DFD7] hover:border-[#8E9F8B]/40'
@@ -3086,8 +3167,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               <button type="button" onClick={() => { setImportMode('batch'); setErrorMsg(''); }} className={`pb-2 text-xs font-semibold border-b-2 ${importMode === 'batch' ? 'border-[#8E9F8B] text-[#4D5E4A]' : 'border-transparent text-[#7A7367]'}`}>批量导入链接</button>
             </div>
             {importMode === 'batch' ? <form onSubmit={e => { e.preventDefault(); void handleBatchImport(); }} className="flex flex-col gap-4">
-              <p className="text-xs text-[#7A7367] leading-relaxed">每行一个仓库链接，也支持空格或逗号分隔。只需填写链接，统一拉取仓库默认主分支（main、master 等）；链接里的分支会忽略。备注和描述稍后可在项目设置中修改。</p>
-              <textarea aria-label="批量仓库链接" required rows={6} value={batchLinks} onChange={e => { setBatchLinks(e.target.value); setImportResults([]); }} placeholder="https://github.com/owner/repo\nowner/another-repo" className="w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
+              <p className="text-xs text-[#7A7367] leading-relaxed">每行一个项目：填写“备注名  链接”或只填写链接。备注可含空格；只有链接时备注留空。统一拉取仓库默认主分支（main、master 等），忽略链接中的分支。备注和描述可稍后修改。</p>
+              <textarea aria-label="批量仓库链接" required rows={6} value={batchLinks} onChange={e => { setBatchLinks(e.target.value); setImportResults([]); }} placeholder={'项目备注  https://github.com/owner/repo\nhttps://github.com/owner/another-repo'} className="w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B]" />
               <label className="text-xs text-[#474239]">GitHub Token（可选，留空使用全局设置）<input type="password" aria-label="批量导入 Token" value={tokenInput} onChange={e => setTokenInput(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27]" /></label>
               {errorMsg && <p role="alert" className="text-xs text-[#8C5D54]">{errorMsg}</p>}
               {importResults.length > 0 && <div className="max-h-48 overflow-y-auto flex flex-col gap-2">
@@ -3390,6 +3471,39 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {batchTask && (
+        <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div role="dialog" aria-modal="true" aria-label={batchTask === 'fork' ? '批量分叉' : batchTask === 'update' ? '批量更新' : '批量分叉同步'} className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl max-w-xl w-full p-5 shadow-xl flex flex-col gap-4">
+            <h3 className="text-base font-bold font-serif text-[#2B2723]">{batchTask === 'fork' ? '批量分叉' : batchTask === 'update' ? '批量更新' : '批量分叉同步'} · {batchTaskItems.length} 个项目</h3>
+            <p className="text-xs text-[#7A7367]">{batchTask === 'fork' ? '选择分叉范围，可分别修改目标名称。成功后加入我的项目，原记录保留。' : batchTask === 'update' ? '逐项检查最新版本，有变化时归档旧版并下载；已绑定仓库将更新对应分支，保留历史。' : '同步已记录的分叉目标；当前分支副本按原始来源更新，完整分叉同步全部上游分支。'} 单个失败会继续处理，完成后可仅重试失败项目。</p>
+            {batchTask === 'fork' && <>
+              <label className="text-xs text-[#474239]">分叉范围<select aria-label="批量分叉范围" disabled={batchTaskRunning || batchTaskItems.some(item => item.status !== 'pending')} value={batchForkScope} onChange={e => {
+                const scope = e.target.value as 'current' | 'full'; setBatchForkScope(scope);
+                setBatchTaskItems(items => items.map(item => { const repo = reposRef.current.find(repo => repo.id === item.id); return { ...item, name: repo ? suggestedCopyName(repo, scope) : item.name }; }));
+              }} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs"><option value="full">完整来源仓库（全部分支与历史）</option><option value="current">当前分支独立私人副本</option></select></label>
+              <label className="text-xs text-[#554F45] flex gap-2 items-start"><input type="checkbox" checked={batchForkPurge} disabled={batchTaskRunning || batchForkScope === 'full'} onChange={e => setBatchForkPurge(e.target.checked)} />当前分支副本上传验证成功后清理源码缓存，保留快照</label>
+            </>}
+            <label className="text-xs text-[#474239]">共用 GitHub Token（可选，留空使用项目或全局设置）<input type="password" aria-label="批量操作 Token" disabled={batchTaskRunning} value={batchTaskToken} onChange={e => setBatchTaskToken(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs" /></label>
+            <p role="status" aria-live="polite" className="text-xs text-[#5D6F5A]">成功 {batchTaskItems.filter(item => item.status === 'success').length} · 失败 {batchTaskItems.filter(item => item.status === 'error').length} · 跳过 {batchTaskItems.filter(item => item.status === 'skipped').length} · 取消 {batchTaskItems.filter(item => item.status === 'cancelled').length}</p>
+            {batchTaskRunning && <p className="text-xs text-[#7A7367]">{loadingText}</p>}
+            <div className="batch-results">
+              {batchTaskItems.map((item, index) => <div key={item.id} className="batch-result text-xs">
+                <p className="font-mono text-[#2B2723]">{item.label}</p>
+                {batchTask === 'fork' && <label className="block mt-1 text-[#7A7367]">目标名称<input aria-label={`目标名称 ${index + 1}`} value={item.name} disabled={batchTaskRunning || item.status === 'success' || item.status === 'skipped'} onChange={e => setBatchTaskItems(items => items.map((old, i) => i === index ? { ...old, name: e.target.value } : old))} className="mt-1 w-full bg-[#FFFFFF] border border-[#DFD8CE] rounded-lg px-2 py-1.5 font-mono text-xs" /></label>}
+                <p className={`mt-1 whitespace-pre-wrap ${item.status === 'error' ? 'text-[#8C5D54]' : 'text-[#5D6F5A]'}`}>{item.message || '等待开始'}</p>
+              </div>)}
+            </div>
+            <div className="flex flex-row flex-wrap justify-end gap-2 border-t border-[#EDE7DF] pt-3">
+              <button type="button" disabled={batchTaskRunning} onClick={() => setBatchTask(null)} className="px-3 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs disabled:opacity-40">关闭</button>
+              {batchTaskRunning ? <button type="button" onClick={cancelGithubOperation} className="px-3 py-2 text-[#8C5D54] border border-[#DFD8CE] rounded-xl text-xs">取消剩余操作</button> : <>
+                {batchTaskItems.some(item => item.status === 'error' || item.status === 'cancelled') && <button type="button" onClick={() => startProjectBatch(true)} className="px-3 py-2 text-[#5D6F5A] border border-[#DFD8CE] rounded-xl text-xs">重试失败项目</button>}
+                <button type="button" disabled={!batchTaskItems.some(item => item.status === 'pending')} onClick={() => startProjectBatch()} className="px-4 py-2 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs disabled:opacity-40">{batchTask === 'fork' ? '开始批量分叉' : batchTask === 'update' ? '开始批量更新' : '开始批量同步'}</button>
+              </>}
+            </div>
           </div>
         </div>
       )}
