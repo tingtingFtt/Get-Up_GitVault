@@ -3,11 +3,13 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import { githubClient } from './src/utils/githubClient';
+import { createGitRouter } from './server/gitRouter';
 dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 async function startServer() {
   const app = express();
+  app.use('/api/git', createGitRouter());
   app.use(express.json({ limit: '100mb' }));
   const routes: Record<string, (p: any) => Promise<unknown>> = {
     'validate-token': p => githubClient.validateToken(p.token),

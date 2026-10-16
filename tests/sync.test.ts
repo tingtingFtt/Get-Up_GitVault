@@ -36,6 +36,24 @@ test('missing target branch is offered for future creation only after repository
   assert.equal(result.missingBranch, true); assert.deepEqual(result.tree, []);
   assert.ok(calls.every(call => !call.init.method || call.init.method === 'GET'));
 });
+test('422 unresolved target branches and empty repositories are verified before offering branch creation', async () => {
+  for (const [status, message, branches] of [[422, 'No commit found for SHA: dev', [{name:'main'}]], [409, 'Git Repository is empty.', []]] as const) {
+    handler = path => path === '/repos/me/project' ? response({id:77,owner:{login:'me'},name:'project'})
+      : path.includes('/commits/') ? response({message},status) : path.includes('/branches?') ? response(branches) : response({message:'unexpected'},404);
+    const result = await githubClient.inspectImportTarget({id:77,owner:'me',repo:'project',branch:'dev'},'token');
+    assert.equal(result.missingBranch,true);assert.equal(result.commitSha,undefined);
+    assert.ok(calls.every(call=>!call.init.method||call.init.method==='GET'));
+  }
+});
+test('a listed branch, permission failure or unrelated 422 is never classified as an absent target branch', async () => {
+  for (const variant of ['listed','forbidden','validation']) {
+    handler = path => path === '/repos/me/project' ? response({id:77})
+      : path.includes('/commits/') ? response({message:variant==='validation'?'Validation failed':'No commit found for SHA: dev'},422)
+      : path.includes('/branches?') ? variant==='forbidden'?response({message:'Resource not accessible'},403):response([{name:'dev'}])
+      : response({},404);
+    await assert.rejects(githubClient.inspectImportTarget({id:77,owner:'me',repo:'project',branch:'dev'},'token'));
+  }
+});
 test('import comparison preserves rate-limit errors and never treats them as a missing branch', async () => {
   handler = path => path === '/repos/me/project' ? response({ id: 77 }) : response({ message: 'API rate limit exceeded' }, 403);
   await assert.rejects(githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'project', branch: 'main' }, 'token'), /API rate limit exceeded/);
@@ -103,6 +121,12 @@ test('respects URL branch containing slashes and explicit branch overrides', asy
   assert.equal(linked.branch, 'feature/demo');
   const selected = await githubClient.fetchRepo('demo/project/tree/feature/demo', 'release');
   assert.equal(selected.branch, 'release');
+});
+test('file URLs resolve the longest real branch when GitHub returns 422 for longer unresolved refs',async()=>{
+  source();const base=handler;
+  handler=(path,init)=>path.includes('/commits/feature%2Fdemo%2F')?response({message:'No commit found for SHA: unresolved'},422):base(path,init);
+  const result=await githubClient.fetchRepo('demo/project/blob/feature/demo/src/a.ts');
+  assert.equal(result.branch,'feature/demo');assert.ok(calls.some(call=>call.path.includes('/commits/feature%2Fdemo')));
 });
 test('pins the tree and contents to resolved commit and reuses unchanged files', async () => {
   const files = [file('a.txt', 'same'), file('b.txt', 'new')]; source(files);

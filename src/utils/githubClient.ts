@@ -5,6 +5,7 @@ import type { CachedFile } from './localCache';
 import type { TargetHealth, TargetIdentity } from './targetLifecycle';
 import { githubTransport, GitHubError } from './githubTransport';
 export { GitHubError } from './githubTransport';
+import { gitServiceConfig, gitServiceTransfer } from './gitService';
 
 export interface RepoEntry {
   path: string;
@@ -77,7 +78,7 @@ async function resolveRef(owner: string, repo: string, linked: string, explicit:
     for (let n = parts.length; n > 0; n--) {
       const candidate = parts.slice(0, n).join('/');
       try { await json(`${root(owner, repo)}/commits/${encodeURIComponent(candidate)}`, token, {}, signal); return candidate; }
-      catch (e) { if (!(e instanceof GitHubError) || e.status !== 404) throw e; }
+      catch (e) { if (!(e instanceof GitHubError) || !(e.status === 404 || e.status === 422 && /No commit found for SHA:/i.test(e.message))) throw e; }
     }
     throw new Error('链接中的分支、标签或提交不存在');
   }
@@ -165,9 +166,27 @@ export const githubClient = {
       if (old?.sha === entry.sha) { files.set(entry.path, { ...old, mode: entry.mode }); done++; }
       else missing.push(entry);
     }
+    if (gitServiceConfig().mode === 'git' && missing.length) {
+      if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
+      progress('正在通过 Git 获取选定提交的完整项目…', options);
+      const result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha }, token || '', signal);
+      if (result.commitSha !== commit.sha || result.treeSha !== commit.commit.tree.sha || !Array.isArray(result.files) || result.files.length !== entries.length) throw new Error('Git 拉取结果与选定快照不一致，本地原版本已保留');
+      const expected = new Map(entries.map(entry => [entry.path, entry]));
+      const received = new Set<string>();
+      for (const remote of result.files) {
+        signal.throwIfAborted();
+        const entry = expected.get(remote.path);
+        if (!entry || received.has(remote.path) || remote.sha !== entry.sha || remote.mode !== entry.mode || remote.encoding !== 'base64') throw new Error('Git 文件清单校验失败，本地原版本已保留');
+        received.add(remote.path);
+        const file = await cachedFile(entry, bytesFromBase64(remote.content));
+        if (checkpoint) await checkpoint.save(transfer, commit.sha, file);
+        files.set(entry.path, file);
+      }
+      done = files.size;
+    }
     // A large initial import is cheaper as one archive; each downloaded blob is still verified.
     // Browser archive redirects can fail CORS, so each channel has its own catch/deadline.
-    if (missing.length > 12) {
+    if (missing.length > 12 && files.size !== entries.length) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
       for (const archiveUrl of archiveUrls) {
@@ -262,12 +281,19 @@ export const githubClient = {
     let commit;
     try { commit = await json(`${root(identity.owner, identity.repo)}/commits/${encodeURIComponent(target.branch)}`, token, { cache: 'no-store' }); }
     catch (error) {
-      if (!(error instanceof GitHubError) || error.status !== 404) throw error;
+      const missingRef = error instanceof GitHubError && (error.status === 404
+        || error.status === 422 && /No commit found for SHA:/i.test(error.message)
+        || error.status === 409 && /Git Repository is empty/i.test(error.message));
+      if (!missingRef) throw error;
       // A missing ref is safe to create later; an inaccessible repository is not.
       await githubClient.repository(identity.owner, identity.repo, token, identity.id);
-      const branches = await githubClient.fetchBranches(identity.htmlUrl, token);
-      if (branches.includes(target.branch)) throw error;
-      return { identity, commitSha: undefined, tree: [] as RepoEntry[], missingBranch: true };
+      for (let page = 1; ; page++) {
+        const branches = await json(`${root(identity.owner, identity.repo)}/branches?per_page=100&page=${page}`, token, { cache: 'no-store' });
+        if (!Array.isArray(branches)) throw new Error('目标分支列表读取失败，未将其当作空仓库');
+        if (branches.some(branch => branch.name === target.branch)) throw error;
+        // An accessible empty target is legitimate; source imports still require a commit.
+        if (branches.length < 100) return { identity, commitSha: undefined, tree: [] as RepoEntry[], missingBranch: true };
+      }
     }
     const tree = await getTree(identity.owner, identity.repo, commit.commit.tree.sha, token);
     return { identity, commitSha: commit.sha as string, tree, missingBranch: false };
@@ -333,6 +359,18 @@ export const githubClient = {
     for (const file of allFiles) {
       if (!file.path || file.path.startsWith('/') || file.path.split('/').some(p => p === '..' || !p) || paths.has(file.path)) throw new Error(`无效或重复的文件路径: ${file.path}`);
       paths.add(file.path);
+    }
+    if (gitServiceConfig().mode === 'git') {
+      if (!Number.isSafeInteger(identity.id) || !identity.id || identity.id <= 0) throw new Error('目标仓库缺少可信 ID，未开始 Git 推送');
+      progress(`正在通过 Git 推送 ${allFiles.length} 个文件到 ${targetOwner}/${targetRepo}:${branch}…`);
+      const prepared = await Promise.all(allFiles.map(async file => ({ ...file, sha: await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) })));
+      const result = await gitServiceTransfer('push', { owner: identity.owner, repo: identity.repo, expectedRepoId: identity.id, branch, files: prepared, message: commitMessage, rebaseOnConflict: !!options.rebaseOnConflict }, token, signal);
+      if (!result.verified || result.repoId !== identity.id || result.branch !== branch || !/^[a-f0-9]{40}$/.test(result.commitSha) || !/^[a-f0-9]{40}$/.test(result.treeSha)) throw new Error('Git 推送回执无效，本地缓存已保留');
+      const committed = await json(`${base}/git/commits/${result.commitSha}`, token, { cache: 'no-store' }, signal);
+      const tree = await getTree(targetOwner, targetRepo, result.treeSha, token, signal);
+      const blobs = tree.filter(item => item.type === 'blob'), expected = new Map(prepared.map(file => [file.path, file]));
+      if (committed.tree.sha !== result.treeSha || blobs.length !== prepared.length || tree.some(item => item.type === 'commit') || blobs.some(item => item.sha !== expected.get(item.path)?.sha || item.mode !== (expected.get(item.path)?.mode || '100644')) || await readHead() !== result.commitSha) throw new Error('Git 推送后的文件或分支校验失败，本地缓存已保留，请检查目标最新提交');
+      return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: identity.id, commitSha: result.commitSha as string, treeSha: result.treeSha as string, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
     }
     let parentTree = '';
     const existing = new Map<string, RepoEntry>();

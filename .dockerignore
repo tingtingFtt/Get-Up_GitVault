@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+node_modules
+dist
+android
+android-device-screenshots
+test-results
+playwright-report
+*.jks
+*.keystore

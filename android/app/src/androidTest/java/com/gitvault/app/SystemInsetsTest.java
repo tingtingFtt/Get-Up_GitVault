@@ -17,6 +17,8 @@ import androidx.test.platform.app.InstrumentationRegistry;
 import java.io.InputStream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import android.webkit.WebView;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import static org.junit.Assert.*;
@@ -31,6 +33,12 @@ public class SystemInsetsTest {
             if (!ready.get()) Thread.sleep(100);
         }
         assertTrue("Bundled page did not finish loading", ready.get());
+        ready.set(false);
+        scenario.onActivity(activity -> activity.getBridge().getWebView().postVisualStateCallback(0, new WebView.VisualStateCallback() {
+            @Override public void onComplete(long requestId) { ready.set(true); }
+        }));
+        for (int attempt = 0; attempt < 100 && !ready.get(); attempt++) Thread.sleep(100);
+        assertTrue("WebView did not paint its loaded page", ready.get());
     }
     private void waitForOrientation(ActivityScenario<MainActivity> scenario, int orientation) throws Exception {
         AtomicBoolean ready = new AtomicBoolean(false);
@@ -38,6 +46,9 @@ public class SystemInsetsTest {
             InstrumentationRegistry.getInstrumentation().waitForIdleSync();
             scenario.onActivity(activity -> ready.set(activity.getResources().getConfiguration().orientation == orientation
                 && activity.getBridge().getWebView().getHeight() > 0
+                && (orientation == Configuration.ORIENTATION_LANDSCAPE
+                    ? activity.getWindow().getDecorView().getWidth() > activity.getWindow().getDecorView().getHeight()
+                    : activity.getWindow().getDecorView().getWidth() < activity.getWindow().getDecorView().getHeight())
                 && ViewCompat.getRootWindowInsets(activity.findViewById(android.R.id.content)) != null));
             if (!ready.get()) Thread.sleep(100);
         }
@@ -57,6 +68,7 @@ public class SystemInsetsTest {
         assertTrue("WebView overlaps right cutout", position[0] + web.getWidth() <= origin[0] + decor.getWidth() - safe.right);
         assertTrue("Bottom controls overlap the system navigation bar", position[1] + web.getHeight() <= origin[1] + decor.getHeight() - safe.bottom);
         assertEquals("Insets belong to the parent, not HTML/WebView padding", 0, web.getPaddingTop());
+        assertEquals("Capacitor must not apply the same insets to DecorView again", 0, decor.getPaddingBottom());
         assertTrue("The page must remain usable", web.getWidth() > 100 && web.getHeight() > 100);
     }
 
@@ -73,6 +85,7 @@ public class SystemInsetsTest {
 
     private void waitForKeyboard(ActivityScenario<MainActivity> scenario, boolean visible) throws Exception {
         AtomicBoolean ready = new AtomicBoolean(false);
+        AtomicReference<String> diagnostic = new AtomicReference<>("");
         for (int attempt = 0; attempt < 100 && !ready.get(); attempt++) {
             InstrumentationRegistry.getInstrumentation().waitForIdleSync();
             scenario.onActivity(activity -> {
@@ -80,12 +93,13 @@ public class SystemInsetsTest {
                 WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(decor);
                 Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
                 int bottom = Math.max(bars.bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom);
+                diagnostic.set("ime=" + insets.isVisible(WindowInsetsCompat.Type.ime()) + ", web=" + web.getHeight() + ", decor=" + decor.getHeight() + ", top=" + bars.top + ", bottom=" + bottom + ", decorPadding=" + decor.getPaddingBottom());
                 ready.set(insets.isVisible(WindowInsetsCompat.Type.ime()) == visible
                     && web.getHeight() == decor.getHeight() - bars.top - bottom);
             });
             if (!ready.get()) Thread.sleep(100);
         }
-        assertTrue("Real keyboard and WebView viewport did not finish resizing", ready.get());
+        assertTrue("Real keyboard and WebView viewport did not finish resizing: " + diagnostic.get(), ready.get());
     }
 
     @Test public void portraitAndLandscapeKeepWebContentOutsideSystemBars() throws Exception {
@@ -96,6 +110,7 @@ public class SystemInsetsTest {
             scenario.onActivity(this::assertSafeViewport); screenshot("insets-portrait");
             scenario.onActivity(activity -> activity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE));
             waitForOrientation(scenario, Configuration.ORIENTATION_LANDSCAPE);
+            waitForPage(scenario);
             scenario.onActivity(this::assertSafeViewport); screenshot("insets-landscape");
         }
     }

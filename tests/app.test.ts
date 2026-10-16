@@ -698,6 +698,36 @@ test('single re-upload locks the chosen name and reuses the exact bound branch w
   assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
   assert.ok(alerts.some(message => message.includes('完整上传')));
 });
+test('a 422 missing target dev branch is created by the existing upload flow without writing main',async()=>{
+  const saved=boundProject();saved.branch='dev';saved.uploadTarget.branch='dev';await reloadProject(saved);identifyDestination();
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[{...cloudEntry(),source:{...cloudEntry().source,branch:'dev'},bindings:{dev:{branch:'dev',updatedAt:'now'}}}],legacy:[]});
+  const base=globalThis.fetch;let created=false;
+  globalThis.fetch=async(url,init={})=>{
+    const path=String(url).replace('https://api.github.com','');
+    if(path==='/repos/destination/backup/commits/dev')return ok({message:'No commit found for SHA: dev'},422);
+    if(path.startsWith('/repos/destination/backup/branches?'))return ok([{name:'main'}]);
+    if(path==='/repos/destination/backup/git/ref/heads/dev')return created?ok({object:{sha:'uploaded'}}):ok({message:'Not Found'},404);
+    if(path==='/repos/destination/backup/git/refs'&&init.method==='POST'){assert.equal(JSON.parse(String(init.body)).ref,'refs/heads/dev');created=true;}
+    return base(url,init);
+  };
+  await enterWorkbench();await click('分叉与私有仓');await click('更新已绑定仓库（保留历史）');
+  await waitFor(()=>alerts.some(message=>message.includes('完整上传')));
+  assert.equal(created,true);assert.equal(storedProjects()[0].remoteSnapshot.branch,'dev');
+  assert.equal(storedProjects()[0].uploadTarget.repo,'backup');
+  assert.ok(!requests.some(request=>request.payload&&request.path.includes('/heads/main')));
+});
+test('Git service settings keep the existing credentials UI and test the endpoint without transmitting a token',async()=>{
+  const base=globalThis.fetch;let authorization:unknown='not tested';
+  globalThis.fetch=async(url,init={})=>{
+    if(String(url)==='https://git.example.test/api/git/health'){authorization=(init.headers as Record<string,string>).Authorization;return ok({service:'GitVault',version:1,git:'git version test',capabilities:['fetch','push']});}
+    return base(url,init);
+  };
+  await click('设置');await setField(document.querySelector<HTMLSelectElement>('[aria-label="源码传输方式"]')!,'git');
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="Git 服务地址"]')!,'https://git.example.test');
+  await click('检查 Git 服务（不发送 Token）');await waitFor(()=>alerts.some(message=>message.includes('Git 服务可用')));
+  assert.equal(authorization,undefined);await click('保存设置');
+  const config=JSON.parse(localStorage.getItem('gitvault_git_service_v1')!);assert.equal(config.mode,'git');assert.equal(config.url,'https://git.example.test');
+});
 
 test('rename button changes the existing repository and rewrites historical links while keeping source identity', async () => {
   const saved = boundProject();

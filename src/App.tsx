@@ -31,6 +31,7 @@ import { isNativeAndroid, hasNativeFiles, nativeBridge, exportProjectDirectory, 
 import { readCredentialValue, writeCredentialValue, flushCredentials } from './utils/credentialStorage';
 import { checkpoint, readTasks, interruptedTask, forgetTask, hasUnfinished, type SavedTask } from './utils/taskJournal';
 import { App as NativeApp } from '@capacitor/app';
+import { gitServiceConfig, saveGitServiceConfig, testGitService, GitServiceError } from './utils/gitService';
 
 interface RepoTreeItem {
   path: string;
@@ -254,6 +255,8 @@ export default function App() {
   const latestTargetChecks = useRef(new Map<string, number>());
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'github' | 'backup' | 'apk'>('github');
+  const [gitSettings, setGitSettings] = useState(() => { try { return gitServiceConfig(); } catch { return {mode:'rest' as const,url:''}; } });
+  const [gitServiceTesting, setGitServiceTesting] = useState(false);
   const [isDiffModalOpen, setIsDiffModalOpen] = useState(false);
   const [diffBackupTarget, setDiffBackupTarget] = useState<BackupVersion | null>(null);
 
@@ -446,7 +449,7 @@ export default function App() {
     let reason = error;
     while (reason instanceof Error && reason.cause instanceof Error) reason = reason.cause;
     const secrets = [switchToken, ...operationTokens.current, globalToken, tokenInput, pushToken, batchTaskToken, targetManagerToken, ...reposRef.current.flatMap(project => [project.token || '', project.uploadTarget?.token || '', project.forkTarget?.token || '', ...Object.values(project.branchTargets || {}).map(target => target.token || '')])];
-    try { appendOperationLog({ action, status, project: repo ? `${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, branch: repo ? sourceOf(repo).branch : undefined, target: repo?.uploadTarget ? `${repo.uploadTarget.owner}/${repo.uploadTarget.repo}:${repo.uploadTarget.branch}` : undefined, message, stage, httpStatus: reason instanceof GitHubError ? reason.status : undefined, batchId }, secrets); }
+    try { appendOperationLog({ action, status, project: repo ? `${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, branch: repo ? sourceOf(repo).branch : undefined, target: repo?.uploadTarget ? `${repo.uploadTarget.owner}/${repo.uploadTarget.repo}:${repo.uploadTarget.branch}` : undefined, message, stage, httpStatus: reason instanceof GitHubError || reason instanceof GitServiceError ? reason.status : undefined, batchId }, secrets); }
     catch { setLogStorageError('操作日志无法持久保存，请检查浏览器存储空间并导出已有日志'); }
   };
   const cloudFlushes = useRef(new Map<string, Promise<void>>());
@@ -854,6 +857,7 @@ export default function App() {
   const handleSaveGlobalSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
+    saveGitServiceConfig(gitSettings);
     writeCredentialValue('gitvault_global_token', globalToken.trim());
     localStorage.setItem('gitvault_global_username', globalUsername.trim());
     localStorage.setItem('gitvault_apk_download_dir', apkDownloadDirectory.trim());
@@ -4765,6 +4769,21 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     onChange={e => setGlobalUsername(e.target.value)}
                     className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] placeholder-[#91887C] focus:outline-none focus:border-[#8E9F8B]"
                   />
+                </div>
+
+                <div className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-2xl p-3 flex flex-col gap-2">
+                  <label className="font-semibold text-[#474239]" htmlFor="git-transfer-mode">源码传输方式</label>
+                  <select id="git-transfer-mode" aria-label="源码传输方式" value={gitSettings.mode} onChange={e => setGitSettings({...gitSettings,mode:e.target.value as 'rest'|'git'})} className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]">
+                    <option value="rest">GitHub REST API（无需额外服务）</option>
+                    <option value="git">Git 推送／拉取（使用自有服务）</option>
+                  </select>
+                  <p className="text-[11px] text-[#7A7367] leading-relaxed">当前选择：{gitSettings.mode==='git'?'Git 服务传输源码；仓库管理继续使用 GitHub API。':'GitHub API 传输，已启用限速与暂停重试。'}</p>
+                  {gitSettings.mode==='git' && <>
+                    <label className="font-semibold text-[#474239]" htmlFor="git-service-url">Git 服务地址</label>
+                    <input id="git-service-url" aria-label="Git 服务地址" type="url" value={gitSettings.url} onChange={e=>setGitSettings({...gitSettings,url:e.target.value})} placeholder="https://git.example.com" className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]" />
+                    <p className="text-[11px] text-[#7A7367] leading-relaxed">启用后，当前 Token 和源码会发送到此服务。请填写自己部署或信任的 HTTPS 服务。GitHub Pages 本身不提供 Git 服务；失败时保留缓存，不自动改用其他通道推送。</p>
+                    <button type="button" disabled={gitServiceTesting} onClick={async()=>{setGitServiceTesting(true);try{const result=await testGitService(gitSettings.url);appDialog.notify('Git 服务可用：'+result.git);}catch(error){appDialog.notify('Git 服务检查失败：'+(error as Error).message);}finally{setGitServiceTesting(false);}}} className="self-start max-w-full px-3 py-2 border border-[#DFD8CE] rounded-xl bg-white text-[#5D6F5A] disabled:opacity-40">{gitServiceTesting?'正在检查服务…':'检查 Git 服务（不发送 Token）'}</button>
+                  </>}
                 </div>
 
                 <div className="flex flex-row items-center justify-between pt-3 border-t border-[#EDE7DF] whitespace-nowrap">

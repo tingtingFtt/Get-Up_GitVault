@@ -46,6 +46,10 @@ GitHub Actions 的 **Build Android APK** 在相关 main 变更后自动运行，
 
 启动器和启动画面使用顶栏同款灰绿渐变、白色衬线 GV 标识。源文件在 `assets/gitvault-icon.svg`，文字已转为路径；安装 Inkscape 后运行 `python scripts/generate-android-icons.py` 可生成各密度 PNG 与 Android 自适应图标。网页布局和顶栏样式不受影响。
 
+Capacitor 的 `SystemBars.insetsHandling` 设为 `disable`，由 `MainActivity` 的内容父容器统一处理 Insets；否则默认插件还会给 DecorView 增加键盘高度，导致重复避让。
+
+源码可选连接自有 Git 服务，配置与网页一致，见 [Git 传输说明](GIT_TRANSPORT.md)。此模式使用 HTTPS 服务执行 Git，不声称 APK 内置了 Git CLI。仓库、分支绑定、快照和本地清理选择继续使用现有逻辑。
+
 ## 缓存、目录与下载
 
 源码缓存仍使用应用 WebView 内的 IndexedDB；快照、绑定、任务队列和日志也保留在本设备。Android 应用不是本地 git clone，远端历史仍由 GitHub 保存。

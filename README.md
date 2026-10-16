@@ -21,6 +21,8 @@ View your app in AI Studio: https://ai.studio/apps/b4462d66-9b70-4b20-a34a-f5bf5
 
 ## 完整项目同步与版本缓存
 
+源码支持可选的 Git 推送／拉取服务，GitHub API 继续管理仓库、Fork 与账号记录。部署方法、网页／APK 配置和分支历史策略见 [Git 传输说明](docs/GIT_TRANSPORT.md)。GitHub Pages 不会自动提供此服务；未配置时继续使用 REST。
+
 使用 Node.js 22，执行 `npm ci` 安装锁定依赖。`npm run lint` 检查类型，`npm test` 运行同步、存储和页面操作回归测试。
 
 - 首次获取会固定源提交 SHA，校验完整文件清单和每个 Git blob；优先下载压缩包，失败时切换到 GitHub 文件接口。请求有超时，操作可取消。

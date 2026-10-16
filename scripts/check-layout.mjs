@@ -16,7 +16,7 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
@@ -113,7 +113,7 @@ function inspect(doc, width, scenario) {
     localStorage.removeItem('gitvault_tasks_v1');
     localStorage.removeItem('gitvault_global_token');
     // Each iframe is an independent layout fixture; production cooldowns survive reloads.
-    for (const key of ['gitvault_github_cooldown_v1','gitvault_github_writes_v1','gitvault_github_last_write_v1']) localStorage.removeItem(key);
+    for (const key of ['gitvault_github_cooldown_v1','gitvault_github_writes_v1','gitvault_github_last_write_v1','gitvault_git_service_v1']) localStorage.removeItem(key);
     if(scenario==='task-recovery')localStorage.setItem('gitvault_tasks_v1',JSON.stringify([{kind:'projects',action:'sync',updatedAt:'2026-10-16',items:[{id:fixture.id,label:fixture.remark,name:fixture.repo,status:'running',branch:fixture.branch,source:fixture.url}]}]));
     if (scenario === 'operation-logs-error') localStorage.setItem('gitvault_operation_logs_v1',JSON.stringify([{id:'audit-log',time:'2026-10-16T00:00:00Z',action:'批量分叉同步',status:'error',httpStatus:422,project:'owner/'+ 'long-project-'.repeat(20),branch:fixture.branch,target:'destination/'+ 'long-target-'.repeat(20),stage:'核对账号记录',message:'Update is not a fast forward；'+'很长的失败原因'.repeat(50)}]));
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
@@ -168,8 +168,9 @@ function inspect(doc, width, scenario) {
         }
       } else if(scenario==='add'||scenario==='import') {
         await click(doc,'新建链接/拉取项目'); if (scenario==='import') await click(doc,'批量导入链接');
-      } else if(['settings','backup','apk'].includes(scenario)) {
+      } else if(['settings','git-service','backup','apk'].includes(scenario)) {
         await click(doc,'设置');
+        if(scenario==='git-service'){const select=doc.querySelector('[aria-label="源码传输方式"]');Object.getOwnPropertyDescriptor(frame.contentWindow.HTMLSelectElement.prototype,'value').set.call(select,'git');select.dispatchEvent(new frame.contentWindow.Event('change',{bubbles:true}));await pause();}
         if(scenario==='backup') await click(doc,'数据备份与恢复');
         if(scenario==='apk') await click(doc,'APK 下载存储目录');
       }
@@ -211,7 +212,7 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const profile = await mkdtemp(resolve(tmpdir(), 'gitvault-layout-'));
 try {
   // Production request spacing is part of this audit; allow its synthetic
-  // network reads as well as UI transitions to complete across 294 fixtures.
+  // network reads as well as UI transitions to complete across all viewport fixtures.
   const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=240000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
   const output = await new Promise((resolve, reject) => {
     const child = spawn(chrome, args); let stdout = ''; let stderr = '';
