@@ -1,4 +1,4 @@
-import type { UploadTarget, ProjectSource } from './projectModel';
+import type { UploadTarget, ProjectSource, RemoteSnapshot } from './projectModel';
 import { sourceOf } from './projectModel';
 
 export type TargetIdentity = { id?: number; owner: string; repo: string };
@@ -16,6 +16,7 @@ type TargetProject = ProjectSource & {
   forkScope?: 'current' | 'full'; privateRepoUrl?: string; branchUploadPending?: boolean;
   targetHealth?: Record<string, TargetHealth>; lastUploadedToPrivateAt?: string; repoMeta: { htmlUrl?: string };
   detachedTargets?: TargetIdentity[];
+  remoteSnapshot?: RemoteSnapshot; savedCopies?: RemoteSnapshot[]; backups?: Array<{ commitSha: string; branch?: string; remoteSnapshot?: RemoteSnapshot }>;
 };
 export function projectTargets(project: TargetProject): TargetIdentity[] {
   const targets: TargetIdentity[] = [project.uploadTarget, project.forkTarget, ...Object.values(project.branchTargets || {})].filter((value): value is NonNullable<typeof value> => !!value);
@@ -30,7 +31,13 @@ export function targetHealthOf(project: TargetProject, target: TargetIdentity) {
 }
 /** Detach only current bindings. Never rewrite historical snapshots or remove cached files. */
 export function detachedTarget<T extends TargetProject>(project: T, target: TargetIdentity): T & TargetProject {
-  if (!projectTargets(project).some(item => sameTarget(item, target))) return project;
+  const detachedTargets = [...(project.detachedTargets || []).filter(item => !sameTarget(item, target)), { id: target.id, owner: target.owner, repo: target.repo }];
+  if (!projectTargets(project).some(item => sameTarget(item, target))) {
+    const historical = [project.remoteSnapshot, ...(project.savedCopies || []), ...(project.backups || []).map(version => version.remoteSnapshot)];
+    // A sibling source record may contain only a historical copy of this target.
+    // Keep that receipt but prevent a later import from offering it as a live base.
+    return historical.some(snapshot => snapshot && sameTarget({ ...snapshot, id: snapshot.repoId }, target)) ? { ...project, detachedTargets } : project;
+  }
   const uploadRemoved = !!project.uploadTarget && sameTarget(project.uploadTarget, target);
   const forkRemoved = !!project.forkTarget && sameTarget(project.forkTarget, target);
   const branchTargets = project.branchTargets ? Object.fromEntries(Object.entries(project.branchTargets).filter(([, binding]) => !sameTarget(binding, target))) : undefined;
@@ -46,7 +53,7 @@ export function detachedTarget<T extends TargetProject>(project: T, target: Targ
     branchUploadPending: uploadRemoved ? false : project.branchUploadPending,
     lastUploadedToPrivateAt: uploadRemoved ? undefined : project.lastUploadedToPrivateAt,
     targetHealth: health,
-    detachedTargets: [...(project.detachedTargets || []).filter(item => !sameTarget(item, target)), { id: target.id, owner: target.owner, repo: target.repo }],
+    detachedTargets,
     ...(managedRemoved ? { owner: source.owner, repo: source.repo, url: source.url, repoMeta: { ...project.repoMeta, htmlUrl: source.url } } : {}),
   };
 }
