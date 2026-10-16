@@ -15,11 +15,11 @@ type TargetProject = ProjectSource & {
   forkTarget?: TargetIdentity & { branch: string; htmlUrl: string; branches?: string[]; token?: string };
   forkScope?: 'current' | 'full'; privateRepoUrl?: string; branchUploadPending?: boolean;
   targetHealth?: Record<string, TargetHealth>; lastUploadedToPrivateAt?: string; repoMeta: { htmlUrl?: string };
-  detachedTargets?: TargetIdentity[];
+  detachedTargets?: TargetIdentity[]; creationReservation?: { target: TargetIdentity }; 
   remoteSnapshot?: RemoteSnapshot; savedCopies?: RemoteSnapshot[]; backups?: Array<{ commitSha: string; branch?: string; remoteSnapshot?: RemoteSnapshot }>;
 };
 export function projectTargets(project: TargetProject): TargetIdentity[] {
-  const targets: TargetIdentity[] = [project.uploadTarget, project.forkTarget, ...Object.values(project.branchTargets || {})].filter((value): value is NonNullable<typeof value> => !!value);
+  const targets: TargetIdentity[] = [project.uploadTarget, project.forkTarget, project.creationReservation?.target, ...Object.values(project.branchTargets || {})].filter((value): value is NonNullable<typeof value> => !!value);
   if (project.privateRepoUrl && !project.uploadTarget) {
     const match = /^https?:\/\/github\.com\/([^/]+)\/([^/#?]+)/i.exec(project.privateRepoUrl);
     if (match) targets.push({ owner: match[1], repo: match[2].replace(/\.git$/i, '') });

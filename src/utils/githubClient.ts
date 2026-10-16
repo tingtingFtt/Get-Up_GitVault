@@ -80,6 +80,7 @@ async function json(path: string, token?: string, init: RequestInit = {}, signal
   const response = await request(path, token, init, signal);
   return response.status === 204 ? {} : response.json();
 }
+export const githubApi = json;
 function body(method: string, value: unknown): RequestInit {
   return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) };
 }
@@ -239,7 +240,7 @@ export const githubClient = {
     if (lfsPointers.length) throw new Error(`项目包含 Git LFS 文件（${lfsPointers.slice(0, 3).join('、')}），当前无法完整保存其大文件内容`);
     progress(`文件已校验 ${files.size}/${entries.length}，正在保存缓存…`, options);
     return {
-      owner, repo, branch: branch || (linkedRef ? ref : meta.default_branch), latestCommitSha: commit.sha,
+      owner, repo, repositoryId: meta.id as number | undefined, branch: branch || (linkedRef ? ref : meta.default_branch), latestCommitSha: commit.sha,
       commitMessage: commit.commit.message, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date,
       repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url },
       tree, files: entries.map(e => files.get(e.path)!), cachedFilesCount: files.size, isFullyCached: true,
@@ -267,7 +268,7 @@ export const githubClient = {
     try {
       const meta = await json(root(owner, repo), token, { cache: 'no-store' }, signal);
       if (expectedId && meta.id !== expectedId) throw new TargetRepositoryError({ ...target, status: 'identity-changed', checkedAt: new Date().toISOString(), message: '目标仓库身份已变化，身份校验失败，已停止操作；可能删除后创建了同名仓库。请通过“管理远端目标”确认解除旧绑定后重新设置，避免误写新仓库。' }, 409);
-      const identity = { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
+      const identity = { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParentId: meta.fork ? meta.parent?.id as number | undefined : undefined, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
       targetHealthEvent(target, { id: identity.id, owner: identity.owner, repo: identity.repo, status: 'available', checkedAt: new Date().toISOString(), message: '远端仓库可访问，身份校验通过' }, checkId, { id: identity.id, owner: identity.owner, repo: identity.repo, htmlUrl: identity.htmlUrl });
       return identity;
     } catch (error) {
@@ -281,9 +282,9 @@ export const githubClient = {
     }
   },
 
-  async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string }) {
+  async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string; repositoryId?: number }) {
     const identity = await githubClient.repository(target.owner, target.repo, token, target.id);
-    if (forkSource && identity.forkParent?.toLowerCase() !== `${forkSource.owner}/${forkSource.repo}`.toLowerCase()) throw new Error('目标分叉的上游与来源不一致，不能沿用此同步关系');
+    if (forkSource && (forkSource.repositoryId && identity.forkParentId ? forkSource.repositoryId !== identity.forkParentId : identity.forkParent?.toLowerCase() !== `${forkSource.owner}/${forkSource.repo}`.toLowerCase())) throw new Error('目标分叉的上游与来源不一致，不能沿用此同步关系');
     let commit;
     try { commit = await json(`${root(identity.owner, identity.repo)}/commits/${encodeURIComponent(target.branch)}`, token, { cache: 'no-store' }); }
     catch (error) {
@@ -314,7 +315,7 @@ export const githubClient = {
     const selected = ref || selectedBranch;
     const commit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(selected)}`, token, { cache: 'no-store' });
     const tree = await getTree(owner, repo, commit.commit.tree.sha, token);
-    return { owner, repo, branch: selectedBranch as string, latestCommitSha: commit.sha as string, commitMessage: commit.commit.message as string, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date || new Date().toISOString(), tree, repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url } };
+    return { owner, repo, repositoryId: meta.id as number | undefined, branch: selectedBranch as string, latestCommitSha: commit.sha as string, commitMessage: commit.commit.message as string, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date || new Date().toISOString(), tree, repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url } };
   },
 
   async listHistory(target: { id?: number; owner: string; repo: string; branch: string }, token: string, page = 1) {
@@ -405,7 +406,7 @@ export const githubClient = {
         try { actual = await readHead(); } catch { throw error; }
         if (actual !== commit.sha) {
           if (actual !== expectedParent) moved = actual;
-          else if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) throw new Error(`目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`);
+          else if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) throw new GitHubError(`${error.message}；目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`, error.status);
           else throw error;
         }
       }
@@ -496,7 +497,7 @@ export const githubClient = {
     throw new Error(`分叉仍在创建或缺少分支，请稍后重试以关联已有 Fork：https://github.com/${forkOwner}/${forkName}`);
   },
 
-  async syncAllForkBranches(owner: string, repo: string, token: string) {
+  async syncAllForkBranches(owner: string, repo: string, token: string, onBranch?: (result: { branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string }) => void) {
     const meta = await json(root(owner, repo), token);
     if (!meta.fork || !meta.parent) throw new Error('目标不是 Fork');
     const sourceOwner = meta.parent.owner.login;
@@ -512,6 +513,7 @@ export const githubClient = {
         if (typeof indexedDB !== 'undefined') await transferCache.clear(snapshot.latestCommitSha);
         results.push({ branch, success: true, sourceSha: snapshot.latestCommitSha, commitSha: uploaded.commitSha });
       } catch (error) { results.push({ branch, success: false, error: (error as Error).message }); }
+      onBranch?.(results[results.length - 1]);
     }
     return results;
   },

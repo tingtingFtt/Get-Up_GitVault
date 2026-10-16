@@ -8,6 +8,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
 import { beginGithubOperation, githubClient } from '../src/utils/githubClient';
 import App from '../src/App';
+import { accountRegistry, type AccountProject } from '../src/utils/accountRegistry';
+const registryMethods = { ...accountRegistry };
 
 const originalFetch = globalThis.fetch;
 const withoutTargetHealth = (saved: string | null) => JSON.stringify(JSON.parse(saved!).map(({ targetHealth, ...project }: any) => project));
@@ -70,6 +72,10 @@ let rejectionStatus: number;
 let uploadedContents: string[];
 const ok = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 beforeEach(async () => {
+  accountRegistry.candidates = async () => ({ login: 'destination', recorded: [], legacy: [] });
+  accountRegistry.save = async () => ({} as any);
+  accountRegistry.remove = async () => ({} as any);
+  accountRegistry.reserve = async (source, name, kind, _token, _signal, explicit) => ({ source, target: explicit || {owner:'destination',repo:name}, kind, state:'reserved',createdByApp:true,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:'' });
   beginGithubOperation(); localStorage.clear(); document.body.innerHTML = '<div id="root"></div>';
   await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase('GitVault_Storage_v1'); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
   alerts = []; requests = []; uploadedContents = []; failUpload = false; rejectionStatus = 403;
@@ -94,6 +100,7 @@ beforeEach(async () => {
     if (path.endsWith('/forks')) return ok({ owner: { login: 'me' }, name: 'project-fork', default_branch: 'develop', html_url: 'https://github.com/me/project-fork' });
     if (path === '/repos/me/project-fork') return ok({ fork: true, parent: { full_name: 'source/project' }, default_branch: 'develop' });
     if (path.endsWith('/merge-upstream')) return ok({ message: 'synced' });
+    if (/^\/repos\/[^/]+\/[^/]+$/.test(path) && !init.method) return ok({ message: 'Not Found' }, 404);
     throw new Error('Unexpected request: ' + path);
   };
   localStorage.setItem('gitvault_repos_v8', JSON.stringify([repo()]));
@@ -102,7 +109,7 @@ beforeEach(async () => {
   root = createRoot(document.getElementById('root')!);
   await act(async () => { root.render(React.createElement(App)); });
 });
-afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; });
+afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); });
 
 const storedProjects = () => JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
 const targetManager = () => document.querySelector('[aria-label="管理远端目标"]');
@@ -615,14 +622,15 @@ function identifyDestination() {
   globalThis.fetch = async (url, init) => String(url) === 'https://api.github.com/repos/destination/backup' ? ok({ id: 77, owner: { login: 'destination' }, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' }) : base(url, init);
 }
 
-test('batch upload reuses the bound renamed repository and branch without creating another', async () => {
+test('batch first upload skips an already bound target and never pushes files', async () => {
   await reloadProject(boundProject()); identifyDestination();
   (globalThis as any).confirm = () => false;
   await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量上传至私人仓库'); await click('开始批量上传');
-  await waitFor(() => document.body.textContent?.includes('成功') === true);
+  await waitFor(() => document.body.textContent?.includes('已跳过') === true);
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
   assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'release');
-  assert.equal(saved.remoteSnapshot.commitSha, 'uploaded');
+  assert.equal(saved.remoteSnapshot, undefined);
+  assert.ok(!requests.some(r => r.path.includes('/git/')));
   assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
 });
@@ -684,11 +692,7 @@ test('upload after a restore archives the restored manifest with its matching so
 });
 
 test('current-branch copy saves exact downloaded version and adds a separate managed project', async () => {
-  identifyDestination(); const base = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => String(url).endsWith('/user') ? ok({ login: 'destination' }) : base(url, init);
-  // Use an existing private destination chosen explicitly for this test.
-  const second = globalThis.fetch;
-  globalThis.fetch = async (url, init) => String(url) === 'https://api.github.com/repos/destination/backup' ? ok({ id: 77, private: true, owner: { login: 'destination' }, name: 'backup', default_branch: 'release', html_url: 'https://github.com/destination/backup' }) : second(url, init);
+  newPrivateFixture();
   await enterWorkbench(); await click('分叉与私有仓'); await click('板块二：创建分叉与上游同步');
   await input('project', 'backup');
   await click('保存当前分支并加入我的项目');
@@ -702,7 +706,20 @@ test('current-branch copy saves exact downloaded version and adds a separate man
   assert.ok(!requests.some(r => r.path.endsWith('/forks')));
 });
 
+function newPrivateFixture() {
+  const base = globalThis.fetch; let created = false;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    if (path === '/user') return ok({login:'destination'});
+    if (path === '/repos/destination/backup') return created ? ok({id:77,private:true,owner:{login:'destination'},name:'backup',default_branch:'main',html_url:'https://github.com/destination/backup'}) : ok({message:'Not Found'},404);
+    if (path === '/user/repos' && init.method === 'POST') { created = true; return ok({id:77,owner:{login:'destination'},name:'backup',default_branch:'main',html_url:'https://github.com/destination/backup'}); }
+    return base(url,init);
+  };
+}
+
 function completeForkFixture() {
+  accountRegistry.candidates = async () => ({login:'me',recorded:[],legacy:[]});
+  accountRegistry.reserve = async (source, name, kind) => ({source,target:{owner:'me',repo:name},kind,state:'reserved',createdByApp:true,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''});
   let created = false;
   globalThis.fetch = async (url, init = {}) => {
     const path = String(url).replace('https://api.github.com', '');
@@ -888,10 +905,10 @@ test('workbench metadata can be edited without pulling files or altering branch 
   assert.ok(requests.every(request => request.path === '/repos/destination/backup' && request.payload === null));
 });
 
-test('batch upload after switching uses the matching slash branch and preserves the previously uploaded branch', async () => {
+test('batch update after switching uses the matching slash branch and preserves the previously uploaded branch', async () => {
   await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
   (globalThis as any).confirm = () => false;
-  await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量上传至私人仓库'); await click('开始批量上传');
+  await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量更新'); await click('开始批量更新');
   await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
   assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
   assert.ok(!requests.some(r => r.path.endsWith('/git/refs/heads/release')));
@@ -899,28 +916,24 @@ test('batch upload after switching uses the matching slash branch and preserves 
   assert.equal(saved.branchTargets.develop.branch, 'release'); assert.equal(saved.branchTargets['feature/demo'].repo, 'backup');
 });
 
-test('private upload into an existing named repository creates the source branch rather than overwriting its default branch', async () => {
-  const base = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    if (String(url).endsWith('/user')) return ok({ login: 'destination' });
-    if (String(url) === 'https://api.github.com/repos/destination/backup') return ok({ id: 77, private: true, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' });
-    return base(url, init);
-  };
+test('a proposed private name already present in the account requires comparison before any write', async () => {
+  identifyDestination();
   await enterWorkbench(); await click('分叉与私有仓');
   const name = [...document.querySelectorAll<HTMLInputElement>('input')].find(field => field.value === 'project')!;
   await setField(name, 'backup'); await click('立即新建私人仓库并上传');
-  await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
-  assert.equal(saved.uploadTarget.branch, 'develop');
-  assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/develop'));
-  assert.ok(!requests.some(r => r.path.includes('/heads/main') || r.path.endsWith('/git/refs/heads/release')));
+  await waitFor(() => !!importDialog());
+  assert.equal(storedProjects()[0].uploadTarget, undefined);
+  assert.ok(!requests.some(r => r.payload));
+  await click('跳过此链接'); await waitFor(() => alerts.length > 0);
+  assert.equal(storedProjects()[0].uploadTarget, undefined);
+  assert.ok(!requests.some(r => r.payload));
 });
 
 test('manual copy mode cannot bypass another branch binding in the same uploaded repository', async () => {
   await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
   await click('上传指定仓库'); await click('另存副本到其他仓库（不改变原绑定）');
   await input('owner/repo', 'destination/backup'); await input('留空使用当前来源分支', 'release');
-  await click('确认上传'); await waitFor(() => alerts.some(message => message.includes('不能用 feature/demo 覆盖')));
+  await click('确认上传'); await waitFor(() => alerts.some(message => message.includes('不能再次上传为新副本')));
   assert.ok(!requests.some(r => r.path.endsWith('/git/commits') || r.path.endsWith('/git/refs/heads/release')));
 });
 
@@ -956,12 +969,7 @@ test('complete batch Fork creates one verified destination and associates duplic
 });
 
 test('batch current-branch copies use the exact cached source snapshot and corresponding branch', async () => {
-  const base = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    if (String(url).endsWith('/user')) return ok({ login: 'destination' });
-    if (String(url) === 'https://api.github.com/repos/destination/backup') return ok({ id: 77, private: true, owner: { login: 'destination' }, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup' });
-    return base(url, init);
-  };
+  newPrivateFixture();
   await openBatch('批量分叉');
   await setField(document.querySelector<HTMLSelectElement>('[aria-label="批量分叉范围"]')!, 'current');
   await setField(document.querySelector<HTMLInputElement>('[aria-label="目标名称 1"]')!, 'backup');
@@ -1049,4 +1057,131 @@ test('batch sync shares complete-Fork transfers but refreshes every selected man
     const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!).find((item: any) => item.id === 'managed');
     assert.equal(updated.latestCommitSha, 'source-new'); assert.equal(updated.remoteSnapshot.commitSha, 'target-new'); assert.equal(updated.isCachePurged, true);
   } finally { githubClient.syncAllForkBranches = original; }
+});
+
+function cloudEntry(full = false): AccountProject {
+  return {source:{owner:'source',repo:'project',url:'https://github.com/source/project',branch:'develop',repositoryId:42},target:{id:77,owner:'destination',repo:'backup'},kind:full?'full':'upload',state:'active',createdByApp:true,branches:full?['develop','other']:undefined,bindings:{develop:{branch:'release',sourceSha:'import-new',commitSha:'target-current',updatedAt:'now'}},updatedAt:'now'};
+}
+test('a fresh device importing the original link restores the account target and synced receipt without uploading', async () => {
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture();
+  accountRegistry.candidates = async () => ({login:'destination',recorded:[cloudEntry()],legacy:[]});
+  await click('新建链接/拉取项目'); await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');
+  await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地'); await waitFor(()=>alerts.length>0);
+  const saved = storedProjects()[0]; assert.equal(saved.uploadTarget.repo,'backup'); assert.equal(saved.uploadTarget.branch,'release');
+  assert.equal(saved.accountState,'synced'); assert.equal(saved.remoteSnapshot.sourceSha,'import-new');
+  assert.ok(document.body.textContent?.includes('已同步')); assert.ok(!importDialog()); assert.ok(requests.every(request=>!request.payload));
+});
+test('a fresh device importing the destination URL resumes the original source branch and fixed destination', async () => {
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture();
+  const base=globalThis.fetch;
+  globalThis.fetch=async(url,init={})=>String(url).endsWith('/repos/destination/backup/commits/main')?ok({sha:'target-current',commit:{tree:{sha:'compare-tree'},message:'old',author:{}}}):base(url,init);
+  accountRegistry.candidates = async () => ({login:'destination',recorded:[cloudEntry()],legacy:[]});
+  await click('新建链接/拉取项目'); await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','destination/backup/tree/release');
+  await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地'); await waitFor(()=>alerts.length>0);
+  const saved=storedProjects()[0]; assert.equal(saved.owner,'source'); assert.equal(saved.repo,'project'); assert.equal(saved.branch,'develop'); assert.equal(saved.uploadTarget.branch,'release');
+  assert.equal(saved.latestCommitSha,'import-new'); assert.ok(requests.every(request=>!request.payload));
+});
+test('a fresh-device full Fork import displays forked state and keeps its account target', async()=>{
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({full:true});
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry(true)],legacy:[]});
+  await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');await waitFor(()=>alerts.length>0);
+  assert.equal(storedProjects()[0].forkTarget.id,77);assert.equal(storedProjects()[0].accountState,'forked');assert.ok(document.body.textContent?.includes('已分叉'));assert.ok(requests.every(request=>!request.payload));
+});
+test('an inaccessible account target remains fixed on a fresh device instead of allowing duplicate creation', async()=>{
+  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture();
+  const base=globalThis.fetch;globalThis.fetch=async(url,init={})=>String(url)==='https://api.github.com/repos/destination/backup'?ok({message:'Not Found'},404):base(url,init);
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry()],legacy:[]});
+  await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');await waitFor(()=>alerts.length>0);
+  assert.equal(storedProjects()[0].uploadTarget.id,77);assert.equal(storedProjects()[0].accountState,'pending');
+  await click('全选所有');await click('批量上传至私人仓库');await click('开始批量上传');await waitFor(()=>document.body.textContent?.includes('失败')===true);
+  assert.ok(requests.every(request=>!request.payload));assert.equal(storedProjects()[0].uploadTarget.repo,'backup');
+});
+test('cancel batch first upload stops the current account check and every remaining item and records reasons',async()=>{
+  await reloadProjects([repo(),{...repo(),id:'second',owner:'other',repo:'other',url:'https://github.com/other/other'}]);
+  let checks=0;
+  const {operationSignal}=await import('../src/utils/githubClient');
+  accountRegistry.candidates=async()=>{checks++;const signal=operationSignal();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));};
+  await openBatch('批量上传至私人仓库',2);await click('开始批量上传');await waitFor(()=>checks===1);await click('取消剩余上传');
+  await waitFor(()=>document.querySelectorAll('span').length>0 && [...document.querySelectorAll('span')].filter(span=>span.textContent==='已取消').length===2);
+  assert.equal(checks,1);assert.ok(!requests.some(request=>request.payload));
+  const logs=JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!);assert.equal(logs.filter((log:any)=>log.status==='cancelled').length,2);
+});
+test('cancel batch update keeps an earlier success and never begins the remaining project',async()=>{
+  const first=boundProject();first.remoteSnapshot={repoId:77,owner:'destination',repo:'backup',branch:'release',sourceSha:'v2',commitSha:'uploaded',htmlUrl:''};
+  await reloadProjects([first,{...repo(),id:'second',owner:'other',repo:'second'},{...repo(),id:'third',owner:'third',repo:'third'}]);identifyDestination();
+  const base=globalThis.fetch;let blocked=false;
+  globalThis.fetch=async(url,init={})=>{
+    const path=String(url);
+    if(path.endsWith('/repos/source/project/commits/develop'))return ok({sha:'v2',commit:{message:'current',author:{}}});
+    if(path.endsWith('/repos/other/second/commits/develop')){blocked=true;return new Promise((_resolve,reject)=>init.signal!.addEventListener('abort',()=>reject(init.signal!.reason),{once:true}));}
+    return base(url,init);
+  };
+  await openBatch('批量更新',3);await click('开始批量更新');await waitFor(()=>blocked);await click('取消剩余操作');await waitFor(()=>batchStatus()==='成功 1 · 失败 0 · 跳过 0 · 取消 2');
+  assert.equal(storedProjects()[0].remoteSnapshot.commitSha,'uploaded');assert.ok(!requests.some(request=>request.path.includes('/repos/third/')));
+});
+test('a verified upload keeps cache and pending account receipt if cloud registration fails, then retries only registration',async()=>{
+  await reloadProject(boundProject());identifyDestination();
+  let failing=true,saves=0;
+  // Use the existing verified local receipt path so preflight migration does not need a write.
+  const original=accountRegistry.candidates;let active=false;
+  accountRegistry.candidates=async()=>({login:'destination',recorded:active?[{...cloudEntry(),bindings:{develop:{branch:'release',sourceSha:'v2',commitSha:'uploaded',updatedAt:'now'}}}]:[],legacy:[]});
+  // The first migration must succeed; the subsequent verified receipt write fails.
+  accountRegistry.save=async()=>{saves++;if(saves>1&&failing)throw new Error('registry write denied');active=true;return {} as any;};
+  await enterWorkbench();await upload(true);await waitFor(()=>alerts.some(message=>message.includes('项目已在 GitHub 保存')));
+  assert.equal(storedProjects()[0].remoteSnapshot.commitSha,'uploaded');assert.equal(storedProjects()[0].cloudPending.length,1);
+  assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');
+  const writes=requests.filter(request=>request.path.endsWith('/git/commits')).length;
+  failing=false;
+  // Make the remote receipt and unchanged source resolvable during the retry.
+  const base=globalThis.fetch;globalThis.fetch=async(url,init={})=>{
+    const path=String(url);
+    if(path.endsWith('/repos/destination/backup/commits/release'))return ok({sha:'uploaded',commit:{tree:{sha:'old-tree'}}});
+    if(path.endsWith('/repos/source/project/commits/develop'))return ok({sha:'v2',commit:{message:'current',author:{}}});
+    return base(url,init);
+  };
+  await click('一键更新');await waitFor(()=>storedProjects()[0].cloudPending.length===0);
+  assert.equal(requests.filter(request=>request.path.endsWith('/git/commits')).length,writes);
+  accountRegistry.candidates=original;
+});
+test('failure logs are visible with the original GitHub reason and can be filtered',async()=>{
+  failUpload=true;rejectionStatus=422;await enterWorkbench();await upload(false);
+  await click('操作日志');const dialog=document.querySelector('[aria-label="操作日志"]')!;
+  assert.ok(dialog.textContent?.includes('Update is not a fast forward'), JSON.stringify({text:dialog.textContent,alerts,logs:localStorage.getItem('gitvault_operation_logs_v1')}));assert.ok(dialog.textContent?.includes('HTTP 422'));
+  await setField(document.querySelector<HTMLSelectElement>('[aria-label="日志筛选"]')!,'failed');assert.ok(dialog.textContent?.includes('失败'));
+  assert.ok(!dialog.textContent?.includes('fake-test-token'));
+});
+test('batch first uploads create only one target for duplicate source branches and skip the other branch',async()=>{
+  await reloadProjects([repo(),{...repo(),id:'second',branch:'other'}]);
+  await localCache.saveProjectFiles('second',[file('new')],'v2');
+  const base=globalThis.fetch;let created=false,creates=0;let registered:AccountProject|undefined;
+  accountRegistry.candidates=async()=>({login:'destination',recorded:registered?[registered]:[],legacy:[]});
+  accountRegistry.save=async(entry)=>{registered=entry;return {} as any;};
+  globalThis.fetch=async(url,init={})=>{
+    const path=String(url).replace('https://api.github.com','');
+    if(path==='/user')return ok({login:'destination'});
+    if(path==='/user/repos'&&init.method==='POST'){created=true;creates++;return ok({id:77,owner:{login:'destination'},name:'project',html_url:'https://github.com/destination/project',default_branch:'main'});}
+    if(path==='/repos/destination/project')return created?ok({id:77,owner:{login:'destination'},name:'project',private:true,default_branch:'main',html_url:'https://github.com/destination/project'}):ok({message:'Not Found'},404);
+    if(path==='/repos/destination/project/commits/other')return ok({message:'Not Found'},404);
+    if(path.startsWith('/repos/destination/project/branches?'))return ok([{name:'develop'}]);
+    if(path.startsWith('/repos/destination/project/'))return base(String(url).replace('/destination/project/','/destination/backup/'),init);
+    return base(url,init);
+  };
+  await openBatch('批量上传至私人仓库',2);await click('开始批量上传');await waitFor(()=>document.body.textContent?.includes('已跳过')===true);
+  assert.equal(creates,1);const saved=storedProjects();assert.equal(saved[0].uploadTarget.repo,'project');assert.equal(saved[1].uploadTarget.repo,'project');assert.equal(saved[1].uploadTarget.branch,'other');
+  assert.ok(!requests.some(request=>request.payload?.ref==='refs/heads/other'));assert.equal(registered?.bindings.develop.commitSha,'uploaded');
+});
+test('cancel full batch sync preserves verified branch receipts locally for later account registration',async()=>{
+  const target={id:77,owner:'destination',repo:'backup',branch:'develop',htmlUrl:'https://github.com/destination/backup',branches:['develop','other']};
+  await reloadProject({...repo(),forkTarget:target});identifyDestination();
+  const original=githubClient.syncAllForkBranches;let started=false;
+  const {operationSignal}=await import('../src/utils/githubClient');
+  githubClient.syncAllForkBranches=async(_owner,_repo,_token,onBranch)=>{
+    onBranch?.({branch:'develop',success:true,sourceSha:'v3',commitSha:'verified-branch'});started=true;
+    const signal=operationSignal();return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));
+  };
+  try{
+    await openBatch('批量分叉同步');await click('开始批量同步');await waitFor(()=>started);await click('取消剩余操作');await waitFor(()=>batchStatus()==='成功 0 · 失败 0 · 跳过 0 · 取消 1');
+    assert.equal(storedProjects()[0].cloudPending[0].bindings.develop.commitSha,'verified-branch');
+    const logs=JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!);assert.ok(logs.some((log:any)=>log.status==='success'&&log.message.includes('develop')));assert.ok(logs.some((log:any)=>log.status==='cancelled'));
+  }finally{githubClient.syncAllForkBranches=original;}
 });

@@ -13,6 +13,7 @@ type KnownProject = ProjectSource & {
 export interface ImportCandidate {
   key: string; projectId: string; remark: string; source: ProjectSource;
   target: UploadTarget; fullFork: boolean; branches?: string[];
+  accountRecord?: import('./accountRegistry').AccountProject;
 }
 export function sameRepository(a: { owner: string; repo: string }, b: { owner: string; repo: string }) {
   return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase();

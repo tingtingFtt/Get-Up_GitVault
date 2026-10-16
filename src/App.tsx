@@ -21,6 +21,8 @@ import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
+import { accountRegistry, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject } from './utils/accountRegistry';
+import { appendOperationLog, readOperationLogs, clearOperationLogs, type OperationLog } from './utils/operationLog';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 
 interface RepoTreeItem {
@@ -32,6 +34,11 @@ interface RepoTreeItem {
 }
 
 interface TrackedRepo {
+  repositoryId?: number;
+  cloudPending?: AccountProject[];
+  cloudRemovals?: TargetIdentity[];
+  creationReservation?: AccountProject;
+  accountState?: 'synced' | 'forked' | 'bound' | 'pending';
   targetHealth?: Record<string, TargetHealth>;
   detachedTargets?: TargetIdentity[];
   remoteSnapshot?: RemoteSnapshot;
@@ -109,13 +116,13 @@ interface BatchUploadItemStatus {
   id: string;
   name: string;
   repo: string;
-  status: 'pending' | 'creating' | 'uploading' | 'success' | 'error';
+  status: 'pending' | 'creating' | 'uploading' | 'success' | 'error' | 'skipped' | 'cancelled';
   error?: string;
   htmlUrl?: string;
 }
 
-type ImportComparison = { status: 'loading' | 'ready' | 'error'; error?: string; target?: UploadTarget; sourceSha?: string; commitSha?: string; missingBranch?: boolean; diff?: ReturnType<typeof compareImportTrees> };
-type ImportChoice = { candidate: ImportCandidate; comparison: ImportComparison } | 'independent' | 'skip';
+type ImportComparison = { status: 'loading' | 'ready' | 'error'; error?: string; target?: UploadTarget; sourceSha?: string; commitSha?: string; missingBranch?: boolean; diff?: ReturnType<typeof compareImportTrees>; targetHealth?: TargetHealth };
+type ImportChoice = { candidate: ImportCandidate; comparison: ImportComparison; automatic?: boolean } | 'independent' | 'skip';
 
 // Light Morandi Gradient Color Palette for heatmap
 const MORANDI_HEATMAP_COLORS = [
@@ -191,6 +198,12 @@ export default function App() {
   const [isBatchUploadModalOpen, setIsBatchUploadModalOpen] = useState(false);
   const [batchUploadStatusList, setBatchUploadStatusList] = useState<BatchUploadItemStatus[]>([]);
   const [isBatchUploading, setIsBatchUploading] = useState(false);
+  const batchUploadLock = useRef(false);
+  const operationTokens = useRef(new Set<string>());
+  const [isLogOpen, setIsLogOpen] = useState(false);
+  const [operationLogs, setOperationLogs] = useState<OperationLog[]>(readOperationLogs);
+  const [logFilter, setLogFilter] = useState('all');
+  const [logStorageError, setLogStorageError] = useState('');
   const [batchTask, setBatchTask] = useState<'fork' | 'update' | 'sync' | null>(null);
   const [batchTaskItems, setBatchTaskItems] = useState<ProjectBatchItem[]>([]);
   const [batchTaskRunning, setBatchTaskRunning] = useState(false);
@@ -403,6 +416,41 @@ export default function App() {
     persistRepos(reposRef.current.map(repo => repo.id === id ? { ...repo, ...patch } : repo));
   };
   useEffect(() => {
+    const changed = () => setOperationLogs(readOperationLogs());
+    window.addEventListener('gitvault-logs-changed', changed);
+    return () => window.removeEventListener('gitvault-logs-changed', changed);
+  }, []);
+  const logOperation = (action: string, status: OperationLog['status'], repo: TrackedRepo | undefined, message: string, stage = '', error?: unknown, batchId?: string) => {
+    const secrets = [...operationTokens.current, globalToken, tokenInput, pushToken, batchTaskToken, targetManagerToken, ...reposRef.current.flatMap(project => [project.token || '', project.uploadTarget?.token || '', project.forkTarget?.token || '', ...Object.values(project.branchTargets || {}).map(target => target.token || '')])];
+    try { appendOperationLog({ action, status, project: repo ? `${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, branch: repo ? sourceOf(repo).branch : undefined, target: repo?.uploadTarget ? `${repo.uploadTarget.owner}/${repo.uploadTarget.repo}:${repo.uploadTarget.branch}` : undefined, message, stage, httpStatus: error instanceof GitHubError ? error.status : undefined, batchId }, secrets); }
+    catch { setLogStorageError('操作日志无法持久保存，请检查浏览器存储空间并导出已有日志'); }
+  };
+  const flushCloudPending = async (repo: TrackedRepo, token: string) => {
+    const pending = reposRef.current.find(project => project.id === repo.id)?.cloudPending || [];
+    for (const entry of pending) {
+      try {
+        await githubClient.repository(entry.target.owner, entry.target.repo, token, entry.target.id);
+        await accountRegistry.save(entry, token);
+        const current = reposRef.current.find(project => project.id === repo.id);
+        if (current) patchRepo(repo.id, { cloudPending: (current.cloudPending || []).filter(item => item !== entry && JSON.stringify(item) !== JSON.stringify(entry)) });
+      } catch (error) {
+        logOperation('保存跨设备记录', 'partial', repo, (error as Error).message, '账号记录', error);
+        throw new Error(`项目已在 GitHub 保存，但跨设备记录尚未完成；本地缓存和固定目标已保留，请使用更新／同步重试，不能重复创建：${(error as Error).message}`);
+      }
+    }
+  };
+  const queueAccountRecord = (repo: TrackedRepo, entry: AccountProject) => {
+    const current = reposRef.current.find(project => project.id === repo.id) || repo;
+    const related = (current.cloudPending || []).filter(item => sameTarget(item.target, entry.target));
+    const bindings = { ...related.reduce((all, item) => ({ ...all, ...item.bindings }), {}), ...entry.bindings };
+    patchRepo(repo.id, { cloudPending: [...(current.cloudPending || []).filter(item => !sameTarget(item.target, entry.target)), { ...entry, bindings }] });
+  };
+  const publishAccountRecord = async (repo: TrackedRepo, entry: AccountProject, token: string) => {
+    queueAccountRecord(repo, entry);
+    await flushCloudPending(repo, token);
+  };
+  const accountRecord = (repo: TrackedRepo, target: TargetIdentity, kind: AccountProject['kind'], sourceBranch: string, branch: string, sourceSha?: string, commitSha?: string): AccountProject => ({ source: { ...sourceOf(repo), branch: sourceBranch }, target: { id: target.id, owner: target.owner, repo: target.repo }, kind, state: 'active', createdByApp: true, bindings: { [sourceBranch]: { branch, sourceSha, commitSha, updatedAt: new Date().toISOString() } }, branches: kind === 'full' ? repo.forkTarget?.branches : undefined, updatedAt: new Date().toISOString() });
+  useEffect(() => {
     const listener = (event: Event) => {
       const { target, health, identity, checkId } = (event as CustomEvent<{ target: TargetIdentity; health: TargetHealth; identity?: { id?: number; owner: string; repo: string; htmlUrl: string }; checkId: number }>).detail;
       const key = targetKey(target);
@@ -515,6 +563,10 @@ export default function App() {
       const backups = previous && previous.commitSha !== snapshot.commitSha && archived ? [archived, ...current.backups] : current.backups;
       patchRepo(repo.id, { ...extra, targetHealth, backups, remoteSnapshot: snapshot, branchTargets, uploadTarget: binding, branchUploadPending: false, lastUploadedToPrivateAt: new Date().toISOString() });
     }
+    if (bindTarget) {
+      await publishAccountRecord(repo, accountRecord(repo, binding, repo.forkScope === 'full' ? 'full' : binding.kind || 'upload', sourceBranch, result.branch, sourceSha, result.commitSha), uploadToken || binding.token || globalToken || repo.token || '');
+      patchRepo(repo.id, { creationReservation: undefined, accountState: repo.forkScope === 'full' ? 'forked' : 'synced' });
+    }
     if (purge) {
       try {
         await localCache.deleteProjectFiles(repo.id, sourceSha);
@@ -563,16 +615,23 @@ export default function App() {
     } catch (error) { setTargetManagerMessage(signal.aborted ? '检测已取消，原绑定保持不变。' : (error as Error).message); }
     finally { setTargetManagerBusy(false); }
   };
-  const handleDetachTarget = (repoId: string, target: TargetIdentity) => {
+  const handleDetachTarget = async (repoId: string, target: TargetIdentity) => {
     if (targetManagerBusy) return;
     const affected = reposRef.current.filter(project => projectTargets(project).some(item => sameTarget(item, target)));
     if (!affected.length || !confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n之后需要重新选择上传目标或创建分叉。若只是 Token 无权限，建议先更新 Token 并重新检测。`)) return;
     try {
-      persistRepos(reposRef.current.map(project => detachedTarget(project, target)));
+      persistRepos(reposRef.current.map(project => {
+        const next = detachedTarget(project, target);
+        return affected.some(item => item.id === project.id) ? { ...next, creationReservation: undefined, cloudPending: (project.cloudPending || []).filter(entry => !sameTarget(entry.target, target)), cloudRemovals: [...(project.cloudRemovals || []), target] } : next;
+      }));
       setDetachedTargetName(target.repo);
       setTargetManagerMessage(`已解除 ${affected.length} 个记录的旧目标绑定。可以重新设置上传或创建分叉；本地文件和历史快照已保留。GitHub 上已删除的历史无法在新仓库中自动重建。`);
       setTargetManagerId(repoId);
-    } catch (error) { setTargetManagerMessage('解除绑定未保存：' + (error as Error).message); }
+      beginGithubOperation();
+      const auth = targetManagerToken.trim() || targetToken(affected[0], target);
+      if (auth) for (const project of affected) await flushCloudRemovals(project, auth);
+      logOperation('解除远端目标', 'success', affected[0], '当前绑定与账号记录已解除；历史快照保留');
+    } catch (error) { logOperation('解除远端目标', 'partial', affected[0], (error as Error).message, '解除账号记录', error); setTargetManagerMessage('本地记录已保留；账号解绑未完成，将在下次操作时重试：' + (error as Error).message); }
   };
   const reopenTargetSetup = (repoId: string, fork: boolean) => {
     const repo = reposRef.current.find(project => project.id === repoId);
@@ -618,8 +677,10 @@ export default function App() {
       persistRepos(reposRef.current.map(item => renamedProject(item, previous, next)));
       const refreshed = reposRef.current.find(item => item.id === repo.id)!;
       setSingleUploadTargetRepo(refreshed); setSingleUploadRepoName(next.repo);
+      if (refreshed.uploadTarget) await publishAccountRecord(refreshed, accountRecord(refreshed, refreshed.uploadTarget, refreshed.forkScope === 'full' ? 'full' : refreshed.uploadTarget.kind || 'upload', sourceOf(refreshed).branch, refreshed.uploadTarget.branch, refreshed.remoteSnapshot?.sourceSha, refreshed.remoteSnapshot?.commitSha), token);
+      logOperation('修改项目名称', 'success', refreshed, `固定目标已更名为 ${next.repo}`);
       alert('项目名称已修改，仓库身份和历史记录保持不变。');
-    } catch (error) { alert('修改名称失败：' + (error as Error).message); }
+    } catch (error) { logOperation('修改项目名称', 'error', repo, (error as Error).message, '修改名称或账号记录', error); alert('修改名称失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1098,8 +1159,8 @@ export default config;
       const current = reposRef.current.find(item => item.id === repo.id);
       if (!current || sourceOf(current).branch !== source.branch) throw new Error('项目已改变，请重新选择分支');
       const old = archiveVersion(repo);
-      patchRepo(repo.id, { branch: data.branch, url: repo.origin ? repo.url : `https://github.com/${source.owner}/${source.repo}`, origin: repo.origin ? { ...repo.origin, branch: data.branch } : undefined,
-        latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree,
+      patchRepo(repo.id, { branch: data.branch, url: repo.origin ? repo.url : `https://github.com/${source.owner}/${source.repo}`, origin: repo.origin ? { ...repo.origin, branch: data.branch, repositoryId: data.repositoryId || repo.origin.repositoryId } : undefined,
+        repositoryId: repo.origin ? repo.repositoryId : data.repositoryId, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree,
         repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl },
         backups: [old, ...current.backups.map(item => ({ ...item, branch: item.branch || source.branch }))], branchTargets, uploadTarget: nextTarget, branchUploadPending: !!nextTarget && !Object.hasOwn(branchTargets, data.branch), remoteSnapshot: undefined,
         forkTarget: repo.forkTarget ? { ...repo.forkTarget, branch: data.branch } : undefined,
@@ -1107,7 +1168,7 @@ export default config;
       setViewingBackup(null); setSelectedFilePath(null); setFileContent(null); setSelectedBackupIds([]); setFileSearchQuery(''); setVisibleFileCount(150); setMobileFileView('list'); setWorkbenchTab('files');
       await transferCache.clear(data.latestCommitSha);
       alert(`已重新拉取并切换到 ${data.branch}，共 ${data.files.length} 个文件。${nextTarget ? `上传目标：${nextTarget.owner}/${nextTarget.repo}:${nextTarget.branch}。` : ''}其他分支的文件和历史记录已保留。`);
-    } catch (error) { setWorkbenchBranchError('切换未完成：' + (error as Error).message); }
+    } catch (error) { logOperation('切换分支', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取分支', error); setWorkbenchBranchError('切换未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1127,6 +1188,7 @@ export default config;
       patchRepo(repo.id, { hasUpdate: data.hasUpdate, latestRemoteCommit: data.latestCommit, lastCheckedAt: new Date().toISOString() });
     } catch (error) {
       patchRepo(repo.id, { lastCheckedAt: new Date().toISOString() });
+      logOperation('检测更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '检测来源与目标', error);
       if (!isBackground) alert('检测失败：' + (error as Error).message);
     } finally { checkingRepos.current.delete(repoId); if (!isBackground) setIsLoading(false); }
   };
@@ -1141,14 +1203,15 @@ export default config;
   };
 
   // Import matching is read-only. A destination is bound only after an explicit choice.
-  const chooseImportBase = async (data: { owner: string; repo: string; branch: string; latestCommitSha: string; tree: RepoTreeItem[] }, token: string): Promise<ImportChoice> => {
-    const source = { owner: data.owner, repo: data.repo, branch: data.branch, url: `https://github.com/${data.owner}/${data.repo}` };
-    const candidates = importCandidates(reposRef.current, source);
+  const chooseImportBase = async (data: { owner: string; repo: string; branch: string; repositoryId?: number; latestCommitSha: string; tree: RepoTreeItem[] }, token: string, extra: ImportCandidate[] = []): Promise<ImportChoice> => {
+    const source = { owner: data.owner, repo: data.repo, branch: data.branch, repositoryId: data.repositoryId, url: `https://github.com/${data.owner}/${data.repo}` };
+    const all = [...extra, ...importCandidates(reposRef.current, source)];
+    const candidates = all.filter((candidate, i) => !all.slice(0, i).some(other => sameTarget(other.target, candidate.target)));
     if (!candidates.length) return 'independent';
     const signal = operationSignal(); signal.throwIfAborted();
     importSession.current++;
     setImportMatch({ source, sha: data.latestCommitSha, tree: data.tree, candidates, token, comparisons: {} });
-    setIsLoading(false);
+    const wasLoading = isLoading || importLock.current || !(batchTaskLock.current || batchUploadLock.current); setIsLoading(false);
     try {
       return await new Promise<ImportChoice>((resolve, reject) => {
         const finish = (choice: ImportChoice) => { signal.removeEventListener('abort', abort); importResolver.current = null; resolve(choice); };
@@ -1156,7 +1219,52 @@ export default config;
         signal.addEventListener('abort', abort, { once: true });
         importResolver.current = finish;
       });
-    } finally { importSession.current++; setImportMatch(null); setIsLoading(true); }
+    } finally { importSession.current++; setImportMatch(null); setIsLoading(wasLoading); }
+  };
+
+  const candidateFromAccount = (record: AccountProject, source: ProjectSource, token: string): ImportCandidate => ({ key: `${source.owner}/${source.repo}:${source.branch}=>${targetKey(record.target)}`, projectId: '', remark: record.state === 'reserved' ? '账号中的首次任务尚未完成，需要继续完成或处理旧目标' : '当前 GitHub 账号的已有项目', source, target: { ...record.target, branch: record.bindings[source.branch]?.branch || source.branch, kind: record.kind, token, purgeAfterUpload: false }, fullFork: record.kind === 'full', branches: record.branches, accountRecord: record });
+  const automaticAccountChoice = async (record: AccountProject, source: ProjectSource, token: string, latestSha?: string): Promise<Exclude<ImportChoice, string>> => {
+    const candidate = candidateFromAccount(record, source, token);
+    try {
+      const inspected = await githubClient.inspectImportTarget(candidate.target, token, candidate.fullFork ? source : undefined);
+      return { candidate, automatic: true, comparison: { status: 'ready', target: { ...candidate.target, id: inspected.identity.id, owner: inspected.identity.owner, repo: inspected.identity.repo }, commitSha: inspected.commitSha, sourceSha: latestSha || record.bindings[source.branch]?.sourceSha, missingBranch: inspected.missingBranch } };
+    } catch (error) {
+      if (operationSignal().aborted) throw operationSignal().reason;
+      if (!(error instanceof TargetRepositoryError)) throw error;
+      logOperation('识别账号已有项目', 'error', undefined, error.message, '核对远端目标', error);
+      // Retain the known binding even when inaccessible. A 404 is never permission
+      // to create a second destination under a different name.
+      return { candidate, automatic: true, comparison: { status: 'ready', target: candidate.target, sourceSha: latestSha, missingBranch: true, targetHealth: error.health } };
+    }
+  };
+  const resolveImportChoice = async (data: { owner: string; repo: string; repositoryId?: number; branch: string; latestCommitSha: string; tree: RepoTreeItem[] }, token: string): Promise<ImportChoice> => {
+    if (token) operationTokens.current.add(token);
+    const source: ProjectSource = { owner: data.owner, repo: data.repo, repositoryId: data.repositoryId, branch: data.branch, url: `https://github.com/${data.owner}/${data.repo}` };
+    if (!token) return chooseImportBase(data, token);
+    const found = await accountRegistry.candidates(source, token);
+    const active = found.recorded.filter(record => record.state === 'active');
+    if (active.length === 1) {
+      const entry = active[0];
+      if (!sameSource(entry.source, source)) {
+        const branch = Object.entries(entry.bindings).find(([, binding]) => binding.branch === source.branch)?.[0] || source.branch;
+        const original = await githubClient.inspectRepo(entry.source.url, branch, token);
+        return automaticAccountChoice(entry, { ...entry.source, branch, repositoryId: original.repositoryId || entry.source.repositoryId }, token, original.latestCommitSha);
+      }
+      return automaticAccountChoice(entry, source, token, data.latestCommitSha);
+    }
+    const reserved = found.recorded.find(record => record.state === 'reserved');
+    if (reserved) {
+      try { await githubClient.repository(reserved.target.owner, reserved.target.repo, token, reserved.target.id); }
+      catch (error) { if (error instanceof TargetRepositoryError) return automaticAccountChoice(reserved, source, token, data.latestCommitSha); throw error; }
+    }
+    return chooseImportBase(data, token, [...found.recorded, ...found.legacy].map(record => candidateFromAccount(record, source, token)));
+  };
+  const finishAccountBinding = async (repo: TrackedRepo, choice: ImportChoice, token: string) => {
+    if (typeof choice === 'string' || choice.automatic) return;
+    const target = choice.comparison.target!;
+    const entry = choice.candidate.accountRecord;
+    const record: AccountProject = { ...accountRecord(repo, target, choice.candidate.fullFork ? 'full' : target.kind || 'upload', sourceOf(repo).branch, target.branch), createdByApp: entry?.createdByApp || false, branches: choice.candidate.branches, state: 'active' };
+    await publishAccountRecord(repo, record, token || target.token || '');
   };
 
   const compareImportBase = async (candidate: ImportCandidate) => {
@@ -1181,11 +1289,11 @@ export default config;
   const prepareImport = async (url: string, branch: string | undefined, token: string) => {
     const parsed = parseRepository(url);
     const source = { owner: parsed.owner, repo: parsed.repo, url: `https://github.com/${parsed.owner}/${parsed.repo}`, branch: branch || parsed.linkedRef || 'main' };
-    if (!importCandidates(reposRef.current, source).length) return { choice: 'independent' as const, data: await githubClient.fetchRepo(url, branch, token) };
+    if (!token && !importCandidates(reposRef.current, source).length) return { choice: 'independent' as const, data: await githubClient.fetchRepo(url, branch, token) };
     // Compare manifests before downloading file bytes; skipping an existing project
     // must not require downloading it again.
     const manifest = await githubClient.inspectRepo(url, branch, token);
-    const choice = await chooseImportBase(manifest, token);
+    const choice = await resolveImportChoice(manifest, token);
     operationSignal().throwIfAborted();
     if (choice === 'skip') return { choice, data: undefined };
     const selected = typeof choice === 'string' ? { ...source, branch: manifest.branch } : choice.candidate.source;
@@ -1203,7 +1311,7 @@ export default config;
     if (comparison.status !== 'ready' || !comparison.target) throw new Error('请完成项目对比后再选择同步基础');
     const previous = reposRef.current.find(project => !project.origin && sameRepository(project, newRepo) && project.branch === newRepo.branch);
     const target = comparison.target;
-    const next = { ...previous, ...newRepo, id: previous?.id || newRepo.id,
+    const next: TrackedRepo = { ...previous, ...newRepo, id: previous?.id || newRepo.id,
       token: newRepo.token || previous?.token, checkInterval: previous?.checkInterval || newRepo.checkInterval,
       tags: batch && previous ? previous.tags : newRepo.tags, latestRemoteCommit: undefined, lastUploadedToPrivateAt: undefined,
       backups: previous ? (previous.latestCommitSha !== newRepo.latestCommitSha ? [archiveVersion(previous), ...previous.backups] : previous.backups) : [],
@@ -1214,9 +1322,163 @@ export default config;
       privateRepoUrl: `https://github.com/${target.owner}/${target.repo}`,
       forkScope: candidate.fullFork ? 'full' as const : target.kind === 'current' ? 'current' as const : undefined,
       forkTarget: candidate.fullFork ? { id: target.id, owner: target.owner, repo: target.repo, branch: target.branch, htmlUrl: `https://github.com/${target.owner}/${target.repo}`, branches: candidate.branches?.length ? candidate.branches : [newRepo.branch] } : undefined,
+      accountState: comparison.targetHealth || candidate.accountRecord?.state === 'reserved' ? 'pending' as const : candidate.fullFork ? 'forked' as const : 'bound' as const,
+      creationReservation: candidate.accountRecord?.state === 'reserved' ? candidate.accountRecord : undefined,
+      targetHealth: comparison.targetHealth ? { ...previous?.targetHealth, [targetKey(target)]: comparison.targetHealth } : previous?.targetHealth,
     };
+    if (candidate.accountRecord) {
+      next.branchTargets = { ...next.branchTargets, ...Object.fromEntries(Object.entries(candidate.accountRecord.bindings).map(([branch, binding]) => [branch, { ...target, branch: binding.branch }])) };
+      const receipt = candidate.accountRecord.bindings[newRepo.branch];
+      if (!comparison.targetHealth && receipt?.sourceSha && receipt.commitSha && comparison.commitSha === receipt.commitSha) {
+        next.remoteSnapshot = { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.branch, sourceSha: receipt.sourceSha, commitSha: receipt.commitSha, htmlUrl: `https://github.com/${target.owner}/${target.repo}/tree/${target.branch}` };
+        if (receipt.sourceSha === newRepo.latestCommitSha) next.accountState = candidate.fullFork ? 'forked' : 'synced';
+      }
+    }
     assertDestinationBranch(next, target);
     return next;
+  };
+  const sourceManifest = (repo: TrackedRepo) => ({ ...sourceOf(repo), latestCommitSha: repo.latestCommitSha, tree: repo.tree });
+  const applyAccountChoice = async (repo: TrackedRepo, choice: Exclude<ImportChoice, string>, token: string, save = false) => {
+    repo = reposRef.current.find(project => project.id === repo.id) || repo;
+    const entry = choice.candidate.accountRecord;
+    const raw = choice.comparison.target!;
+    const target = { ...raw, purgeAfterUpload: repo.uploadTarget && sameTarget(repo.uploadTarget, raw) ? repo.uploadTarget.purgeAfterUpload : raw.purgeAfterUpload };
+    const mappings = Object.entries(entry?.bindings || {});
+    if (mappings.some(([branch, binding]) => mappings.some(([other, candidate]) => other !== branch && binding.branch === candidate.branch))) throw new Error('账号分支映射冲突，未执行写入');
+    const source = sourceOf(repo), old = repo.remoteSnapshot;
+    const sameReceipt = !choice.comparison.missingBranch && old && sameTarget({ ...old, id: old.repoId }, target) && old.branch === target.branch;
+    const receipt = entry?.bindings[source.branch];
+    const remoteSnapshot = !choice.comparison.targetHealth && receipt?.sourceSha && receipt.commitSha && choice.comparison.commitSha === receipt.commitSha ? { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.branch, sourceSha: receipt.sourceSha, commitSha: receipt.commitSha, htmlUrl: `https://github.com/${target.owner}/${target.repo}/tree/${target.branch}` } : sameReceipt ? old : undefined;
+    const next: TrackedRepo = { ...repo, uploadTarget: target, branchTargets: { ...repo.branchTargets, ...Object.fromEntries(Object.entries(entry?.bindings || {}).map(([branch, binding]) => [branch, { ...target, branch: binding.branch }])), [source.branch]: target }, branchUploadPending: !!choice.comparison.missingBranch,
+      remoteSnapshot, savedCopies: old && !sameReceipt ? [...(repo.savedCopies || []), old] : repo.savedCopies,
+      forkScope: choice.candidate.fullFork ? 'full' : 'current',
+      forkTarget: choice.candidate.fullFork ? { ...target, htmlUrl: `https://github.com/${target.owner}/${target.repo}`, branches: entry?.branches || [source.branch] } : undefined,
+      privateRepoUrl: choice.candidate.fullFork ? undefined : `https://github.com/${target.owner}/${target.repo}`,
+      accountState: choice.comparison.targetHealth || entry?.state === 'reserved' ? 'pending' : remoteSnapshot?.sourceSha === repo.latestCommitSha ? choice.candidate.fullFork ? 'forked' : 'synced' : 'bound',
+      targetHealth: choice.comparison.targetHealth ? { ...repo.targetHealth, [targetKey(target)]: choice.comparison.targetHealth } : repo.targetHealth,
+      creationReservation: entry?.state === 'reserved' ? entry : undefined,
+      ...(repo.origin ? { owner: target.owner, repo: target.repo, url: `https://github.com/${target.owner}/${target.repo}`, repoMeta: { ...repo.repoMeta, htmlUrl: `https://github.com/${target.owner}/${target.repo}` } } : {}),
+    };
+    assertDestinationBranch(next, target); patchRepo(repo.id, next);
+    if (save) await finishAccountBinding(next, choice, token);
+    return reposRef.current.find(project => project.id === repo.id)!;
+  };
+  const flushCloudRemovals = async (repo: TrackedRepo, token: string) => {
+    for (const target of reposRef.current.find(project => project.id === repo.id)?.cloudRemovals || []) {
+      await accountRegistry.remove(target, token);
+      const current = reposRef.current.find(project => project.id === repo.id)!;
+      patchRepo(repo.id, { cloudRemovals: (current.cloudRemovals || []).filter(item => !sameTarget(item, target)) });
+    }
+  };
+  const knownAccountRecord = (candidate: ImportCandidate, incoming: ProjectSource): AccountProject | undefined => {
+    const known = reposRef.current.find(project => project.id === candidate.projectId);
+    if (!known?.remoteSnapshot || !sameTarget({ ...known.remoteSnapshot, id: known.remoteSnapshot.repoId }, candidate.target)) return undefined;
+    const source = sourceOf(known), receipt = known.remoteSnapshot;
+    const record = accountRecord(known, candidate.target, candidate.fullFork ? 'full' : candidate.target.kind || 'upload', source.branch, receipt.branch, receipt.sourceSha, receipt.commitSha);
+    for (const [branch, target] of Object.entries(known.branchTargets || {})) if (sameTarget(target, candidate.target)) if (!Object.hasOwn(record.bindings, branch)) record.bindings[branch] = { branch: target.branch, updatedAt: record.updatedAt };
+    if (!Object.hasOwn(record.bindings, incoming.branch)) record.bindings[incoming.branch] = { branch: candidate.target.branch, updatedAt: record.updatedAt };
+    return record;
+  };
+  const withLocalBranchMappings = (repo: TrackedRepo, record: AccountProject) => {
+    const bindings = { ...record.bindings };
+    for (const [branch, target] of Object.entries(repo.branchTargets || {})) if (sameTarget(target, record.target) && !Object.hasOwn(bindings, branch)) bindings[branch] = { branch: target.branch, updatedAt: record.updatedAt };
+    return { ...record, bindings };
+  };
+  const firstTarget = async (repo: TrackedRepo, token: string, kind: AccountProject['kind'], name: string, explicit?: TargetIdentity): Promise<{ skipped: boolean; name: string; message: string }> => {
+    if (token) operationTokens.current.add(token);
+    await flushCloudRemovals(repo, token); await flushCloudPending(repo, token);
+    repo = reposRef.current.find(project => project.id === repo.id) || repo;
+    const source = sourceOf(repo), manifest = sourceManifest(repo);
+    const found = await accountRegistry.candidates(source, token);
+    const pending = found.recorded.find(entry => entry.state === 'reserved');
+    if (pending && !pending.target.id) {
+      try { await githubClient.repository(pending.target.owner, pending.target.repo, token); }
+      catch (error) {
+        if (error instanceof TargetRepositoryError && error.health.status === 'unavailable' && pending.kind === kind) {
+          patchRepo(repo.id, { creationReservation: pending, accountState: 'pending' });
+          return { skipped: false, name: pending.target.repo, message: '继续账号中尚未完成的首次任务，目标名称保持固定' };
+        }
+        throw error;
+      }
+    }
+    const local = importCandidates(reposRef.current, source);
+    let entry = found.recorded.find(item => item.state === 'active');
+    if (!entry) entry = local.map(candidate => knownAccountRecord(candidate, source)).find(Boolean);
+    if (entry) {
+      const choice = await automaticAccountChoice(entry, source, token, repo.latestCommitSha);
+      const next = await applyAccountChoice(repo, choice, token);
+      if (choice.comparison.targetHealth) throw new Error(choice.comparison.targetHealth.message);
+      if (!found.recorded.length) await publishAccountRecord(next, entry, token);
+      return { skipped: true, name: choice.comparison.target!.repo, message: `已有同源目标 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo}，已固定绑定；跳过首次上传／分叉，请使用更新或同步。` };
+    }
+    if (repo.uploadTarget?.id && !repo.creationReservation && !found.recorded.length && !found.legacy.length) {
+      await githubClient.repository(repo.uploadTarget.owner, repo.uploadTarget.repo, token, repo.uploadTarget.id);
+      await publishAccountRecord(repo, withLocalBranchMappings(repo, { ...accountRecord(repo, repo.uploadTarget, repo.forkScope === 'full' ? 'full' : repo.uploadTarget.kind || 'upload', source.branch, repo.uploadTarget.branch), createdByApp: false }), token);
+      return { skipped: true, name: repo.uploadTarget.repo, message: '已有固定目标，本次跳过首次上传，请使用更新或同步。' };
+    }
+    if (local.length || found.recorded.length || found.legacy.length) {
+      const choice = await chooseImportBase(manifest, token, [...found.recorded, ...found.legacy].map(item => candidateFromAccount(item, source, token)));
+      if (typeof choice === 'string') return { skipped: true, name, message: '账号已有待确认的同源候选，未创建其他仓库；可重新比较后使用已有目标。' };
+      await applyAccountChoice(repo, choice, token, true);
+      return { skipped: true, name: choice.comparison.target!.repo, message: '已完成比较并固定已有目标，本次跳过首次上传／分叉；后续请使用更新或同步。' };
+    }
+    // A chosen name may already belong to an unrelated repository: compare before binding.
+    let occupied: TargetIdentity | undefined;
+    if (!explicit) {
+      try { const target = await githubClient.repository(found.login, name, token); occupied = target; }
+      catch (error) { if (!(error instanceof TargetRepositoryError) || error.health.status !== 'unavailable') throw error; }
+    }
+    if (occupied) {
+      const existing: AccountProject = { source, target: occupied, kind, state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' };
+      const choice = await chooseImportBase(manifest, token, [candidateFromAccount(existing, source, token)]);
+      if (typeof choice !== 'string') await applyAccountChoice(repo, choice, token, true);
+      return { skipped: true, name, message: '目标名称已有仓库，本次未写入；请比较并绑定后使用更新或同步。' };
+    }
+    try {
+      const reservation = await accountRegistry.reserve(source, name, kind, token, operationSignal(), explicit);
+      patchRepo(repo.id, { creationReservation: reservation, accountState: 'pending' });
+      return { skipped: false, name: reservation.target.repo, message: '已锁定账号首次目标' };
+    } catch (error) {
+      if (error instanceof ExistingSourceError) {
+        const choice = await automaticAccountChoice(error.existing, source, token, repo.latestCommitSha);
+        await applyAccountChoice(repo, choice, token);
+        return { skipped: true, name: error.existing.target.repo, message: '另一台设备已固定同源目标，本次未重复创建；请更新或同步。' };
+      }
+      throw error;
+    }
+  };
+  const updateAccountBinding = async (repo: TrackedRepo, token: string): Promise<{ repo: TrackedRepo; boundOnly: boolean }> => {
+    if (token) operationTokens.current.add(token);
+    if (!token) return { repo, boundOnly: false };
+    await flushCloudRemovals(repo, token); await flushCloudPending(repo, token);
+    repo = reposRef.current.find(project => project.id === repo.id) || repo;
+    const source = sourceOf(repo), found = await accountRegistry.candidates(source, token);
+    const entry = found.recorded.find(item => item.state === 'active');
+    if (entry) {
+      const choice = await automaticAccountChoice(entry, source, token, repo.latestCommitSha);
+      const next = await applyAccountChoice(repo, choice, token);
+      if (choice.comparison.targetHealth) throw new Error(choice.comparison.targetHealth.message);
+      if (!Object.hasOwn(entry.bindings, source.branch)) {
+        // Reserve a new branch mapping before any file write; concurrent devices
+        // cannot assign another source branch to an already reserved destination.
+        await accountRegistry.save({ ...entry, source, bindings: { [source.branch]: { branch: next.uploadTarget!.branch, updatedAt: new Date().toISOString() } } }, token);
+      }
+      return { repo: next, boundOnly: false };
+    }
+    if (repo.uploadTarget?.id && !repo.creationReservation) {
+      await githubClient.repository(repo.uploadTarget.owner, repo.uploadTarget.repo, token, repo.uploadTarget.id);
+      const receipt = repo.remoteSnapshot;
+      const record = accountRecord(repo, repo.uploadTarget, repo.forkScope === 'full' ? 'full' : repo.uploadTarget.kind || 'upload', source.branch, repo.uploadTarget.branch, receipt?.sourceSha, receipt?.commitSha);
+      record.createdByApp = !!receipt;
+      await publishAccountRecord(repo, withLocalBranchMappings(repo, record), token);
+      return { repo: reposRef.current.find(project => project.id === repo.id) || repo, boundOnly: false };
+    }
+    if (found.recorded.length || found.legacy.length) {
+      const choice = await chooseImportBase(sourceManifest(repo), token, [...found.recorded, ...found.legacy].map(item => candidateFromAccount(item, source, token)));
+      if (typeof choice !== 'string') return { repo: await applyAccountChoice(repo, choice, token, true), boundOnly: true };
+      throw new Error('已有同源目标尚未确认，未执行写入；请先比较并固定目标');
+    }
+    return { repo, boundOnly: false };
   };
 
   // Add new repository link: Directly pull project into local memory/storage
@@ -1235,7 +1497,7 @@ export default config;
         const existing = reposRef.current.filter(item => !item.origin && item.owner.toLowerCase() === parsed.owner.toLowerCase() && item.repo.toLowerCase() === parsed.repo.toLowerCase());
         if (existing.length) {
           const meta = await githubClient.repository(parsed.owner, parsed.repo, token);
-          if (existing.some(item => item.branch === meta.defaultBranch) && !importCandidates(reposRef.current, { ...parsed, url: items[i].url!, branch: meta.defaultBranch }).length) {
+          if (!token && existing.some(item => item.branch === meta.defaultBranch) && !importCandidates(reposRef.current, { ...parsed, url: items[i].url!, branch: meta.defaultBranch }).length) {
             items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${meta.defaultBranch} 已在项目列表中` }; setImportResults([...items]); continue;
           }
         }
@@ -1250,6 +1512,7 @@ export default config;
           const { files, ...record } = newRepo as TrackedRepo & { files?: CachedFile[] };
           await localCache.saveProjectFiles(record.id, data.files, data.latestCommitSha);
           operationSignal().throwIfAborted(); persistRepos([record, ...reposRef.current.filter(item => item.id !== record.id)]);
+          await finishAccountBinding(record, choice, token);
           if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
             try { (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${record.repo}`, JSON.stringify({ repo: record.repo, sha: record.latestCommitSha, files: data.files })); }
             catch { /* Durable browser cache is already saved; native export can be retried separately. */ }
@@ -1257,7 +1520,7 @@ export default config;
           items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${typeof choice !== 'string' ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
         }
         await transferCache.clear(data.latestCommitSha);
-      } catch (error) { items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
+      } catch (error) { logOperation('批量导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, `${items[i].url || ''}：${(error as Error).message}`, '拉取与账号识别', error); items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
       setImportResults([...items]);
     }
     for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'error', message: '操作已取消，尚未导入，可重试' };
@@ -1274,7 +1537,7 @@ export default config;
       operationSignal().throwIfAborted();
       if (!data) return;
       const newRepo = importWithBase({
-        id: `${data.owner}-${data.repo}-${Date.now()}`, url: typeof choice === 'string' ? repoUrl.trim() : choice.candidate.source.url, owner: data.owner, repo: data.repo, branch: data.branch,
+        id: `${data.owner}-${data.repo}-${Date.now()}`, url: typeof choice === 'string' ? repoUrl.trim() : choice.candidate.source.url, owner: data.owner, repo: data.repo, repositoryId: data.repositoryId, branch: data.branch,
         token: tokenInput.trim() || undefined, remark: remarkInput.trim() || '未备注项目', description: descriptionInput.trim() || data.repoMeta.description,
         tags: tagsInput.split(',').map(t => t.trim()).filter(Boolean), checkInterval: 0, lastCheckedAt: new Date().toISOString(),
         latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate,
@@ -1282,13 +1545,14 @@ export default config;
       }, choice);
       await localCache.saveProjectFiles(newRepo.id, data.files, data.latestCommitSha);
       operationSignal().throwIfAborted(); persistRepos([newRepo, ...reposRef.current.filter(item => item.id !== newRepo.id)]);
+      await finishAccountBinding(newRepo, choice, tokenInput.trim() || globalToken);
       if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
         (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${newRepo.repo}`, JSON.stringify({ repo: newRepo.repo, sha: newRepo.latestCommitSha, files: data.files }));
       }
       setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
       await transferCache.clear(data.latestCommitSha);
       alert(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
-    } catch (error) { setErrorMsg((error as Error).message || '操作已取消'); }
+    } catch (error) { logOperation('导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, (error as Error).message, '拉取与账号识别', error); setErrorMsg((error as Error).message || '操作已取消'); }
     finally { setIsLoading(false); importLock.current = false; }
   };
 
@@ -1311,20 +1575,35 @@ export default config;
     if (!token) return;
     startOperation(); setIsUploadingToPrivate(true);
     try {
-      const existing = await boundTarget(singleUploadTargetRepo, token);
-      const target = existing || await githubClient.ensurePrivateRepo(token, singleUploadRepoName.trim(), singleUploadDescription.trim(), singleUploadRemark.trim());
-      const branch = existing?.branch || sourceOf(singleUploadTargetRepo).branch;
-      assertDestinationBranch(singleUploadTargetRepo, { ...target, branch });
-      const files = await versionFiles(singleUploadTargetRepo);
-      const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${singleUploadTargetRepo.repo} @ ${singleUploadTargetRepo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), sourceOf(singleUploadTargetRepo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
-      await recordUpload(singleUploadTargetRepo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
+      let repo = singleUploadTargetRepo;
+      let name = singleUploadRepoName.trim();
+      if (repo.uploadTarget && !repo.creationReservation) {
+        const prepared = await updateAccountBinding(repo, token); repo = prepared.repo;
+        if (prepared.boundOnly) { alert('已比较并绑定目标，请再次使用更新。'); return; }
+      } else {
+        const guard = await firstTarget(repo, token, 'upload', name);
+        if (guard.skipped) { logOperation('首次上传', 'skipped', repo, guard.message); setIsSingleUploadModalOpen(false); alert(guard.message); return; }
+        name = guard.name;
+      }
+      const existing = repo.creationReservation ? undefined : await boundTarget(repo, token);
+      const target = existing || await githubClient.ensurePrivateRepo(token, name, singleUploadDescription.trim(), singleUploadRemark.trim());
+      if (!existing && 'alreadyExisted' in target && target.alreadyExisted) throw new Error('首次任务执行前目标仓库已出现，本次未写入；请重试并比较已有仓库。');
+      const branch = existing?.branch || sourceOf(repo).branch;
+      assertDestinationBranch(repo, { ...target, branch });
+      const files = await versionFiles(repo);
+      const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
+      await recordUpload(repo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
+      logOperation('上传', 'success', singleUploadTargetRepo, '项目与账号记录均已验证保存');
       setIsSingleUploadModalOpen(false);
       alert(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
-    } catch (error) { alert('上传未完成：' + (error as Error).message); }
+    } catch (error) { logOperation('上传', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '验证上传', error); alert('上传未完成：' + (error as Error).message); }
     finally { setIsUploadingToPrivate(false); setIsLoading(false); }
   };
 
   const createProjectCopy = async (sourceProject: TrackedRepo, scope: 'current' | 'full', name: string, token: string, purge: boolean) => {
+    const guard = await firstTarget(sourceProject, token, scope, name.trim() || sourceOf(sourceProject).repo);
+    if (guard.skipped) return { message: guard.message, skipped: true };
+    name = guard.name;
     const origin = sourceOf(sourceProject);
       let target: { id?: number; owner: string; repo: string; htmlUrl: string; defaultBranch: string; branches?: string[] };
       let manifest: Awaited<ReturnType<typeof githubClient.inspectRepo>>;
@@ -1336,12 +1615,13 @@ export default config;
         remoteSha = manifest.latestCommitSha;
       } else {
         target = await githubClient.ensurePrivateRepo(token, name.trim(), sourceProject.description, sourceProject.remark);
+        if ('alreadyExisted' in target && target.alreadyExisted) throw new Error('首次任务执行前目标仓库已出现，请比较并绑定后更新。');
         target.defaultBranch = origin.branch;
         assertDestinationBranch(sourceProject, { ...target, branch: origin.branch });
         copiedFiles = await versionFiles(sourceProject);
         const uploaded = await githubClient.push(target.owner, target.repo, target.defaultBranch, token, copiedFiles, `Save source branch ${origin.branch} @ ${sourceProject.latestCommitSha}`, sourceProject.description, sourceProject.remark, origin.url, { rebaseOnConflict: true, expectedRepoId: target.id });
         remoteSha = uploaded.commitSha;
-        manifest = { owner: origin.owner, repo: origin.repo, branch: origin.branch, latestCommitSha: sourceProject.latestCommitSha, commitMessage: sourceProject.commitMessage, commitAuthor: sourceProject.commitAuthor, commitDate: sourceProject.commitDate, tree: sourceProject.tree, repoMeta: { description: sourceProject.repoMeta.description || '', stars: sourceProject.repoMeta.stars || 0, forks: sourceProject.repoMeta.forks || 0, language: sourceProject.repoMeta.language || 'Unknown', updatedAt: sourceProject.repoMeta.updatedAt, htmlUrl: sourceProject.repoMeta.htmlUrl } };
+        manifest = { owner: origin.owner, repo: origin.repo, repositoryId: origin.repositoryId, branch: origin.branch, latestCommitSha: sourceProject.latestCommitSha, commitMessage: sourceProject.commitMessage, commitAuthor: sourceProject.commitAuthor, commitDate: sourceProject.commitDate, tree: sourceProject.tree, repoMeta: { description: sourceProject.repoMeta.description || '', stars: sourceProject.repoMeta.stars || 0, forks: sourceProject.repoMeta.forks || 0, language: sourceProject.repoMeta.language || 'Unknown', updatedAt: sourceProject.repoMeta.updatedAt, htmlUrl: sourceProject.repoMeta.htmlUrl } };
       }
       const originForCopy = { ...origin, branch: manifest.branch };
       const id = `managed-${target.id || `${target.owner}/${target.repo}`}-${manifest.branch}`;
@@ -1355,9 +1635,11 @@ export default config;
       await localCache.saveSyncReceipt(id, manifest.latestCommitSha, snapshot);
       if (copiedFiles && !purge) await localCache.saveProjectFiles(id, copiedFiles, manifest.latestCommitSha);
       persistRepos([managed, ...reposRef.current.filter(item => item.id !== id)]);
-      if (scope === 'full') patchRepo(sourceProject.id, { forkTarget: managed.forkTarget });
+      patchRepo(sourceProject.id, { creationReservation: undefined, ...(scope === 'full' ? { forkTarget: managed.forkTarget } : {}) });
+      patchRepo(id, { creationReservation: undefined, cloudPending: [], cloudRemovals: [], accountState: scope === 'full' ? 'forked' : 'synced' });
+      await publishAccountRecord(managed, accountRecord(managed, managed.uploadTarget!, scope, originForCopy.branch, target.defaultBranch, manifest.latestCommitSha, remoteSha), token);
       if (copiedFiles && purge) await recordUpload(sourceProject, { verified: true, repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, htmlUrl: snapshot.htmlUrl }, true, undefined, {}, token, false);
-    return scope === 'full' ? `完整分叉已验证并加入我的项目，共 ${target.branches?.length || 0} 个分支。` : `当前分支 ${origin.branch} 已保存为独立副本并加入我的项目，后续更新继续使用固定名称。`;
+    return { message: scope === 'full' ? `完整分叉已验证并加入我的项目，共 ${target.branches?.length || 0} 个分支。` : `当前分支 ${origin.branch} 已保存为独立副本并加入我的项目，后续更新继续使用固定名称。` };
   };
 
   const handleExecuteCreateFork = async (e: React.FormEvent) => {
@@ -1367,16 +1649,35 @@ export default config;
     startOperation(); setIsForking(true);
     try {
       const message = await createProjectCopy(singleUploadTargetRepo, forkScope, forkRepoName, token, singleUploadPurgeCache);
-      setIsSingleUploadModalOpen(false); setCurrentView('projects'); alert(message);
-    } catch (error) { alert('创建副本未完成：' + (error as Error).message); }
+      setIsSingleUploadModalOpen(false); setCurrentView('projects'); logOperation('分叉', message.skipped ? 'skipped' : 'success', singleUploadTargetRepo, message.message); alert(message.message);
+    } catch (error) { logOperation('分叉', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '创建或验证目标', error); alert('创建副本未完成：' + (error as Error).message); }
     finally { setIsForking(false); setIsLoading(false); }
+  };
+
+  const rememberFullBranch = (repo: TrackedRepo, result: { branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string }) => {
+    if (!result.success || !result.sourceSha || !result.commitSha) { logOperation('完整分叉分支同步', operationSignal().aborted ? 'cancelled' : 'error', repo, `${result.branch}：${result.error || '未完成'}`, '同步分支'); return; }
+    const target = repo.forkTarget || repo.uploadTarget;
+    if (target) queueAccountRecord(repo, accountRecord(repo, target, 'full', result.branch, result.branch, result.sourceSha, result.commitSha));
+    logOperation('完整分叉分支同步', 'success', repo, `${result.branch}：提交已验证保存`, '同步分支');
+  };
+
+  const recordFullBranches = async (repo: TrackedRepo, token: string, results: Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>) => {
+    const target = repo.forkTarget || repo.uploadTarget;
+    if (!target) return;
+    const record = accountRecord(repo, target, 'full', sourceOf(repo).branch, sourceOf(repo).branch);
+    record.bindings = Object.create(null);
+    for (const item of results) {
+      if (item.success && item.sourceSha && item.commitSha) record.bindings[item.branch] = { branch: item.branch, sourceSha: item.sourceSha, commitSha: item.commitSha, updatedAt: record.updatedAt };
+      if (!item.success) logOperation('完整分叉分支同步', 'error', repo, `${item.branch}：${item.error}`, '合并上游');
+    }
+    if (Object.keys(record.bindings).length) await publishAccountRecord(repo, record, token);
   };
 
   const syncFullProject = async (repo: TrackedRepo, token: string, synced?: Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>) => {
     const target = repo.forkTarget;
     if (!target || !repo.uploadTarget) throw new Error('完整分叉尚未绑定目标仓库');
     await boundTarget(repo, token);
-    const results = synced || await githubClient.syncAllForkBranches(target.owner, target.repo, token);
+    const results = synced || await githubClient.syncAllForkBranches(target.owner, target.repo, token, result => rememberFullBranch(repo, result));
     const source = sourceOf(repo);
     const current = results.find(result => result.branch === source.branch && result.success);
     if (current?.sourceSha && current.commitSha) {
@@ -1391,8 +1692,9 @@ export default config;
       }
       const updated = { ...repo, ...manifest, owner: repo.owner, repo: repo.repo, url: repo.url, repoMeta: { ...manifest.repoMeta, htmlUrl: repo.repoMeta.htmlUrl }, remoteSnapshot: undefined, backups: changed ? [old, ...repo.backups] : repo.backups, isCachePurged: repo.uploadTarget.purgeAfterUpload, cachedFilesCount: count, lastSyncedAt: new Date().toISOString(), hasUpdate: false };
       patchRepo(repo.id, updated);
-      await recordUpload(updated, { verified: true, repoId: repo.uploadTarget.id, owner: target.owner, repo: target.repo, branch: source.branch, commitSha: current.commitSha, htmlUrl: `${target.htmlUrl}/tree/${source.branch}` }, repo.uploadTarget.purgeAfterUpload);
+      await recordUpload(updated, { verified: true, repoId: repo.uploadTarget.id, owner: target.owner, repo: target.repo, branch: source.branch, commitSha: current.commitSha, htmlUrl: `${target.htmlUrl}/tree/${source.branch}` }, repo.uploadTarget.purgeAfterUpload, undefined, {}, token);
     }
+    await recordFullBranches(repo, token, results);
     const failed = results.filter(result => !result.success);
     const message = `全部分支同步：${results.length - failed.length}/${results.length} 成功。${failed.map(result => `\n${result.branch}：${result.error}`).join('')}`;
     if (failed.length) throw new Error(message);
@@ -1401,14 +1703,18 @@ export default config;
 
   const syncProjectUpstream = async (repo: TrackedRepo, token: string, syncedTargets?: Map<string, Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>>): Promise<string> => {
     if (repo.forkScope === 'current' || repo.detachedTargets?.length && !repo.forkTarget && repo.uploadTarget) return updateProject(repo, token);
+    const prepared = await updateAccountBinding(repo, token); repo = prepared.repo;
+    if (prepared.boundOnly) return '已比较并固定已有目标，请再次同步。';
+    if (repo.forkScope === 'current') return updateProject(repo, token);
     if (repo.detachedTargets?.length && !repo.forkTarget && !repo.forkScope) throw new Error('旧分叉绑定已解除，请先在“分叉与私有仓”中重新创建或关联分叉。');
     const target = repo.forkTarget || { owner: repo.owner, repo: repo.repo, branch: repo.branch };
     await githubClient.repository(target.owner, target.repo, token, 'id' in target ? target.id : undefined);
     if (repo.forkScope === 'full' && repo.origin || repo.forkTarget?.branches?.length) {
       const key = `${target.owner}/${target.repo}`.toLowerCase();
-      const results = syncedTargets?.get(key) || await githubClient.syncAllForkBranches(target.owner, target.repo, token);
+      const results = syncedTargets?.get(key) || await githubClient.syncAllForkBranches(target.owner, target.repo, token, result => rememberFullBranch(repo, result));
       syncedTargets?.set(key, results);
-      if (repo.forkScope === 'full' && repo.origin) return syncFullProject(repo, token, results);
+      if (repo.forkScope === 'full' && repo.uploadTarget) return syncFullProject(repo, token, results);
+      await recordFullBranches(repo, token, results);
       const failed = results.filter(item => !item.success);
       const message = `全部分支同步：${results.length - failed.length}/${results.length} 成功。${failed.map(item => `\n${item.branch}：${item.error}`).join('')}`;
       if (failed.length) throw new Error(message);
@@ -1421,8 +1727,8 @@ export default config;
     const token = repo.forkTarget?.token || repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
     if (!token) return;
     startOperation();
-    try { alert(await syncProjectUpstream(repo, token)); }
-    catch (error) { alert('同步上游未完成：' + (error as Error).message); }
+    try { const message = await syncProjectUpstream(repo, token); logOperation('同步', 'success', repo, message); alert(message); }
+    catch (error) { logOperation('同步', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '同步上游', error); alert('同步上游未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1439,24 +1745,35 @@ export default config;
     if (!token) return alert('请填写 GitHub Token');
     startOperation();
     try {
+      const prepared = await updateAccountBinding(activeRepo, token);
+      const project = prepared.repo;
+      if (prepared.boundOnly) { alert('已比较并固定目标，请再次更新。'); return; }
+      if (pushCopyMode && (project.uploadTarget || project.forkTarget)) throw new Error('该来源已固定目标，不能再次上传为新副本；请更新或同步已有目标。');
       const version = pushBackupTarget || viewingBackup || undefined;
-      const sourceBranch = version?.branch || sourceOf(activeRepo).branch;
+      const sourceBranch = version?.branch || sourceOf(project).branch;
       const requested = parseRepository(pushTargetRepo);
-      const target = !pushCopyMode && activeRepo.uploadTarget ? await boundTarget(activeRepo, token, sourceBranch) : await githubClient.repository(requested.owner, requested.repo, token);
+      const target = !pushCopyMode && project.uploadTarget ? await boundTarget(project, token, sourceBranch) : await githubClient.repository(requested.owner, requested.repo, token);
       if (!target) throw new Error('目标仓库未指定');
-      const destinationBranch = !pushCopyMode && activeRepo.uploadTarget ? targetForBranch(activeRepo, sourceBranch)!.branch : pushTargetBranch.trim() || sourceBranch;
-      assertDestinationBranch(activeRepo, { ...target, branch: destinationBranch }, sourceBranch);
-      const files = await versionFiles(activeRepo, version);
-      const result = await githubClient.push(target.owner, target.repo, destinationBranch, token, files, pushCommitMsg.trim() || `Sync ${activeRepo.repo} @ ${version?.commitSha || activeRepo.latestCommitSha}`, activeRepo.description, activeRepo.remark, sourceOf(activeRepo).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: target.id });
-      await recordUpload(activeRepo, result, purgePushCacheOption, version, {}, token, !pushCopyMode && (!!activeRepo.uploadTarget || !version));
+      if (!project.uploadTarget) {
+        const guard = await firstTarget(project, token, 'upload', requested.repo, target);
+        if (guard.skipped) { logOperation('指定仓库首次上传', 'skipped', project, guard.message); alert(guard.message); return; }
+      }
+      const destinationBranch = !pushCopyMode && project.uploadTarget ? targetForBranch(project, sourceBranch)!.branch : pushTargetBranch.trim() || sourceBranch;
+      assertDestinationBranch(project, { ...target, branch: destinationBranch }, sourceBranch);
+      const files = await versionFiles(project, version);
+      const result = await githubClient.push(target.owner, target.repo, destinationBranch, token, files, pushCommitMsg.trim() || `Sync ${project.repo} @ ${version?.commitSha || project.latestCommitSha}`, project.description, project.remark, sourceOf(project).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: target.id });
+      await recordUpload(project, result, purgePushCacheOption, version, {}, token, !pushCopyMode && (!!project.uploadTarget || !version));
+      logOperation('上传指定仓库', 'success', project, '提交及账号记录已验证');
       setIsPushModalOpen(false); setPushBackupTarget(null);
       alert(`已验证上传 ${files.length} 个文件。${purgePushCacheOption ? '对应版本源码已清理，快照已保留。' : '对应版本源码已保留。'}`);
-    } catch (error) { alert('上传未完成：' + (error as Error).message); }
+    } catch (error) { logOperation('上传指定仓库', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '上传指定分支', error); alert('上传未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
   const updateProject = async (repo: TrackedRepo, authToken = ''): Promise<string> => {
-      if (repo.forkScope === 'full' && repo.origin) {
+      const prepared = await updateAccountBinding(repo, authToken || repo.uploadTarget?.token || globalToken || repo.token || ''); repo = prepared.repo;
+      if (prepared.boundOnly) return '已比较并固定已有目标，本次未写入项目；请再次更新或同步。';
+      if (repo.forkScope === 'full' && repo.forkTarget && repo.uploadTarget) {
         const auth = repo.uploadTarget?.token || authToken || globalToken || repo.token;
         if (!auth) throw new Error('请填写 GitHub Token');
         return syncFullProject(repo, auth);
@@ -1471,7 +1788,7 @@ export default config;
           const target = repo.uploadTarget;
           const files = await versionFiles(repo);
           const result = await pushSnapshot(repo, files, target.token || globalToken || token, `Sync ${repo.repo} @ ${repo.latestCommitSha}`);
-          await recordUpload(repo, result, target.purgeAfterUpload);
+          await recordUpload(repo, result, target.purgeAfterUpload, undefined, {}, target.token || authToken || globalToken || token);
           return '已完成上次待上传的版本，并验证成功。';
         }
         return '当前已是最新版本';
@@ -1488,7 +1805,7 @@ export default config;
       if (repo.uploadTarget) {
         const target = repo.uploadTarget;
         const result = await pushSnapshot(updated, data.files, target.token || globalToken || token, `Sync ${repo.repo} @ ${data.latestCommitSha}`);
-        await recordUpload(updated, result, target.purgeAfterUpload);
+        await recordUpload(updated, result, target.purgeAfterUpload, undefined, {}, target.token || authToken || globalToken || token);
         message = '新版本已更新并验证上传；旧版本记录已保留。';
       }
       if (activeRepoId === repo.id) { setFileContent(null); setSelectedFilePath(null); setViewingBackup(null); }
@@ -1496,8 +1813,8 @@ export default config;
   };
   const handleOneClickUpdate = async (repo: TrackedRepo) => {
     startOperation(); setErrorMsg('');
-    try { alert(await updateProject(repo)); }
-    catch (error) { alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
+    try { const message = await updateProject(repo); logOperation('更新', 'success', repo, message); alert(message); }
+    catch (error) { logOperation('更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取或上传', error); alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1533,11 +1850,12 @@ export default config;
       const repo = reposRef.current.find(project => project.id === item.id);
       if (!repo) continue;
       const source = sourceOf(repo);
-      const key = `${source.owner}/${source.repo}`.toLowerCase() + (batchForkScope === 'current' ? `:${source.branch}` : '');
+      const key = `${source.owner}/${source.repo}`.toLowerCase();
       seen.add(key); targetNames.set(item.name.trim().toLowerCase(), key);
     }
     try {
-      await runProjectBatch(items, { signal, onChange: setBatchTaskItems, run: async item => {
+      const batchId = crypto.randomUUID();
+      await runProjectBatch(items, { signal, onChange: setBatchTaskItems, onResult: (item, error) => logOperation(`批量${batchTask === 'fork' ? '分叉' : batchTask === 'sync' ? '同步' : '更新'}`, item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === item.id), item.message || '', '批量任务', error, batchId), run: async item => {
         const repo = reposRef.current.find(project => project.id === item.id);
         if (!repo) throw new Error('项目已移除，未执行');
         const token = batchTaskToken.trim() || (batchTask === 'sync' ? repo.forkTarget?.token : undefined) || repo.uploadTarget?.token || globalToken || repo.token || '';
@@ -1545,7 +1863,7 @@ export default config;
         if (batchTask === 'update') return { message: await updateProject(repo, token) };
         const source = sourceOf(repo);
         if (batchTask === 'fork') {
-          const sourceKey = `${source.owner}/${source.repo}`.toLowerCase() + (batchForkScope === 'current' ? `:${source.branch}` : '');
+          const sourceKey = `${source.owner}/${source.repo}`.toLowerCase();
           if (seen.has(sourceKey)) {
             if (batchForkScope === 'full') {
               const managed = reposRef.current.find(project => project.forkScope === 'full' && project.origin?.owner.toLowerCase() === source.owner.toLowerCase() && project.origin?.repo.toLowerCase() === source.repo.toLowerCase());
@@ -1559,7 +1877,7 @@ export default config;
           if (occupied && occupied !== sourceKey) throw new Error('本批其他项目使用了相同目标名称，请修改名称后重试');
           targetNames.set(name.toLowerCase(), sourceKey);
           const message = await createProjectCopy(repo, batchForkScope, name, token, batchForkPurge);
-          seen.add(sourceKey); return { message };
+          if (!message.skipped) seen.add(sourceKey); return message;
         }
         return { message: await syncProjectUpstream(repo, token, syncedTargets) };
       } });
@@ -1634,7 +1952,7 @@ export default config;
     const selectedRepos = repos.filter(r => selectedProjectIds.includes(r.id));
     const initialList: BatchUploadItemStatus[] = selectedRepos.map(r => ({
       id: r.id,
-      name: r.repo,
+      name: r.uploadTarget?.repo || sourceOf(r).repo,
       repo: r.repo,
       status: 'pending'
     }));
@@ -1643,30 +1961,43 @@ export default config;
   };
 
   // Execute Batch Upload to User's GitHub Private Repositories
-  const handleStartBatchUpload = async () => {
+  const handleStartBatchUpload = async (retry = false) => {
+    if (batchUploadLock.current) return;
     const token = globalToken || prompt('请输入 GitHub Token：')?.trim();
     if (!token) return;
     const purge = confirm('上传验证成功后是否清理本地源码？\n确定：清理源码并保留快照；取消：保留源码。');
-    beginGithubOperation(); setIsBatchUploading(true);
+    const queue = batchUploadStatusList.map(item => retry && ['error', 'cancelled'].includes(item.status) ? { ...item, status: 'pending' as const, error: undefined } : { ...item });
+    batchUploadLock.current = true; beginGithubOperation(); setIsBatchUploading(true);
+    const signal = operationSignal(), batchId = crypto.randomUUID();
+    const status = (id: string, value: Partial<BatchUploadItemStatus>, error?: unknown) => {
+      const item = queue.find(item => item.id === id)!; Object.assign(item, value);
+      setBatchUploadStatusList(queue.map(item => ({ ...item })));
+      if (['success', 'error', 'skipped', 'cancelled'].includes(item.status)) logOperation('批量上传', item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === id), item.error || '首次上传与账号记录已验证完成', '首次上传', error, batchId);
+    };
     try {
-      for (const repo of reposRef.current.filter(r => selectedProjectIds.includes(r.id))) {
-        if (operationSignal().aborted) break;
-        const status = (value: Partial<BatchUploadItemStatus>) => setBatchUploadStatusList(prev => prev.map(item => item.id === repo.id ? { ...item, ...value } : item));
+      for (const item of queue) {
+        if (item.status !== 'pending' || signal.aborted) continue;
+        const repo = reposRef.current.find(repo => repo.id === item.id);
         try {
-          status({ status: 'creating' });
-          const auth = repo.uploadTarget?.token || token;
-          const existing = await boundTarget(repo, auth);
-          const target = existing || await githubClient.ensurePrivateRepo(auth, repo.repo, repo.description, repo.remark);
-          const branch = existing?.branch || sourceOf(repo).branch;
+          if (!repo) throw new Error('项目已移除');
+          status(repo.id, { status: 'creating', error: undefined });
+          const auth = token;
+          const guard = await firstTarget(repo, auth, 'upload', item.name);
+          if (guard.skipped) { status(repo.id, { status: 'skipped', error: guard.message }); continue; }
+          signal.throwIfAborted();
+          const target = await githubClient.ensurePrivateRepo(auth, guard.name, repo.description, repo.remark);
+          if (target.alreadyExisted) throw new Error('首次任务执行前目标仓库已出现，请比较并绑定后更新。');
+          const branch = sourceOf(repo).branch;
           assertDestinationBranch(repo, { ...target, branch });
-          status({ status: 'uploading' });
+          status(repo.id, { status: 'uploading' });
           const files = await versionFiles(repo);
           const result = await githubClient.push(target.owner, target.repo, branch, auth, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.description, repo.remark, sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
           await recordUpload(repo, result, purge, undefined, { privateRepoUrl: target.htmlUrl }, auth);
-          status({ status: 'success', htmlUrl: target.htmlUrl });
-        } catch (error) { status({ status: 'error', error: (error as Error).message }); }
+          status(repo.id, { status: 'success', htmlUrl: target.htmlUrl });
+        } catch (error) { status(item.id, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message }, error); }
       }
-    } finally { setIsBatchUploading(false); }
+      for (const item of queue) if (item.status === 'pending') status(item.id, { status: 'cancelled', error: '已取消，尚未执行，可重试' });
+    } finally { batchUploadLock.current = false; setIsBatchUploading(false); }
   };
 
   // Batch Purge Local Cache for selected projects
@@ -1881,7 +2212,7 @@ export default config;
       }
       patchRepo(activeRepo.id, { backups: [...activeRepo.backups, ...loaded] });
       setHistoryPage(page => page + 1); setHistoryHasMore(entries.length === 30);
-    } catch (error) { alert('获取历史失败：' + (error as Error).message); }
+    } catch (error) { logOperation('获取历史', 'error', activeRepo, (error as Error).message, '读取历史', error); alert('获取历史失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
   const handleDownloadVersion = async (version: BackupVersion) => {
@@ -1893,7 +2224,7 @@ export default config;
       for (const file of files) zip.file(file.path, file.content, { base64: file.isBase64 });
       const blob = await zip.generateAsync({ type: 'blob' });
       const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `${activeRepo.repo}-${version.commitSha.slice(0, 12)}.zip`; link.click(); URL.revokeObjectURL(url);
-    } catch (error) { alert('版本下载失败：' + (error as Error).message); }
+    } catch (error) { logOperation('版本下载', 'error', activeRepo, (error as Error).message, '下载历史文件', error); alert('版本下载失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
   const handleRestoreVersion = async (version: BackupVersion) => {
@@ -1902,13 +2233,15 @@ export default config;
     if (!token) return alert('请填写 GitHub Token');
     startOperation();
     try {
-      const files = await versionFiles(activeRepo, version);
-      const branch = version.branch || sourceOf(activeRepo).branch;
-      const result = await pushSnapshot(activeRepo, files, token, `Restore historical version ${version.remoteSnapshot?.commitSha || version.commitSha}`, branch);
-      const restored = { ...activeRepo, latestCommitSha: version.commitSha, tree: version.tree, commitMessage: version.commitMessage, commitAuthor: version.commitAuthor, commitDate: version.commitDate };
-      await recordUpload(restored, result, false, branch === sourceOf(activeRepo).branch ? undefined : version, {}, token);
+      const prepared = await updateAccountBinding(activeRepo, token); const project = prepared.repo;
+      if (prepared.boundOnly) { alert('目标已比较并绑定，请再次选择恢复版本。'); return; }
+      const files = await versionFiles(project, version);
+      const branch = version.branch || sourceOf(project).branch;
+      const result = await pushSnapshot(project, files, token, `Restore historical version ${version.remoteSnapshot?.commitSha || version.commitSha}`, branch);
+      const restored = { ...project, latestCommitSha: version.commitSha, tree: version.tree, commitMessage: version.commitMessage, commitAuthor: version.commitAuthor, commitDate: version.commitDate };
+      await recordUpload(restored, result, false, branch === sourceOf(project).branch ? undefined : version, {}, token);
       alert(`历史版本已恢复为目标分支 ${result.branch} 的新提交，原有历史全部保留。`);
-    } catch (error) { alert('恢复未完成，本地文件保留：' + (error as Error).message); }
+    } catch (error) { logOperation('恢复版本', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '恢复目标分支', error); alert('恢复未完成，本地文件保留：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -2292,6 +2625,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
             <span>新建链接/拉取项目</span>
           </button>
 
+          <button type="button" onClick={() => setIsLogOpen(true)} className="px-3 py-2 bg-white border border-[#DFD8CE] text-[#554F45] rounded-xl text-xs">操作日志</button>
           <button
             onClick={() => setIsSettingsModalOpen(true)}
             className="p-2 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#554F45] rounded-xl border border-[#DFD8CE] shadow-xs transition shrink-0"
@@ -2302,6 +2636,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         </div>
       </header>
 
+      {logStorageError && <div role="alert" className="px-4 py-2 bg-[#C7A39B]/15 text-[#8C5D54] text-xs flex flex-wrap gap-2"><p>{logStorageError}</p><button type="button" onClick={() => setIsLogOpen(true)} className="underline">查看并导出日志</button></div>}
       {/* Global Connection Test Result Banner */}
       {testStatus === 'success' && (
         <div className="bg-[#8E9F8B]/20 border-b border-[#8E9F8B]/30 px-4 md:px-8 py-2 flex flex-row items-center justify-between text-xs text-[#2B3B28] whitespace-nowrap">
@@ -2774,6 +3109,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           )}
 
                           {/* Tags & meta line */}
+                          {(repo.accountState || repo.uploadTarget || repo.forkTarget) && <p className="text-xs text-[#5D6F5A] break-words">{repo.cloudPending?.length || repo.creationReservation || repo.accountState === 'pending' ? '账号记录待完成' : repo.forkScope === 'full' || repo.forkTarget ? '已分叉' : repo.remoteSnapshot?.sourceSha === repo.latestCommitSha ? '已同步' : '已绑定 · 待更新'} · 固定目标 {(repo.uploadTarget || repo.forkTarget || repo.creationReservation?.target)?.owner}/{(repo.uploadTarget || repo.forkTarget || repo.creationReservation?.target)?.repo}</p>}
                           {targetWarning(repo)}
                           <div className="flex flex-row items-center gap-2 flex-wrap">
                             {repo.tags.map(t => (
@@ -3814,6 +4150,24 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         </div>
       )}
 
+      {isLogOpen && <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-[70] flex items-center justify-center p-4">
+        <div role="dialog" aria-modal="true" aria-label="操作日志" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-5 shadow-xl flex flex-col gap-3 max-h-[90dvh] overflow-y-auto">
+          <div className="flex flex-wrap justify-between items-center gap-2"><h3 className="text-base font-bold font-serif text-[#2B2723]">操作日志</h3><button type="button" onClick={() => setIsLogOpen(false)} className="px-3 py-2 bg-[#EFECE6] rounded-xl text-xs">关闭日志</button></div>
+          <p className="text-xs text-[#7A7367]">本设备保存最近 1000 条记录，包含失败原因。导出内容会隐藏已知凭证；日志不会写入项目仓库。</p>
+          {logStorageError && <p role="alert" className="text-xs text-[#8C5D54]">{logStorageError}</p>}
+          <label className="text-xs">显示记录<select aria-label="日志筛选" value={logFilter} onChange={event => setLogFilter(event.target.value)} className="ml-2 border border-[#DFD8CE] rounded-lg p-2"><option value="all">全部</option><option value="failed">失败与未完成</option></select></label>
+          <div className="batch-results">{operationLogs.filter(entry => logFilter === 'all' || ['error','partial','cancelled'].includes(entry.status)).map(entry => <div key={entry.id} className="batch-result text-xs">
+            <p className="text-[#554F45]">{new Date(entry.time).toLocaleString()} · {entry.action} · {({success:'成功',error:'失败',skipped:'跳过',cancelled:'取消',partial:'部分完成'})[entry.status]}</p>
+            <p className="text-[#7A7367]">{entry.project}{entry.branch ? ` · ${entry.branch}` : ''}{entry.target ? ` → ${entry.target}` : ''}{entry.stage ? ` · ${entry.stage}` : ''}{entry.httpStatus ? ` · HTTP ${entry.httpStatus}` : ''}</p>
+            <p className="whitespace-pre-wrap break-words text-[#8C5D54]">{entry.message}</p>
+          </div>)}{!operationLogs.length && <p className="text-xs text-[#7A7367]">暂无操作记录</p>}</div>
+          <div className="flex flex-wrap justify-end gap-2"><button type="button" onClick={() => {
+            const url = URL.createObjectURL(new Blob([JSON.stringify(operationLogs, null, 2)], {type:'application/json'}));
+            const link = document.createElement('a'); link.href = url; link.download = 'gitvault-operation-logs.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+          }} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl text-xs">导出日志</button><button type="button" onClick={() => { if (confirm('清空本设备的操作日志？')) { clearOperationLogs(); setLogStorageError(''); } }} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-xs">清空日志</button></div>
+        </div>
+      </div>}
+
       {batchTask && (
         <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div role="dialog" aria-modal="true" aria-label={batchTask === 'fork' ? '批量分叉' : batchTask === 'update' ? '批量更新' : '批量分叉同步'} className="bg-[#FFFFFF] border border-[#E2DBD0] rounded-3xl max-w-xl w-full p-5 shadow-xl flex flex-col gap-4">
@@ -3870,20 +4224,23 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 <strong>选定项目:</strong> 共 <strong>{batchUploadStatusList.length}</strong> 个项目。
               </p>
               <p className="text-[#7A7367]">
-                已绑定项目沿用固定仓库名称和分支并保留历史；首次上传的项目会在您的 GitHub 账号 (@{userProfile?.login || '您的账号'}) 下创建私人仓库。
+                已有同源目标会跳过首次上传，请使用批量更新或同步；首次上传的项目会在您的 GitHub 账号 (@{userProfile?.login || '您的账号'}) 下创建私人仓库。
               </p>
             </div>
 
+            <p className="text-xs text-[#7A7367]">首次保存会在当前账号创建私人记录仓库 {REGISTRY_REPO}，仅记录来源、固定目标和分支映射。同账号的其他设备填写 Token 后可识别已有项目。取消不会回滚已完成的提交。</p>
             {/* Progress list */}
             <div className="max-h-60 overflow-y-auto flex flex-col gap-2 pr-1 border border-[#E5DFD7] rounded-xl p-3 bg-[#FAF8F5]">
               {batchUploadStatusList.map(item => (
-                <div key={item.id} className="flex flex-row items-center justify-between p-2.5 rounded-lg bg-[#FFFFFF] border border-[#EDE7DF] text-xs whitespace-nowrap">
+                <div key={item.id} className="flex flex-row flex-wrap items-center justify-between gap-1 p-2.5 rounded-lg bg-[#FFFFFF] border border-[#EDE7DF] text-xs">
                   <div className="flex flex-row items-center gap-2 truncate mr-2">
                     <FolderGit2 className="w-3.5 h-3.5 text-[#8E9F8B] shrink-0" />
                     <span className="font-mono font-semibold text-[#2B2723] truncate">{item.name}</span>
                   </div>
 
                   <div className="shrink-0 flex flex-row items-center gap-1.5 whitespace-nowrap">
+                    {item.status === 'skipped' && <span className="text-[#5D6F5A]">已跳过</span>}
+                    {item.status === 'cancelled' && <span className="text-[#7A7367]">已取消</span>}
                     {item.status === 'pending' && <span className="text-[#7A7367]">等待中</span>}
                     {item.status === 'creating' && (
                       <span className="text-[#8E9F8B] font-medium flex flex-row items-center gap-1">
@@ -3906,11 +4263,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       </span>
                     )}
                   </div>
+                  {item.error && <p className="basis-full w-full whitespace-pre-wrap break-words text-[#8C5D54] mt-2">{item.error}</p>}
                 </div>
               ))}
             </div>
 
-            <div className="flex flex-row items-center justify-end gap-3 pt-3 border-t border-[#EDE7DF] whitespace-nowrap">
+            <div className="flex flex-row flex-wrap items-center justify-end gap-3 pt-3 border-t border-[#EDE7DF]">
               <button
                 type="button"
                 disabled={isBatchUploading}
@@ -3919,10 +4277,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               >
                 {isBatchUploading ? '处理中...' : '关闭'}
               </button>
+              {isBatchUploading && <button type="button" onClick={cancelGithubOperation} className="px-3 py-2 border border-[#DFD8CE] text-[#8C5D54] rounded-xl text-xs">取消剩余上传</button>}
+              {!isBatchUploading && batchUploadStatusList.some(item => ['error', 'cancelled'].includes(item.status)) && <button type="button" onClick={() => handleStartBatchUpload(true)} className="px-3 py-2 border border-[#DFD8CE] text-[#5D6F5A] rounded-xl text-xs">重试未完成上传</button>}
               <button
                 type="button"
-                disabled={isBatchUploading}
-                onClick={handleStartBatchUpload}
+                disabled={isBatchUploading || !batchUploadStatusList.some(item => item.status === 'pending')}
+                onClick={() => handleStartBatchUpload()}
                 className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold shadow-xs whitespace-nowrap shrink-0 disabled:opacity-40"
               >
                 {isBatchUploading ? '正在批量处理...' : '开始批量上传'}
@@ -4244,10 +4604,11 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               />
             </div>
 
+            
             {/* Progress list */}
             <div className="max-h-56 overflow-y-auto flex flex-col gap-2 border border-[#E5DFD7] rounded-xl p-3 bg-[#FAF8F5]">
               {batchReleaseProgress.map(item => (
-                <div key={item.id} className="flex flex-row items-center justify-between p-2.5 rounded-lg bg-[#FFFFFF] border border-[#EDE7DF] text-xs whitespace-nowrap">
+                <div key={item.id} className="flex flex-row flex-wrap items-center justify-between gap-1 p-2.5 rounded-lg bg-[#FFFFFF] border border-[#EDE7DF] text-xs">
                   <span className="font-mono font-semibold text-[#2B2723] truncate mr-2">{item.tag}</span>
                   <div className="shrink-0">
                     {item.status === 'pending' && <span className="text-[#7A7367]">待发布</span>}
@@ -4267,11 +4628,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                       </span>
                     )}
                   </div>
+                  {item.error && <p className="basis-full w-full whitespace-pre-wrap break-words text-[#8C5D54] mt-2">{item.error}</p>}
                 </div>
               ))}
             </div>
 
-            <div className="flex flex-row items-center justify-end gap-3 pt-3 border-t border-[#EDE7DF] whitespace-nowrap">
+            <div className="flex flex-row flex-wrap items-center justify-end gap-3 pt-3 border-t border-[#EDE7DF]">
               <button
                 type="button"
                 disabled={isBatchPublishing}

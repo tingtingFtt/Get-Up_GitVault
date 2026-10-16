@@ -16,11 +16,26 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-error', 'batch-upload-cancelled'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
 const importMock = `<script>
+if (new URLSearchParams(location.search).has('audit-batch')) {
+  window.prompt = () => 'audit-token'; window.confirm = () => false;
+  const original = window.fetch;
+  window.fetch = async (input, init = {}) => {
+    if (!String(input).includes('api.github.com')) return original(input,init);
+    const url = new URL(String(input));
+    if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
+    if (url.pathname === '/user') return new Response(JSON.stringify({login:'audit-account'}),{status:200});
+    if (url.pathname === '/user/repos') {
+      if (new URLSearchParams(location.search).get('audit-batch')==='error') return new Response(JSON.stringify({message:'API rate limit exceeded '+ 'long-failure-reason-'.repeat(30)}),{status:403});
+      return new Promise((resolve,reject)=>init.signal.addEventListener('abort',()=>reject(init.signal.reason),{once:true}));
+    }
+    return new Response(JSON.stringify({message:'Not Found'}),{status:404});
+  };
+}
 if (new URLSearchParams(location.search).has('audit-import') || new URLSearchParams(location.search).has('audit-target')) {
   const fixture = ${JSON.stringify(fixture)};
   const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
@@ -88,14 +103,16 @@ function inspect(doc, width, scenario) {
 (async () => {
   for (const width of widths) for (const scenario of scenarios) {
     localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
+    localStorage.removeItem('gitvault_operation_logs_v1');
+    if (scenario === 'operation-logs-error') localStorage.setItem('gitvault_operation_logs_v1',JSON.stringify([{id:'audit-log',time:'2026-10-16T00:00:00Z',action:'批量分叉同步',status:'error',httpStatus:422,project:'owner/'+ 'long-project-'.repeat(20),branch:fixture.branch,target:'destination/'+ 'long-target-'.repeat(20),stage:'核对账号记录',message:'Update is not a fast forward；'+'很长的失败原因'.repeat(50)}]));
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       const doc = frame.contentDocument;
-      if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario)) {
+      if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
         await click(doc,'仓库已有项目 (1)');
-        if (scenario.startsWith('batch-')) { await click(doc,'全选所有'); await click(doc,{'batch-fork':'批量分叉','batch-update':'批量更新','batch-sync':'批量分叉同步','batch-upload':'批量上传至私人仓库'}[scenario]); }
+        if (scenario.startsWith('batch-')) { await click(doc,'全选所有'); await click(doc,{'batch-fork':'批量分叉','batch-update':'批量更新','batch-sync':'批量分叉同步','batch-upload':'批量上传至私人仓库'}[scenario] || '批量上传至私人仓库'); }
       } else if (['workbench','history','changelog','private','fork','push','folders','metadata','storage'].includes(scenario)) {
         await click(doc,'工作台');
         if (scenario==='history') await click(doc,'版本归档库 (1)');
@@ -131,6 +148,12 @@ function inspect(doc, width, scenario) {
         await click(doc,'设置');
         if(scenario==='backup') await click(doc,'数据备份与恢复');
         if(scenario==='apk') await click(doc,'APK 下载存储目录');
+      }
+      if (scenario.startsWith('operation-logs')) await click(doc,'操作日志');
+      if (scenario.startsWith('batch-upload-')) {
+        await click(doc,'开始批量上传');
+        if(scenario==='batch-upload-cancelled') await click(doc,'取消剩余上传');
+        if(scenario==='batch-upload-error') { for(let tries=0;tries<100&&!doc.body.textContent.includes('API rate limit exceeded');tries++) await pause(); if(!doc.body.textContent.includes('API rate limit exceeded')) throw new Error('Expected visible bulk failure'); }
       }
       inspect(doc,width,scenario);
     } catch(error) { failures.push({width,scenario,issue:error.message}); }
