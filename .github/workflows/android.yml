@@ -8,6 +8,8 @@ on:
       - 'android/**'
       - 'index.html'
       - 'package*.json'
+      - 'scripts/test-android-*.sh'
+      - 'scripts/create-update-manifests.mjs'
       - 'capacitor.config.ts'
       - 'vite.config.ts'
       - '.github/workflows/android.yml'

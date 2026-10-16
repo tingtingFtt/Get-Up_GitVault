@@ -93,9 +93,12 @@ export const uploadCache = {
     });
   },
   async save(repoId: number, sha: string): Promise<void> {
+    return uploadCache.saveBatch(repoId, [sha]);
+  },
+  async saveBatch(repoId: number, hashes: string[]): Promise<void> {
     await withDB(async db => {
       const tx = db.transaction(UPLOADS, 'readwrite'), done = completed(tx);
-      tx.objectStore(UPLOADS).put({ id: `${repoId}:${sha}`, repoId, sha, savedAt: Date.now() });
+      for (const sha of hashes) tx.objectStore(UPLOADS).put({ id: `${repoId}:${sha}`, repoId, sha, savedAt: Date.now() });
       await done;
     });
   },

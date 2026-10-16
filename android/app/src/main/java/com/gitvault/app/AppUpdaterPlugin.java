@@ -25,7 +25,7 @@ public class AppUpdaterPlugin extends Plugin {
     private PackageInfo installed()throws Exception{return getContext().getPackageManager().getPackageInfo(getContext().getPackageName(),Build.VERSION.SDK_INT>=28?PackageManager.GET_SIGNING_CERTIFICATES:PackageManager.GET_SIGNATURES);}
     private static long version(PackageInfo info){return Build.VERSION.SDK_INT>=28?info.getLongVersionCode():info.versionCode;}
     private static String hex(byte[] bytes){StringBuilder result=new StringBuilder();for(byte b:bytes)result.append(String.format(java.util.Locale.ROOT,"%02x",b&255));return result.toString();}
-    static boolean allowedDownload(String value){try{URI u=new URI(value);return "https".equals(u.getScheme())&&u.getUserInfo()==null&&"github.com".equals(u.getHost())&&u.getPath().startsWith("/tingtingFtt/Get-Up_GitVault/releases/download/")&&u.getPath().endsWith(".apk")&&u.getQuery()==null&&u.getFragment()==null;}catch(Exception ignored){return false;}}
+    static boolean allowedDownload(String value){try{URI u=new URI(value);return "https".equals(u.getScheme())&&u.getPort()==-1&&u.getUserInfo()==null&&"github.com".equals(u.getHost())&&u.getPath().startsWith("/tingtingFtt/Get-Up_GitVault/releases/download/")&&u.getPath().endsWith(".apk")&&u.getQuery()==null&&u.getFragment()==null;}catch(Exception ignored){return false;}}
     @PluginMethod public void check(PluginCall call){io.execute(()->{HttpURLConnection connection=null;try{
         PackageInfo current=installed();boolean debug=getContext().getPackageName().endsWith(".debug");
         JSObject result=new JSObject();result.put("currentVersion",current.versionName);result.put("currentCode",version(current));result.put("packageId",getContext().getPackageName());
@@ -50,6 +50,8 @@ public class AppUpdaterPlugin extends Plugin {
     private JSObject status()throws Exception{
         JSObject result=new JSObject();long id=state().getLong("id",-1);result.put("state","idle");if(id==-1)return result;
         DownloadManager manager=(DownloadManager)getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        JSONObject pending=new JSONObject(state().getString("manifest","{}"));
+        if(pending.optLong("versionCode",0)<=version(installed())){manager.remove(id);state().edit().clear().apply();return result;}
         try(Cursor cursor=manager.query(new DownloadManager.Query().setFilterById(id))){if(!cursor.moveToFirst())return result;
             int value=cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));long bytes=cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));result.put("downloaded",bytes);result.put("total",cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)));
             if(value==DownloadManager.STATUS_FAILED){result.put("state","error");result.put("message","Android 下载失败（"+cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))+"），可重试");}

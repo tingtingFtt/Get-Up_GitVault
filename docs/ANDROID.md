@@ -16,7 +16,7 @@ npm run android:open
 
 Linux/macOS 可运行 `npm run android:debug`。Windows 先运行 `npm run android:sync`，再运行 `android\gradlew.bat -p android assembleDebug`，或在 Android Studio 打开 `android/`。
 
-输出：`android/app/build/outputs/apk/debug/app-debug.apk`。测试版包名为 `com.gitvault.app.debug`，正式版为 `com.gitvault.app`；两者数据空间独立。测试包可直接安装，但不同 CI 机器生成的调试签名可能不同，不能保证覆盖安装。不要用测试包存放唯一的数据副本。
+输出：`android/app/build/outputs/apk/debug/app-debug.apk`。测试版包名为 `com.gitvault.app.debug`，正式版为 `com.gitvault.app`；两者数据空间独立。未配置固定签名 Secrets 的测试包可直接安装，但不同 CI 机器生成的调试签名可能不同，不能保证覆盖安装。不要用测试包存放唯一的数据副本。
 
 GitHub Actions 的 **Build Android APK** 在相关 main 变更后自动运行，也可手动执行。完成后在该次运行的 Artifacts 下载 `GitVault-test-apk`；正式版输出为 `GitVault-release-apk`。没有签名 Secrets 时正式版为 unsigned，不能直接安装。
 

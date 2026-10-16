@@ -568,3 +568,10 @@ test('an incorrect combined tree stops before creating a commit or changing a br
  destination();await assert.rejects(githubClient.push('me','backup','release','token',[file('a','a'),file('b','b'),file('c','c'),file('d','d')],'batch'),/文件树哈希不一致/);
  assert.ok(!calls.some(c=>c.path.endsWith('/git/commits')||c.init.method==='PATCH'));
 });
+
+test('text snapshots larger than one batch keep combining files and checkpoint verified intermediate objects',async()=>{
+ const {gitTreeSha}=await import('../src/utils/gitFiles');const files=Array.from({length:20},(_,i)=>file(`src/${i}.txt`,String(i)+'x'.repeat(120*1024)));
+ const expected=await gitTreeSha(files.map(f=>({path:f.path,sha:f.sha!,mode:f.mode!})));destination();const base=handler;
+ handler=async(path,init)=>{if(path==='/repos/me/backup')return response({id:77,default_branch:'main'});if(path.endsWith('/git/trees')){const payload=JSON.parse(String(init.body));return response({sha:await gitTreeSha(await Promise.all(payload.tree.map(async(f:any)=>({path:f.path,mode:f.mode,sha:f.sha||await gitBlobSha(new TextEncoder().encode(f.content))}))))});}if(path.endsWith('/git/commits/new-commit'))return response({tree:{sha:expected}});return base(path,init);};
+ const result=await githubClient.push('me','backup','release','token',files,'large text');assert.equal(result.verified,true);assert.equal(calls.filter(c=>c.path.endsWith('/git/trees')).length,2);assert.equal(calls.filter(c=>c.path.endsWith('/git/blobs')).length,0);assert.ok((await uploadCache.load(77)).size>=17);
+});

@@ -389,6 +389,17 @@ export const githubClient = {
     const acknowledged = checkpoints ? await checkpoints.load(checkpointId) : new Set<string>();
     const verifiedBlobs = new Set([...existing.values()].filter(item => item.type === 'blob').map(item => item.sha));
     let inlineBudget = 2 * 1024 * 1024, inlineCount = 0;
+    let pendingText: Array<{item: {path:string;mode:string;type:string;content?:string;sha?:string}; sha:string}> = [];
+    const flushText = async () => {
+      if (!pendingText.length) return;
+      progress(`正在合并上传 ${pendingText.length} 个文本文件…`);
+      const result = await json(`${base}/git/trees`,token,body('POST',{tree:pendingText.map(entry=>entry.item)}),signal);
+      const hashes = pendingText.map(entry=>({path:entry.item.path,mode:entry.item.mode,sha:entry.sha}));
+      if (result.sha !== await gitTreeSha(hashes)) throw new Error('文本批次文件树校验失败，未更新目标分支；本地文件已保留');
+      if (checkpoints) await checkpoints.saveBatch(checkpointId,hashes.map(entry=>entry.sha));
+      for (const entry of pendingText) { delete entry.item.content; entry.item.sha=entry.sha; verifiedBlobs.add(entry.sha); }
+      pendingText=[];inlineBudget=2*1024*1024;
+    };
     const expectedFiles: Array<{path:string;mode:string;sha:string}> = [];
     const treeItems = await mapConcurrent(allFiles, 1, async file => {
       signal.throwIfAborted();
@@ -400,10 +411,12 @@ export const githubClient = {
       // Small UTF-8 sources can be created in one tree request. Binary and large
       // files retain verified blob checkpoints. Never send both content and sha.
       const inlineSize = new TextEncoder().encode(JSON.stringify(file.content)).length;
-      if (allFiles.length >= 4 && !file.isBase64 && old?.sha !== hash && !verifiedBlobs.has(hash) && inlineSize <= 128 * 1024 && inlineSize <= inlineBudget && !acknowledged.has(hash)) {
+      if (allFiles.length >= 4 && !file.isBase64 && old?.sha !== hash && !verifiedBlobs.has(hash) && inlineSize <= 128 * 1024 && !acknowledged.has(hash)) {
+        if (inlineSize > inlineBudget) await flushText();
         inlineBudget -= inlineSize; inlineCount++;
         progress(`正在合并文本文件 ${++done}/${allFiles.length}：${file.path}`);
-        return {path:file.path,mode:file.mode || '100644',type:'blob',content:file.content};
+        const item = {path:file.path,mode:file.mode || '100644',type:'blob',content:file.content};
+        pendingText.push({item,sha:hash});return item;
       }
       if (old?.sha !== hash && !verifiedBlobs.has(hash)) {
         let reusable = false;
