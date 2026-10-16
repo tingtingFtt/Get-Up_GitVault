@@ -199,7 +199,7 @@ test('system backup excludes repaired Fork, branch, upload and source credential
   } finally { URL.createObjectURL = create; URL.revokeObjectURL = revoke; dom.window.HTMLAnchorElement.prototype.click = anchorClick; }
 });
 test('detaching a missing target clears its shared branch and Fork bindings while keeping other targets, history and version caches', async () => {
-  const first = boundProject();
+  const first = boundProject(); first.accountState = 'synced';
   first.branchTargets = { develop: first.uploadTarget, feature: { ...first.uploadTarget, branch: 'feature' }, other: { ...first.uploadTarget, id: 88, repo: 'another', branch: 'other' } };
   first.forkTarget = { ...first.uploadTarget, htmlUrl: 'old', branches: ['develop', 'feature'] };
   first.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', commitSha: 'target-v2', sourceSha: 'v2', htmlUrl: 'old' };
@@ -211,7 +211,7 @@ test('detaching a missing target clears its shared branch and Fork bindings whil
   const saved = storedProjects();
   assert.equal(saved[0].forkTarget, undefined); assert.deepEqual(Object.keys(saved[0].branchTargets), ['other']);
   assert.equal(saved[0].remoteSnapshot.commitSha, 'target-v2'); assert.deepEqual(saved[0].backups, first.backups);
-  assert.equal(saved[1].owner, 'source'); assert.equal(saved[1].forkScope, undefined); assert.equal(saved[1].origin.repo, 'project');
+  assert.equal(saved[1].owner, 'source'); assert.equal(saved[1].accountState, undefined); assert.equal(saved[1].forkScope, undefined); assert.equal(saved[1].origin.repo, 'project');
   assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.ok(targetManager()?.textContent?.includes('2 个记录'));
@@ -1184,4 +1184,11 @@ test('cancel full batch sync preserves verified branch receipts locally for late
     assert.equal(storedProjects()[0].cloudPending[0].bindings.develop.commitSha,'verified-branch');
     const logs=JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!);assert.ok(logs.some((log:any)=>log.status==='success'&&log.message.includes('develop')));assert.ok(logs.some((log:any)=>log.status==='cancelled'));
   }finally{githubClient.syncAllForkBranches=original;}
+});
+test('an existing accessible target cannot be detached to bypass first-upload deduplication',async()=>{
+  await reloadProject(boundProject());identifyDestination();let removed=false;
+  accountRegistry.remove=async()=>{removed=true;return {} as any;};
+  await enterWorkbench();await click('管理远端目标');await click('解除此目标的所有绑定');
+  await waitFor(()=>targetManager()?.textContent?.includes('目标仓库仍然存在')===true);
+  assert.equal(storedProjects()[0].uploadTarget.id,77);assert.equal(removed,false);assert.equal(storedProjects()[0].cloudRemovals,undefined);
 });

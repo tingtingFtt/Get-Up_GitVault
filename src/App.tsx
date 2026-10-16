@@ -618,20 +618,28 @@ export default function App() {
   const handleDetachTarget = async (repoId: string, target: TargetIdentity) => {
     if (targetManagerBusy) return;
     const affected = reposRef.current.filter(project => projectTargets(project).some(item => sameTarget(item, target)));
-    if (!affected.length || !confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n之后需要重新选择上传目标或创建分叉。若只是 Token 无权限，建议先更新 Token 并重新检测。`)) return;
+    if (!affected.length || !confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n仅在确认原仓库已删除或原 ID 已失效后重新创建。若只是 Token 无权限，请先更新 Token 并重新检测。`)) return;
+    beginGithubOperation(); setTargetManagerBusy(true);
+    const auth = targetManagerToken.trim() || targetToken(affected[0], target);
+    let locallyDetached = false;
     try {
+      try {
+        await githubClient.repository(target.owner, target.repo, auth, target.id);
+        setTargetManagerMessage('目标仓库仍然存在，固定绑定已保留；请使用更新、同步或修改名称，不能解除后重复首次上传。');
+        logOperation('解除远端目标', 'skipped', affected[0], '原目标仍可访问，保留固定绑定'); return;
+      } catch (error) { if (!(error instanceof TargetRepositoryError) || !['unavailable','identity-changed'].includes(error.health.status)) throw error; }
       persistRepos(reposRef.current.map(project => {
         const next = detachedTarget(project, target);
-        return affected.some(item => item.id === project.id) ? { ...next, creationReservation: undefined, cloudPending: (project.cloudPending || []).filter(entry => !sameTarget(entry.target, target)), cloudRemovals: [...(project.cloudRemovals || []), target] } : next;
+        return affected.some(item => item.id === project.id) ? { ...next, accountState: next.uploadTarget || next.forkTarget ? 'bound' as const : undefined, creationReservation: undefined, cloudPending: (project.cloudPending || []).filter(entry => !sameTarget(entry.target, target)), cloudRemovals: [...(project.cloudRemovals || []), target] } : next;
       }));
+      locallyDetached = true;
       setDetachedTargetName(target.repo);
       setTargetManagerMessage(`已解除 ${affected.length} 个记录的旧目标绑定。可以重新设置上传或创建分叉；本地文件和历史快照已保留。GitHub 上已删除的历史无法在新仓库中自动重建。`);
       setTargetManagerId(repoId);
-      beginGithubOperation();
-      const auth = targetManagerToken.trim() || targetToken(affected[0], target);
       if (auth) for (const project of affected) await flushCloudRemovals(project, auth);
       logOperation('解除远端目标', 'success', affected[0], '当前绑定与账号记录已解除；历史快照保留');
-    } catch (error) { logOperation('解除远端目标', 'partial', affected[0], (error as Error).message, '解除账号记录', error); setTargetManagerMessage('本地记录已保留；账号解绑未完成，将在下次操作时重试：' + (error as Error).message); }
+    } catch (error) { logOperation('解除远端目标', locallyDetached ? 'partial' : 'error', affected[0], (error as Error).message, '核对原目标或解除账号记录', error); setTargetManagerMessage((locallyDetached ? '本地记录已保留；账号解绑未完成，将在下次操作时重试：' : '无法确认旧目标已失效，绑定保持固定：') + (error as Error).message); }
+    finally { setTargetManagerBusy(false); }
   };
   const reopenTargetSetup = (repoId: string, fork: boolean) => {
     const repo = reposRef.current.find(project => project.id === repoId);
@@ -1365,6 +1373,14 @@ export default config;
   };
   const flushCloudRemovals = async (repo: TrackedRepo, token: string) => {
     for (const target of reposRef.current.find(project => project.id === repo.id)?.cloudRemovals || []) {
+      try {
+        await githubClient.repository(target.owner, target.repo, token, target.id);
+        // Access may have recovered after a 404. Keep the account binding so a
+        // pending detach cannot turn a permission problem into a duplicate upload.
+        const current = reposRef.current.find(project => project.id === repo.id)!;
+        patchRepo(repo.id, { cloudRemovals: (current.cloudRemovals || []).filter(item => !sameTarget(item, target)), detachedTargets: (current.detachedTargets || []).filter(item => !sameTarget(item, target)) });
+        logOperation('恢复固定目标', 'skipped', repo, '原目标恢复可访问，取消待解绑记录，继续使用账号固定目标'); continue;
+      } catch (error) { if (!(error instanceof TargetRepositoryError) || !['unavailable','identity-changed'].includes(error.health.status)) throw error; }
       await accountRegistry.remove(target, token);
       const current = reposRef.current.find(project => project.id === repo.id)!;
       patchRepo(repo.id, { cloudRemovals: (current.cloudRemovals || []).filter(item => !sameTarget(item, target)) });
@@ -1591,7 +1607,7 @@ export default config;
       const branch = existing?.branch || sourceOf(repo).branch;
       assertDestinationBranch(repo, { ...target, branch });
       const files = await versionFiles(repo);
-      const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, singleUploadDescription.trim(), singleUploadRemark.trim(), sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
+      const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.forkScope === 'full' ? undefined : singleUploadDescription.trim(), repo.forkScope === 'full' ? undefined : singleUploadRemark.trim(), repo.forkScope === 'full' ? undefined : sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
       await recordUpload(repo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
       logOperation('上传', 'success', singleUploadTargetRepo, '项目与账号记录均已验证保存');
       setIsSingleUploadModalOpen(false);
@@ -1761,7 +1777,7 @@ export default config;
       const destinationBranch = !pushCopyMode && project.uploadTarget ? targetForBranch(project, sourceBranch)!.branch : pushTargetBranch.trim() || sourceBranch;
       assertDestinationBranch(project, { ...target, branch: destinationBranch }, sourceBranch);
       const files = await versionFiles(project, version);
-      const result = await githubClient.push(target.owner, target.repo, destinationBranch, token, files, pushCommitMsg.trim() || `Sync ${project.repo} @ ${version?.commitSha || project.latestCommitSha}`, project.description, project.remark, sourceOf(project).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: target.id });
+      const result = await githubClient.push(target.owner, target.repo, destinationBranch, token, files, pushCommitMsg.trim() || `Sync ${project.repo} @ ${version?.commitSha || project.latestCommitSha}`, project.forkScope === 'full' ? undefined : project.description, project.forkScope === 'full' ? undefined : project.remark, project.forkScope === 'full' ? undefined : sourceOf(project).url, { rebaseOnConflict: !pushCopyMode, expectedRepoId: target.id });
       await recordUpload(project, result, purgePushCacheOption, version, {}, token, !pushCopyMode && (!!project.uploadTarget || !version));
       logOperation('上传指定仓库', 'success', project, '提交及账号记录已验证');
       setIsPushModalOpen(false); setPushBackupTarget(null);
