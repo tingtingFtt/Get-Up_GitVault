@@ -5,3 +5,5 @@ dist/
 !.env.example
 playwright-report/
 test-results/
+*.jks
+*.keystore

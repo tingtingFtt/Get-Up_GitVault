@@ -215,6 +215,15 @@ test('release uses the selected commit and rejects an existing mismatched tag', 
   handler = () => response({ object: { type: 'commit', sha: 'wrong' } });
   await assert.rejects(() => githubClient.release('me', 'backup', 'v1', 'version', '', 'token', 'saved-commit'), /其他版本/);
 });
+test('retrying an already created release verifies its immutable tag before accepting it', async () => {
+  handler = (path, init) => path.includes('/git/ref/tags/') ? response({ object: { type: 'commit', sha: 'saved-commit' } })
+    : init.method === 'POST' ? response({ message: 'already_exists' }, 422)
+    : response({ tag_name: 'v1', html_url: 'existing-release-url' });
+  const result = await githubClient.release('me', 'backup', 'v1', 'version', 'notes', 'token', 'saved-commit');
+  assert.equal(result.releaseUrl, 'existing-release-url');
+  assert.equal(calls.filter(call => call.path.includes('/git/ref/tags/')).length, 2);
+  assert.ok(calls.some(call => call.path.endsWith('/releases/tags/v1')));
+});
 test('blob hash is byte accurate for Unicode and binary files', async () => {
   for (const bytes of [Buffer.from('中文源码'), Buffer.from([0, 255, 128, 1])]) assert.equal(await gitBlobSha(bytes), sha(bytes));
 });

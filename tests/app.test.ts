@@ -8,6 +8,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
 import { beginGithubOperation, githubClient, githubApi } from '../src/utils/githubClient';
 import App from '../src/App';
+import { appDialog } from '../src/utils/appDialog';
+import { checkpoint } from '../src/utils/taskJournal';
 import { accountRegistry, createAccountRegistry, type AccountProject } from '../src/utils/accountRegistry';
 const registryMethods = { ...accountRegistry };
 
@@ -82,6 +84,9 @@ beforeEach(async () => {
   (globalThis as any).alert = (message: string) => alerts.push(message);
   (globalThis as any).confirm = () => true;
   (globalThis as any).prompt = () => 'fake-test-token';
+  appDialog.notify = message => { alerts.push(message); };
+  appDialog.confirm = async message => (globalThis as any).confirm(message);
+  appDialog.prompt = async (message, value) => (globalThis as any).prompt(message, value);
   globalThis.fetch = async (input, init = {}) => {
     const path = String(input).replace('https://api.github.com', '');
     const payload = init.body ? JSON.parse(init.body as string) : null;
@@ -110,6 +115,45 @@ beforeEach(async () => {
   await act(async () => { root.render(React.createElement(App)); });
 });
 afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); });
+
+test('reopening a saved task does not write remotely and a changed branch blocks retry', async () => {
+  checkpoint({ kind: 'projects', action: 'update', items: [{ id: 'tracked', label: 'source/project', name: 'project', status: 'running', source: 'https://github.com/source/project', branch: 'other' }] });
+  await reloadProject(repo());
+  assert.ok(document.body.textContent?.includes('发现上次未完成'));
+  const before = requests.length;
+  await click('查看并继续');
+  assert.equal(requests.length, before);
+  await click('重试失败项目');
+  await waitFor(() => !!document.body.textContent?.includes('项目来源、分支或固定仓库已变化'));
+  assert.ok(!requests.slice(before).some(request => request.payload));
+  assert.equal(storedProjects()[0].branch, 'develop');
+});
+test('restored upload queues retain successful items without repeating their upload', async () => {
+  checkpoint({ kind: 'upload', items: [{ id: 'tracked', repo: 'project', name: 'fixed-name', status: 'success' }, { id: 'removed-project', name: 'other-name', status: 'uploading' }] });
+  await reloadProject(repo()); await click('查看并继续');
+  assert.ok(document.body.textContent?.includes('fixed-name'));
+  const before = requests.length;
+  await click('重试未完成上传');
+  await waitFor(() => !!document.body.textContent?.includes('项目已移除'));
+  assert.ok(!requests.slice(before).some(request => request.payload));
+  const saved = JSON.parse(localStorage.getItem('gitvault_tasks_v1')!)[0];
+  assert.equal(saved.items[0].status, 'success'); assert.equal(saved.items[0].name, 'fixed-name');
+});
+test('archive publishing with keep-source preserves files and saves each completed result', async () => {
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    if (path.includes('/git/ref/tags/')) return ok({ message: 'Not Found' }, 404);
+    if (path.endsWith('/releases') && init.method === 'POST') return ok({ html_url: 'https://github.com/source/project/releases/tag/v1', tag_name: 'v1' });
+    return base(url, init);
+  };
+  await enterWorkbench(); await click('版本归档库 (1)'); await click('全选所有');
+  await click('批量发布 Release 到 GitHub'); await click('开始批量发布');
+  await waitFor(() => storedProjects()[0].backups[0].isReleased === true);
+  assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
+  assert.equal(storedProjects()[0].backups[0].isCachePurged, undefined);
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_tasks_v1')!)[0].items[0].status === 'success');
+});
 
 const storedProjects = () => JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
 const targetManager = () => document.querySelector('[aria-label="管理远端目标"]');
@@ -424,6 +468,7 @@ async function input(placeholder: string, value: string) {
   });
 }
 async function upload(purge: boolean) {
+  const previousAlerts = alerts.length;
   await click('上传指定仓库');
   await input('owner/repo', 'destination/backup');
   await input('留空使用当前来源分支', 'release');
@@ -431,6 +476,7 @@ async function upload(purge: boolean) {
   if (purge) await act(async () => checkbox.click());
   const submit = buttons().find(b => b.textContent === '确认上传')!;
   await act(async () => { submit.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await new Promise(r => setTimeout(r, 50)); });
+  await waitFor(() => alerts.length > previousAlerts);
 }
 
 test('historical file view reads its exact version rather than current cache', async () => {
@@ -455,6 +501,7 @@ test('verified upload with keep option retains cache and records remote commit',
 
 test('verified upload with purge removes only selected contents and keeps manifest', async () => {
   await enterWorkbench(); await upload(true);
+  await waitFor(() => storedProjects()[0].isCachePurged === true);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2')).length, 0);
   assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
@@ -515,6 +562,7 @@ test('history upload sends old bytes and purges only that selected version', asy
   const submit = buttons().find(b => b.textContent === '确认上传')!;
   await act(async () => { submit.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await new Promise(r => setTimeout(r, 50)); });
   assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
+  await waitFor(() => storedProjects()[0].backups[0].isCachePurged === true);
   assert.equal((await localCache.getProjectFiles('tracked', 'v1')).length, 0);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   const stored = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];

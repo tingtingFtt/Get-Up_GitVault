@@ -1,0 +1,100 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'android/**'
+      - 'index.html'
+      - 'package*.json'
+      - 'capacitor.config.ts'
+      - 'vite.config.ts'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GITVAULT_VERSION_CODE: ${{ github.run_number }}
+      GITVAULT_VERSION_NAME: 1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - name: Check web code
+        run: |
+          npm run lint
+          npm test
+      - name: Build bundled web resources and sync native plugins
+        run: npm run android:sync
+      - name: Install required Android SDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Build and check test APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Upload installable test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVault-test-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Prepare release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+            umask 077
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/gitvault-release.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/gitvault-release.jks" >> "$GITHUB_ENV"
+          fi
+      - name: Build release APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVault-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gitvault-release.jks"
+      - name: Summarize install packages
+        shell: bash
+        run: |
+          echo '### GitVault Android' >> "$GITHUB_STEP_SUMMARY"
+          echo 'GitVault-test-apk 是可安装的测试包，包名 com.gitvault.app.debug。' >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$ANDROID_KEYSTORE_PATH" ]; then
+            echo 'GitVault-release-apk 已使用配置的签名生成；后续升级必须继续使用同一签名。' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '正式版未配置签名，release APK 为 unsigned，不能直接安装。请先配置 docs/ANDROID.md 中的 Secrets。' >> "$GITHUB_STEP_SUMMARY"
+          fi

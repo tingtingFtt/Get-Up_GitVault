@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">GitVault</string>
+    <string name="title_activity_main">GitVault</string>
+    <string name="package_name">com.gitvault.app</string>
+    <string name="custom_url_scheme">com.gitvault.app</string>
+</resources>

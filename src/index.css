@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+:root { --app-visible-height: 100dvh; }
+.app-dialog-overlay { height: var(--app-visible-height); overflow-y: auto; }
+.app-dialog-panel { min-width: 0; max-height: calc(var(--app-visible-height) - 2rem); overflow-y: auto; }
+.app-dialog-panel p { min-height: 0; overflow-wrap: anywhere; }
+.app-notices { bottom: max(1rem, env(safe-area-inset-bottom)); }
+.app-notices p { overflow-wrap: anywhere; }
+.app-shell > .fixed.inset-0 > div { max-height: calc(var(--app-visible-height) - 2rem); }
+
 /* Sizing applies to every screen, including resizable desktop windows and dialogs. */
 html, body, #root { width: 100%; min-width: 0; margin: 0; }
 .app-shell { width: 100%; min-width: 0; }

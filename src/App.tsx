@@ -25,6 +25,12 @@ import { accountRegistry, ExistingSourceError, REGISTRY_REPO, sameSource, type A
 import { appendOperationLog, readOperationLogs, clearOperationLogs, type OperationLog } from './utils/operationLog';
 import { bindingLabel, switchedHistory } from './utils/projectBinding';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
+import AppDialogs from './components/AppDialogs';
+import { appDialog } from './utils/appDialog';
+import { isNativeAndroid, hasNativeFiles, nativeBridge, exportProjectDirectory, saveDownload } from './utils/nativePlatform';
+import { readCredentialValue, writeCredentialValue, flushCredentials } from './utils/credentialStorage';
+import { checkpoint, readTasks, interruptedTask, forgetTask, hasUnfinished, type SavedTask } from './utils/taskJournal';
+import { App as NativeApp } from '@capacitor/app';
 
 interface RepoTreeItem {
   path: string;
@@ -115,7 +121,7 @@ interface RateLimit {
 interface BatchReleaseItemStatus {
   id: string;
   tag: string;
-  status: 'pending' | 'releasing' | 'success' | 'error';
+  status: 'pending' | 'releasing' | 'success' | 'error' | 'cancelled';
   error?: string;
   releaseUrl?: string;
 }
@@ -162,9 +168,9 @@ function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&
 export default function App() {
   const [repos, setRepos] = useState<TrackedRepo[]>(() => {
     try {
-      const saved = localStorage.getItem('gitvault_repos_v8');
+      const saved = readCredentialValue('gitvault_repos_v8');
       if (saved) return JSON.parse(saved);
-      const oldSaved = localStorage.getItem('gitvault_repos_v7');
+      const oldSaved = readCredentialValue('gitvault_repos_v7');
       if (oldSaved) return JSON.parse(oldSaved);
       return [];
     } catch {
@@ -174,13 +180,13 @@ export default function App() {
 
   // Global settings state
   const [globalToken, setGlobalToken] = useState<string>(() => {
-    return localStorage.getItem('gitvault_global_token') || '';
+    return readCredentialValue('gitvault_global_token') || '';
   });
   const [globalUsername, setGlobalUsername] = useState<string>(() => {
     return localStorage.getItem('gitvault_global_username') || '';
   });
   const [apkDownloadDirectory, setApkDownloadDirectory] = useState<string>(() => {
-    return localStorage.getItem('gitvault_apk_download_dir') || '/storage/emulated/0/Download/GitVault';
+    return localStorage.getItem('gitvault_apk_download_dir') || '';
   });
 
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -219,6 +225,11 @@ export default function App() {
   const [batchForkScope, setBatchForkScope] = useState<'current' | 'full'>('full');
   const [batchTaskToken, setBatchTaskToken] = useState('');
   const [batchForkPurge, setBatchForkPurge] = useState(false);
+  const [recoveryTasks, setRecoveryTasks] = useState<SavedTask[]>(() => {
+    try { return readTasks().filter(hasUnfinished).map(interruptedTask); } catch { return []; }
+  });
+  const projectTaskContext = useRef<SavedTask['items'] | undefined>(undefined);
+  const uploadTaskContext = useRef<SavedTask['items'] | undefined>(undefined);
 
   // Batch Release & Cache Purge state in Backups tab
   const [selectedBackupIds, setSelectedBackupIds] = useState<string[]>([]);
@@ -227,6 +238,8 @@ export default function App() {
   const [batchReleaseProgress, setBatchReleaseProgress] = useState<BatchReleaseItemStatus[]>([]);
   const [batchReleaseTitlePrefix, setBatchReleaseTitlePrefix] = useState('归档发布');
   const [isBatchPublishing, setIsBatchPublishing] = useState(false);
+  const releaseLock = useRef(false);
+  const releaseContext = useRef<SavedTask['items']>([]);
 
   // Modals
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -376,13 +389,14 @@ export default function App() {
     const controls = () => [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), summary, [href], input:not(:disabled), [tabindex="0"]')];
     const focus = () => controls()[0]?.focus();
     const keydown = (event: KeyboardEvent) => {
+      if (appDialog.snapshot().active) return;
       if (event.key === 'Escape') { event.preventDefault(); cancelGithubOperation(); }
       if (event.key !== 'Tab') return;
       const list = controls(), first = list[0], last = list[list.length - 1];
       if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) { event.preventDefault(); first?.focus(); }
     };
-    const focusin = (event: FocusEvent) => { if (!dialog.contains(event.target as Node)) focus(); };
+    const focusin = (event: FocusEvent) => { if (!appDialog.snapshot().active && !dialog.contains(event.target as Node)) focus(); };
     focus(); document.addEventListener('keydown', keydown); document.addEventListener('focusin', focusin);
     return () => { document.removeEventListener('keydown', keydown); document.removeEventListener('focusin', focusin); if (previous?.isConnected) previous.focus(); };
   }, [!!importMatch]);
@@ -391,18 +405,7 @@ export default function App() {
   // Hidden file input ref for backup import
   const backupImportInputRef = useRef<HTMLInputElement>(null);
 
-  // Environment detection: Check if running inside APK or Native Android WebView
-  const isApkEnvironment = useMemo(() => {
-    if (typeof window === 'undefined') return false;
-    const w = window as any;
-    const ua = navigator.userAgent.toLowerCase();
-    return Boolean(w.AndroidBridge) ||
-           Boolean(w.Capacitor) ||
-           Boolean(w.ReactNativeWebView) ||
-           ua.includes('gitvault-apk') ||
-           ua.includes('wv') ||
-           (ua.includes('android') && ua.includes('version/'));
-  }, []);
+  const isApkEnvironment = useMemo(isNativeAndroid, []);
 
   const reposRef = useRef(repos);
   reposRef.current = repos;
@@ -426,7 +429,7 @@ export default function App() {
 
   // Persist a reviewable record before deleting any local source content.
   const persistRepos = (next: TrackedRepo[]) => {
-    localStorage.setItem('gitvault_repos_v8', JSON.stringify(next));
+    writeCredentialValue('gitvault_repos_v8', JSON.stringify(next));
     reposRef.current = next;
     setRepos(next);
   };
@@ -590,11 +593,12 @@ export default function App() {
     }
     if (purge) {
       try {
-        await localCache.deleteProjectFiles(repo.id, sourceSha);
+        await flushCredentials(); await localCache.deleteProjectFiles(repo.id, sourceSha);
         if (version) patchRepo(repo.id, { backups: (reposRef.current.find(r => r.id === repo.id)?.backups || []).map(b => b.id === version.id ? { ...b, isCachePurged: true } : b) });
         else patchRepo(repo.id, { isCachePurged: true, cachedFilesCount: 0 });
       } catch (error) { throw new Error(`上传已验证成功，缓存清理未完成，可稍后重试：${(error as Error).message}`); }
     } else if (!version && sourceSha === current.latestCommitSha) patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: (await localCache.getProjectFiles(repo.id, sourceSha)).length });
+    await flushCredentials();
   };
 
   const boundTarget = async (repo: TrackedRepo, token: string, branch = sourceOf(repo).branch) => {
@@ -639,7 +643,7 @@ export default function App() {
   const handleDetachTarget = async (repoId: string, target: TargetIdentity) => {
     if (targetManagerBusy) return;
     const affected = reposRef.current.filter(project => projectTargets(project).some(item => sameTarget(item, target)));
-    if (!affected.length || !confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n仅在确认原仓库已删除或原 ID 已失效后重新创建。若只是 Token 无权限，请先更新 Token 并重新检测。`)) return;
+    if (!affected.length || !(await appDialog.confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n仅在确认原仓库已删除或原 ID 已失效后重新创建。若只是 Token 无权限，请先更新 Token 并重新检测。`))) return;
     beginGithubOperation(); setTargetManagerBusy(true);
     const auth = targetManagerToken.trim() || targetToken(affected[0], target);
     let locallyDetached = false;
@@ -694,13 +698,13 @@ export default function App() {
     return githubClient.push(target.owner, target.repo, target.branch, token, files, message, repo.forkScope === 'full' ? undefined : repo.description, repo.forkScope === 'full' ? undefined : repo.remark, repo.forkScope === 'full' ? undefined : sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
   };
   const handleRenameTarget = async (repo: TrackedRepo) => {
-    const token = repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
+    const token = repo.uploadTarget?.token || globalToken || repo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation();
     try {
       const prepared=await updateAccountBinding(repo,token);repo=prepared.repo;
-      if(prepared.boundOnly){alert('已恢复账号固定目标，请再次修改名称');return;}
-      const name = prompt(`修改已绑定的 GitHub 仓库名称（保留原仓库和全部历史）：${repo.uploadTarget?.owner}/${repo.uploadTarget?.repo}`, repo.uploadTarget?.repo || singleUploadRepoName)?.trim();
+      if(prepared.boundOnly){appDialog.notify('已恢复账号固定目标，请再次修改名称');return;}
+      const name = (await appDialog.prompt(`修改已绑定的 GitHub 仓库名称（保留原仓库和全部历史）：${repo.uploadTarget?.owner}/${repo.uploadTarget?.repo}`, repo.uploadTarget?.repo || singleUploadRepoName))?.trim();
       if(!name)return;
       const previous = await boundTarget(repo, token);
       if (!previous) throw new Error('尚未绑定上传目标');
@@ -710,14 +714,47 @@ export default function App() {
       setSingleUploadTargetRepo(refreshed); setSingleUploadRepoName(next.repo);
       if (refreshed.uploadTarget) await publishAccountRecord(refreshed, accountRecord(refreshed, refreshed.uploadTarget, refreshed.forkScope === 'full' ? 'full' : refreshed.uploadTarget.kind || 'upload', sourceOf(refreshed).branch, refreshed.uploadTarget.branch, refreshed.remoteSnapshot?.sourceSha, refreshed.remoteSnapshot?.commitSha), token);
       logOperation('修改项目名称', 'success', refreshed, `固定目标已更名为 ${next.repo}`);
-      alert('项目名称已修改，仓库身份和历史记录保持不变。');
-    } catch (error) { logOperation('修改项目名称', 'error', repo, (error as Error).message, '修改名称或账号记录', error); alert('修改名称失败：' + (error as Error).message); }
+      appDialog.notify('项目名称已修改，仓库身份和历史记录保持不变。');
+    } catch (error) { logOperation('修改项目名称', 'error', repo, (error as Error).message, '修改名称或账号记录', error); appDialog.notify('修改名称失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
+  useEffect(() => {
+    const resized = () => document.documentElement.style.setProperty('--app-visible-height', `${window.visualViewport?.height || window.innerHeight}px`);
+    resized(); window.visualViewport?.addEventListener('resize', resized);
+    const failure = () => appDialog.notify('Android 安全存储未完成，请重新保存设置；清理源码前会再次检查。');
+    window.addEventListener('gitvault-secure-storage-error', failure);
+    try { readTasks(); } catch (error) { appDialog.notify((error as Error).message); }
+    return () => { window.visualViewport?.removeEventListener('resize', resized); window.removeEventListener('gitvault-secure-storage-error', failure); };
+  }, []);
+  useEffect(() => {
+    if (!isApkEnvironment) return;
+    let disposed = false;
+    const registration = NativeApp.addListener('backButton', async () => {
+      if (appDialog.cancelActive()) return;
+      if (importLock.current || batchTaskLock.current || batchUploadLock.current || isLoading || isBatchPublishing) {
+        if (await appDialog.confirm('取消剩余任务？已完成的远端写入和本地文件会保留，之后可重试未完成项。')) cancelGithubOperation();
+        return;
+      }
+      const overlays = Array.from(document.querySelectorAll<HTMLElement>('.app-shell .fixed.inset-0')).filter(element => element.getBoundingClientRect().height > 0);
+      const overlay = overlays.sort((a,b) => Number(getComputedStyle(b).zIndex) - Number(getComputedStyle(a).zIndex))[0];
+      if (overlay) {
+        const close = Array.from(overlay.querySelectorAll<HTMLButtonElement>('button')).find(button => !button.disabled && (/^(关闭|取消|返回)$/.test(button.textContent?.trim() || '') || !!button.querySelector('.lucide-x')));
+        close?.click(); return;
+      }
+      if (currentView === 'workbench') { setCurrentView('projects'); setActiveRepoId(null); return; }
+      if (currentView === 'projects') { setCurrentView('dashboard'); return; }
+      if (await appDialog.confirm('退出 GitVault？已保存的项目与任务恢复记录会保留。')) {
+        try { await flushCredentials(); await NativeApp.exitApp(); } catch (error) { appDialog.notify((error as Error).message); }
+      }
+    });
+    registration.then(listener => { if (disposed) void listener.remove(); }).catch(() => appDialog.notify('Android 返回键监听失败，请重新打开应用'));
+    return () => { disposed = true; void registration.then(listener => listener.remove()); };
+  }, [isApkEnvironment, currentView, isLoading, isBatchPublishing]);
+
   // Save to localStorage
   useEffect(() => {
-    try { localStorage.setItem('gitvault_repos_v8', JSON.stringify(repos)); }
+    try { writeCredentialValue('gitvault_repos_v8', JSON.stringify(repos)); }
     catch (error) { setErrorMsg('项目记录保存失败，请导出备份并检查浏览器存储空间'); }
   }, [repos]);
 
@@ -799,18 +836,20 @@ export default function App() {
     }
   };
 
-  const handleSaveGlobalSettings = (e: React.FormEvent) => {
+  const handleSaveGlobalSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    localStorage.setItem('gitvault_global_token', globalToken.trim());
+    try {
+    writeCredentialValue('gitvault_global_token', globalToken.trim());
     localStorage.setItem('gitvault_global_username', globalUsername.trim());
     localStorage.setItem('gitvault_apk_download_dir', apkDownloadDirectory.trim());
+    await flushCredentials(); } catch (error) { appDialog.notify((error as Error).message); return; }
     validateGitHubToken(globalToken.trim());
     setIsSettingsModalOpen(false);
-    alert('全局设置已成功保存！');
+    appDialog.notify('全局设置已成功保存！');
   };
 
   // Export full system backup (settings + project registry + remarks + descriptions)
-  const handleExportSystemBackup = () => {
+  const handleExportSystemBackup = async () => {
     try {
       const backupData = {
         app: 'GitVault',
@@ -827,18 +866,11 @@ export default function App() {
 
       const jsonStr = JSON.stringify(backupData, null, 2);
       const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       const now = new Date();
       const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
-      a.href = url;
-      a.download = `GitVault_Backup_${dateStr}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      await saveDownload(blob, `GitVault_Backup_${dateStr}.json`);
     } catch (err: any) {
-      alert('备份导出失败: ' + err.message);
+      appDialog.notify('备份导出失败: ' + err.message);
     }
   };
 
@@ -848,37 +880,32 @@ export default function App() {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const text = event.target?.result as string;
         const data = JSON.parse(text);
 
         if (!data || !Array.isArray(data.projects)) {
-          alert('导入失败：该文件不是合法的 GitVault 备份 JSON');
+          appDialog.notify('导入失败：该文件不是合法的 GitVault 备份 JSON');
           return;
         }
 
-        const shouldMerge = confirm(
-          `已读取备份文件！包含 ${data.projects.length} 个项目记录。\n点击“确定”将合并追加项目；点击“取消”将覆盖现有所有数据。`
+        const shouldMerge = await appDialog.confirm(
+          `已读取备份文件，包含 ${data.projects.length} 个项目记录。选择合并会追加没有重复 ID 的项目；选择覆盖方式后还需再次确认。`,
+          { accept: '合并导入', cancel: '覆盖方式…' }
         );
+        if (!shouldMerge && !await appDialog.confirm('覆盖本设备现有全部项目记录？远端仓库不删除，当前项目记录会被备份替换。', { accept: '确认覆盖', cancel: '取消恢复' })) return;
 
-        if (shouldMerge) {
-          const existingIds = new Set(repos.map(r => r.id));
-          const newItems = data.projects.filter((p: TrackedRepo) => !existingIds.has(p.id));
-          setRepos(prev => [...newItems, ...prev]);
-        } else {
-          setRepos(data.projects);
-        }
-
-        // Imported metadata does not imply that source files exist on this device.
-        const importedIds = new Set(data.projects.map((project: TrackedRepo) => project.id));
-        setRepos(prev => prev.map(repo => importedIds.has(repo.id) ? { ...repo, isCachePurged: true, cachedFilesCount: 0 } : repo));
+        // Metadata restored from another device does not imply cached files exist.
+        const imported = data.projects.map((project: TrackedRepo) => ({ ...project, isCachePurged: true, cachedFilesCount: 0 }));
+        const existingIds = new Set(reposRef.current.map(repo => repo.id));
+        persistRepos(shouldMerge ? [...imported.filter((project: TrackedRepo) => !existingIds.has(project.id)), ...reposRef.current] : imported);
 
         // Restore settings if included
         if (data.settings) {
           if (data.settings.globalToken) {
             setGlobalToken(data.settings.globalToken);
-            localStorage.setItem('gitvault_global_token', data.settings.globalToken);
+            writeCredentialValue('gitvault_global_token', data.settings.globalToken);
           }
           if (data.settings.globalUsername) {
             setGlobalUsername(data.settings.globalUsername);
@@ -890,10 +917,11 @@ export default function App() {
           }
         }
 
-        alert(`备份恢复完成！当前项目总数: ${data.projects.length} 个`);
+        await flushCredentials();
+        appDialog.notify(`备份恢复完成！当前项目总数: ${data.projects.length} 个`);
         setIsSettingsModalOpen(false);
       } catch (err: any) {
-        alert('解析备份文件出错: ' + err.message);
+        appDialog.notify('解析备份文件出错: ' + err.message);
       }
     };
     reader.readAsText(file);
@@ -943,17 +971,10 @@ export default function App() {
       zip.file("gitvault_backup.json", JSON.stringify(backupData, null, 2));
 
       const content = await zip.generateAsync({ type: "blob" });
-      const url = URL.createObjectURL(content);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `gitvault_html_offline_package_${new Date().toISOString().slice(0,10)}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      alert('HTML 离线网页打包与静态资源导出成功！');
+      await saveDownload(content, `gitvault_html_offline_package_${new Date().toISOString().slice(0,10)}.zip`);
+      appDialog.notify('HTML 离线网页打包与静态资源导出成功！');
     } catch (err: any) {
-      alert('导出 HTML 离线包失败: ' + err.message);
+      appDialog.notify('导出 HTML 离线包失败: ' + err.message);
     }
   };
 
@@ -1029,17 +1050,10 @@ app.on('window-all-closed', () => {
       zip.file("README_EXE.md", readme);
 
       const content = await zip.generateAsync({ type: "blob" });
-      const url = URL.createObjectURL(content);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `gitvault_exe_electron_config.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      alert('EXE 桌面端打包配置文件已下载！请按照说明在本地运行 electron-builder 生成 exe。');
+      await saveDownload(content, `gitvault_exe_electron_config.zip`);
+      appDialog.notify('EXE 桌面端打包配置文件已下载！请按照说明在本地运行 electron-builder 生成 exe。');
     } catch (err: any) {
-      alert('导出 EXE 配置失败: ' + err.message);
+      appDialog.notify('导出 EXE 配置失败: ' + err.message);
     }
   };
 
@@ -1056,46 +1070,40 @@ const config: CapacitorConfig = {
   appName: 'GitVault',
   webDir: 'dist',
   server: {
-    androidScheme: 'https'
-  }
+    androidScheme: 'https',
+    errorPath: 'webview-error.html'
+  },
+  android: { allowMixedContent: false, minWebViewVersion: 119 }
 };
 
 export default config;
 `;
 
-      const apkGuide = `# Android APK 打包指南 (Capacitor)
+      const apkGuide = `# GitVault Android APK
 
-1. 在项目根目录安装 Capacitor 依赖:
-   \`npm install @capacitor/core @capacitor/cli\`
-   \`npm install @capacitor/android\`
-2. 初始化 Capacitor:
-   \`npx cap init\` (App Name 填 GitVault, Package ID 填 com.gitvault.app)
-3. 添加 Android 平台:
-   \`npx cap add android\`
-4. 构建网页并同步到 Android:
-   \`npm run build\`
-   \`npx cap sync android\`
-5. 打开 Android Studio 生成 APK:
-   \`npx cap open android\`
-   在 Android Studio 中点击 Build -> Build Bundle(s) / APK(s) -> Build APK(s) 即可生成安卓 APK 安装包。
-   *注：打包为 APK 后，系统设置中的 APK 本地存储目录将自动生效，支持下载直落本地文件夹。*
+源项目已包含 Capacitor 配置、Android 工程和 GitVaultNative 文件／安全存储插件。
+此 ZIP 仅是配置参考，不能单独生成完整 APK；请下载完整项目。
+
+1. 安装 Node.js 22+、JDK 21 和 Android SDK（按 android/variables.gradle 安装）。
+2. 运行 npm ci。
+3. 运行 npm run android:sync，构建网页并同步原生插件。
+4. 运行 npm run android:debug 生成可安装的调试 APK。
+5. 正式版使用 Android Studio 签名，或在 GitHub Actions 配置文档中的签名 Secrets。
+
+设置中的目录需通过 Android 系统选择器授权。源码缓存默认保存在应用内部空间；
+选择导出目录后，新导入会额外导出项目文件，缓存清理不会删除这些导出文件。
+批量任务中断后重新打开可手动续办，不承诺锁屏后持续传输。
+网页部署不会自动替换 APK 内置资源。详见项目 docs/ANDROID.md。
 `;
 
       zip.file("capacitor.config.ts", capacitorConfig);
       zip.file("README_APK.md", apkGuide);
 
       const content = await zip.generateAsync({ type: "blob" });
-      const url = URL.createObjectURL(content);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `gitvault_apk_capacitor_config.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      alert('APK 安卓打包配置已下载！请按照说明安装 Capacitor 并使用 Android Studio 生成 APK。');
+      await saveDownload(content, `gitvault_apk_capacitor_config.zip`);
+      appDialog.notify('APK 安卓打包配置已下载！请按照说明安装 Capacitor 并使用 Android Studio 生成 APK。');
     } catch (err: any) {
-      alert('导出 APK 配置失败: ' + err.message);
+      appDialog.notify('导出 APK 配置失败: ' + err.message);
     }
   };
 
@@ -1124,8 +1132,8 @@ export default config;
     try {
       patchRepo(repo.id,next);
       if(next.uploadTarget){beginGithubOperation();const token=next.uploadTarget.token||globalToken||next.token||'';await publishAccountRecord(next,accountRecord(next,next.uploadTarget,next.forkScope==='full'?'full':next.uploadTarget.kind||'upload',sourceOf(next).branch,next.uploadTarget.branch,next.remoteSnapshot?.sourceSha,next.remoteSnapshot?.commitSha),token);}
-      setIsProjectSettingsModalOpen(false);alert('项目设置已成功保存！');
-    } catch(error){logOperation('保存项目标签与资料','partial',next,(error as Error).message,'保存账号资料',error);alert('本设备资料已保存，跨设备记录待重试：'+(error as Error).message);}
+      setIsProjectSettingsModalOpen(false);appDialog.notify('项目设置已成功保存！');
+    } catch(error){logOperation('保存项目标签与资料','partial',next,(error as Error).message,'保存账号资料',error);appDialog.notify('本设备资料已保存，跨设备记录待重试：'+(error as Error).message);}
   };
 
   // Scheduled polling for auto status checks
@@ -1194,7 +1202,7 @@ export default config;
       }
       setViewingBackup(null); setSelectedFilePath(null); setFileContent(null); setSelectedBackupIds([]); setFileSearchQuery(''); setVisibleFileCount(150); setMobileFileView('list'); setWorkbenchTab('files');
       await transferCache.clear(data.latestCommitSha);
-      alert(`已重新拉取并切换到 ${data.branch}，共 ${data.files.length} 个文件。${nextTarget ? `上传目标：${nextTarget.owner}/${nextTarget.repo}:${nextTarget.branch}。` : ''}其他分支的文件和历史记录已保留。`);
+      appDialog.notify(`已重新拉取并切换到 ${data.branch}，共 ${data.files.length} 个文件。${nextTarget ? `上传目标：${nextTarget.owner}/${nextTarget.repo}:${nextTarget.branch}。` : ''}其他分支的文件和历史记录已保留。`);
     } catch (error) { logOperation('切换分支', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取分支', error); setWorkbenchBranchError('切换未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
@@ -1216,7 +1224,7 @@ export default config;
     } catch (error) {
       patchRepo(repo.id, { lastCheckedAt: new Date().toISOString() });
       logOperation('检测更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '检测来源与目标', error);
-      if (!isBackground) alert('检测失败：' + (error as Error).message);
+      if (!isBackground) appDialog.notify('检测失败：' + (error as Error).message);
     } finally { checkingRepos.current.delete(repoId); if (!isBackground) setIsLoading(false); }
   };
 
@@ -1582,29 +1590,60 @@ export default config;
     return { repo, boundOnly: false };
   };
 
+  const exportToNativeDirectory = async (repo: TrackedRepo, files: CachedFile[]) => {
+    if (!isApkEnvironment || !apkDownloadDirectory.startsWith('content://')) return;
+    try {
+      await exportProjectDirectory(apkDownloadDirectory, repo, files, operationSignal());
+      logOperation('Android 目录导出', 'success', repo, '项目文件已导出到已授权目录；清理缓存不会删除导出文件');
+    } catch (error) {
+      logOperation('Android 目录导出', 'error', repo, (error as Error).message, '写入授权目录', error);
+      appDialog.notify('项目缓存已保存，但手机目录导出未完成：' + (error as Error).message);
+    }
+  };
+  const chooseApkDirectory = async () => {
+    try {
+      const { uri } = await nativeBridge.chooseDirectory();
+      localStorage.setItem('gitvault_apk_download_dir', uri); setApkDownloadDirectory(uri);
+      appDialog.notify('导出目录已授权。新导入会额外导出文件，缓存清理不会删除导出文件。');
+    } catch (error) { if ((error as {code?:string}).code !== 'CANCELLED') appDialog.notify('目录授权失败：' + (error as Error).message); }
+  };
+  const exportCurrentProject = async () => {
+    if (!activeRepo || isLoading) return;
+    startOperation();
+    try {
+      const files = await versionFiles(activeRepo);
+      await exportProjectDirectory(apkDownloadDirectory, activeRepo, files, operationSignal());
+      logOperation('Android 目录导出', 'success', activeRepo, '当前快照导出完成'); appDialog.notify('当前项目快照已导出到手机目录。');
+    } catch (error) { logOperation('Android 目录导出', 'error', activeRepo, (error as Error).message, '写入授权目录', error); appDialog.notify('目录导出未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
+  };
+
   // Add new repository link: Directly pull project into local memory/storage
   const handleBatchImport = async (retry = false) => {
-    if (importLock.current) return;
+    if (importLock.current || (!retry && !await confirmNewTask('import'))) return;
     const items = retry ? importResults.map(item => item.status === 'error' && item.url ? { ...item, status: 'pending' as const, message: undefined } : item) : parseImportLinks(batchLinks);
     if (!items.length) { setImportResults([]); setErrorMsg('请先填写至少一个仓库链接'); return; }
-    importLock.current = true; startOperation(); setErrorMsg(''); setImportResults([...items]);
+    const publishImportResults = (items: ImportLink[]) => { checkpoint({ kind: 'import', items }); setImportResults([...items]); };
+    try { checkpoint({ kind: 'import', items }); } catch (error) { appDialog.notify('任务保存失败：' + (error as Error).message); return; }
+    importLock.current = true; startOperation(); setErrorMsg(''); publishImportResults(items);
     const token = tokenInput.trim() || globalToken;
+    try {
     for (let i = 0; i < items.length; i++) {
       if (items[i].status !== 'pending') continue;
       if (operationSignal().aborted) break;
-      items[i] = { ...items[i], status: 'downloading', message: '正在拉取默认分支…' }; setImportResults([...items]);
+      items[i] = { ...items[i], status: 'downloading', message: '正在拉取默认分支…' }; publishImportResults(items);
       try {
         const parsed = parseRepository(items[i].url!);
         const existing = reposRef.current.filter(item => !item.origin && item.owner.toLowerCase() === parsed.owner.toLowerCase() && item.repo.toLowerCase() === parsed.repo.toLowerCase());
         if (existing.length) {
           const meta = await githubClient.repository(parsed.owner, parsed.repo, token);
           if (!token && existing.some(item => item.branch === meta.defaultBranch) && !importCandidates(reposRef.current, { ...parsed, url: items[i].url!, branch: meta.defaultBranch }).length) {
-            items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${meta.defaultBranch} 已在项目列表中` }; setImportResults([...items]); continue;
+            items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${meta.defaultBranch} 已在项目列表中` }; publishImportResults(items); continue;
           }
         }
         const { choice, data } = await prepareImport(`https://github.com/${parsed.owner}/${parsed.repo}`, undefined, token);
         operationSignal().throwIfAborted();
-        if (!data) { items[i] = { ...items[i], status: 'skipped', message: '用户选择跳过此链接' }; setImportResults([...items]); continue; }
+        if (!data) { items[i] = { ...items[i], status: 'skipped', message: '用户选择跳过此链接' }; publishImportResults(items); continue; }
         const exists = reposRef.current.some(item => { const source = sourceOf(item); return source.owner.toLowerCase() === data.owner.toLowerCase() && source.repo.toLowerCase() === data.repo.toLowerCase() && source.branch === data.branch && !item.origin; });
         if (exists && choice === 'independent' && !importCandidates(reposRef.current, { ...data, url: items[i].url! }).length) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
         else {
@@ -1616,18 +1655,18 @@ export default config;
           await finishAccountBinding(record, choice, token);
           if(typeof choice!=='string'&&choice.updateNow) await uploadComparedImport(record,token);
           if (typeof choice!=='string' && choice.newName) await performSwitch(record,{mode:'create',name:choice.newName,branch:record.branch,token,purge:false});
-          if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
-            try { (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${record.repo}`, JSON.stringify({ repo: record.repo, sha: record.latestCommitSha, files: data.files })); }
-            catch { /* Durable browser cache is already saved; native export can be retried separately. */ }
-          }
+          await exportToNativeDirectory(record, data.files);
+          await flushCredentials();
           items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${typeof choice !== 'string' ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
         }
         await transferCache.clear(data.latestCommitSha);
       } catch (error) { logOperation('批量导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, `${items[i].url || ''}：${(error as Error).message}`, '拉取与账号识别', error); items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
-      setImportResults([...items]);
+      publishImportResults(items);
     }
     for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'error', message: '操作已取消，尚未导入，可重试' };
-    setImportResults([...items]); setIsLoading(false); setCurrentView('projects'); importLock.current = false;
+    publishImportResults(items); setCurrentView('projects');
+    } catch (error) { appDialog.notify('批量导入未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); importLock.current = false; }
   };
 
   const handleAddRepo = async (e: React.FormEvent) => {
@@ -1651,12 +1690,11 @@ export default config;
       await finishAccountBinding(newRepo, choice, tokenInput.trim() || globalToken);
       if(typeof choice!=='string'&&choice.updateNow) await uploadComparedImport(newRepo,tokenInput.trim()||globalToken);
       if(typeof choice!=='string' && choice.newName) await performSwitch(newRepo,{mode:'create',name:choice.newName,branch:newRepo.branch,token:tokenInput.trim() || globalToken,purge:false});
-      if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
-        (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${newRepo.repo}`, JSON.stringify({ repo: newRepo.repo, sha: newRepo.latestCommitSha, files: data.files }));
-      }
+      await exportToNativeDirectory(newRepo, data.files);
+      await flushCredentials();
       setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
       await transferCache.clear(data.latestCommitSha);
-      alert(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
+      appDialog.notify(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
     } catch (error) { logOperation('导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, (error as Error).message, '拉取与账号识别', error); setErrorMsg((error as Error).message || '操作已取消'); }
     finally { setIsLoading(false); importLock.current = false; }
   };
@@ -1730,7 +1768,8 @@ export default config;
     const branchTargets=Object.fromEntries(Object.entries(bindings).map(([branch,binding])=>[branch,{...nextTarget,branch:binding.branch}]));
     await localCache.saveSyncReceipt(repo.id,pending.sourceSha,snapshot);
     patchRepo(repo.id,{...pending.manifest,branch:pending.sourceBranch,latestCommitSha:pending.sourceSha,origin:{...sourceOf(repo),branch:pending.sourceBranch},owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repoMeta:{...repo.repoMeta,htmlUrl:`https://github.com/${result.owner}/${result.repo}`},primarySource:{owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repositoryId:result.repoId,branch:result.branch},uploadTarget:nextTarget,branchTargets,branchUploadPending:false,forkTarget:undefined,forkScope:undefined,privateRepoUrl:nextTarget.private?`https://github.com/${result.owner}/${result.repo}`:undefined,remoteSnapshot:snapshot,savedCopies:[...(repo.savedCopies||[]),...(repo.remoteSnapshot?[repo.remoteSnapshot]:[])],backups:[archiveVersion(repo),...repo.backups],targetHistory:history,cloudPending:[],pendingSwitch:undefined,creationReservation:undefined,accountState:'synced',verification:'ready',isCachePurged:false,cachedFilesCount:(await localCache.getProjectFiles(repo.id,pending.sourceSha)).length});
-    if(request.purge){await localCache.deleteProjectFiles(repo.id,pending.sourceSha);patchRepo(repo.id,{isCachePurged:true,cachedFilesCount:0});}
+    if(request.purge){await flushCredentials(); await localCache.deleteProjectFiles(repo.id,pending.sourceSha);patchRepo(repo.id,{isCachePurged:true,cachedFilesCount:0});}
+    await flushCredentials();
     logOperation('另存并切换固定仓库','success',reposRef.current.find(item=>item.id===repo.id),`旧目标 ${pending.oldTarget?`${pending.oldTarget.owner}/${pending.oldTarget.repo}`:'无'} → ${result.owner}/${result.repo}:${result.branch}`);
     return '另存已验证，固定仓库已切换；旧仓库和历史记录保留。';
   };
@@ -1749,11 +1788,11 @@ export default config;
     event.preventDefault();const repo=reposRef.current.find(item=>item.id===switchProjectId);if(!repo||switchLock.current)return;
     if(switchMode==='existing'&&!repo.pendingSwitch?.result&&(!switchComparison||switchComparison.name!==switchName||switchComparison.branch!==switchBranch)){setSwitchError('请先对比已有仓库与目标分支，再确认另存切换');return;}
     if(repo.pendingSwitch?.result&&switchComparison&&Object.values(switchComparison.diff).some(paths=>paths.length)){
-      if(!confirm('新目标代码已有变化。确认将本次固定版本重新上传到已比较的分支，并接续现有历史？'))return;
+      if(!(await appDialog.confirm('新目标代码已有变化。确认将本次固定版本重新上传到已比较的分支，并接续现有历史？')))return;
       patchRepo(repo.id,{pendingSwitch:{...repo.pendingSwitch,result:undefined}});
     }
     switchLock.current=true;setSwitchBusy(true);setSwitchError('');beginGithubOperation();
-    try{const message=await performSwitch(repo,{mode:switchMode,name:switchName,branch:switchBranch,token:switchToken.trim()||globalToken||repo.uploadTarget?.token||repo.token||'',purge:switchPurge,expectedId:repo.pendingSwitch?.request.expectedId || switchComparison?.id});setSwitchProjectId(null);alert(message);}
+    try{const message=await performSwitch(repo,{mode:switchMode,name:switchName,branch:switchBranch,token:switchToken.trim()||globalToken||repo.uploadTarget?.token||repo.token||'',purge:switchPurge,expectedId:repo.pendingSwitch?.request.expectedId || switchComparison?.id});setSwitchProjectId(null);appDialog.notify(message);}
     catch(error){logOperation('另存并切换固定仓库',operationSignal().aborted?'cancelled':'error',repo,(error as Error).message,'另存切换',error);setSwitchError((error as Error).message);const current=reposRef.current.find(item=>item.id===repo.id);if(current?.pendingSwitch){setSwitchMode(current.pendingSwitch.request.mode);setSwitchName(current.pendingSwitch.request.name);}}
     finally{switchLock.current=false;setSwitchBusy(false);}
   };
@@ -1773,7 +1812,7 @@ export default config;
   // Execute upload single project to private repository
   const handleExecuteSingleUploadToPrivate = async (e: React.FormEvent) => {
     e.preventDefault(); if (!singleUploadTargetRepo) return;
-    const token = singleUploadTargetRepo.uploadTarget?.token || globalToken || singleUploadTargetRepo.token || prompt('请输入 GitHub Token：')?.trim();
+    const token = singleUploadTargetRepo.uploadTarget?.token || globalToken || singleUploadTargetRepo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation(); setIsUploadingToPrivate(true);
     try {
@@ -1781,10 +1820,10 @@ export default config;
       let name = singleUploadRepoName.trim();
       if (repo.uploadTarget && !repo.creationReservation) {
         const prepared = await updateAccountBinding(repo, token); repo = prepared.repo;
-        if (prepared.boundOnly) { alert('已比较并绑定目标，请再次使用更新。'); return; }
+        if (prepared.boundOnly) { appDialog.notify('已比较并绑定目标，请再次使用更新。'); return; }
       } else {
         const guard = await firstTarget(repo, token, 'upload', name);
-        if (guard.skipped) { logOperation('首次上传', 'skipped', repo, guard.message); setIsSingleUploadModalOpen(false); alert(guard.message); return; }
+        if (guard.skipped) { logOperation('首次上传', 'skipped', repo, guard.message); setIsSingleUploadModalOpen(false); appDialog.notify(guard.message); return; }
         name = guard.name;
       }
       const existing = repo.creationReservation ? undefined : await boundTarget(repo, token);
@@ -1797,8 +1836,8 @@ export default config;
       await recordUpload(repo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
       logOperation('上传', 'success', singleUploadTargetRepo, '项目与账号记录均已验证保存');
       setIsSingleUploadModalOpen(false);
-      alert(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
-    } catch (error) { logOperation('上传', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '验证上传', error); alert('上传未完成：' + (error as Error).message); }
+      appDialog.notify(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
+    } catch (error) { logOperation('上传', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '验证上传', error); appDialog.notify('上传未完成：' + (error as Error).message); }
     finally { setIsUploadingToPrivate(false); setIsLoading(false); }
   };
 
@@ -1841,18 +1880,19 @@ export default config;
       patchRepo(id, { creationReservation: undefined, cloudPending: [], cloudRemovals: [], accountState: scope === 'full' ? 'forked' : 'synced' });
       await publishAccountRecord(managed, accountRecord(managed, managed.uploadTarget!, scope, originForCopy.branch, target.defaultBranch, manifest.latestCommitSha, remoteSha), token);
       if (copiedFiles && purge) await recordUpload(sourceProject, { verified: true, repoId: target.id, owner: target.owner, repo: target.repo, branch: target.defaultBranch, commitSha: remoteSha, htmlUrl: snapshot.htmlUrl }, true, undefined, {}, token, false);
+    await flushCredentials();
     return { message: scope === 'full' ? `完整分叉已验证并加入我的项目，共 ${target.branches?.length || 0} 个分支。` : `当前分支 ${origin.branch} 已保存为独立副本并加入我的项目，后续更新继续使用固定名称。` };
   };
 
   const handleExecuteCreateFork = async (e: React.FormEvent) => {
     e.preventDefault(); if (!singleUploadTargetRepo) return;
-    const token = globalToken || singleUploadTargetRepo.token || prompt('请输入 GitHub Token：')?.trim();
+    const token = globalToken || singleUploadTargetRepo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation(); setIsForking(true);
     try {
       const message = await createProjectCopy(singleUploadTargetRepo, forkScope, forkRepoName, token, singleUploadPurgeCache);
-      setIsSingleUploadModalOpen(false); setCurrentView('projects'); logOperation('分叉', message.skipped ? 'skipped' : 'success', singleUploadTargetRepo, message.message); alert(message.message);
-    } catch (error) { logOperation('分叉', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '创建或验证目标', error); alert('创建副本未完成：' + (error as Error).message); }
+      setIsSingleUploadModalOpen(false); setCurrentView('projects'); logOperation('分叉', message.skipped ? 'skipped' : 'success', singleUploadTargetRepo, message.message); appDialog.notify(message.message);
+    } catch (error) { logOperation('分叉', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '创建或验证目标', error); appDialog.notify('创建副本未完成：' + (error as Error).message); }
     finally { setIsForking(false); setIsLoading(false); }
   };
 
@@ -1927,11 +1967,11 @@ export default config;
     return `分叉 ${target.owner}/${target.repo}：${result.message}`;
   };
   const handleSyncUpstream = async (repo: TrackedRepo) => {
-    const token = repo.forkTarget?.token || repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
+    const token = repo.forkTarget?.token || repo.uploadTarget?.token || globalToken || repo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation();
-    try { const message = await syncProjectUpstream(repo, token); logOperation('同步', 'success', repo, message); alert(message); }
-    catch (error) { logOperation('同步', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '同步上游', error); alert('同步上游未完成：' + (error as Error).message); }
+    try { const message = await syncProjectUpstream(repo, token); logOperation('同步', 'success', repo, message); appDialog.notify(message); }
+    catch (error) { logOperation('同步', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '同步上游', error); appDialog.notify('同步上游未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -1945,12 +1985,12 @@ export default config;
   const handlePushProjectToGitHub = async (e: React.FormEvent) => {
     e.preventDefault(); if (!activeRepo || !pushTargetRepo.trim()) return;
     const token = pushToken.trim() || activeRepo.uploadTarget?.token || globalToken || activeRepo.token;
-    if (!token) return alert('请填写 GitHub Token');
+    if (!token) return appDialog.notify('请填写 GitHub Token');
     startOperation();
     try {
       const prepared = await updateAccountBinding(activeRepo, token);
       const project = prepared.repo;
-      if (prepared.boundOnly) { alert('已比较并固定目标，请再次更新。'); return; }
+      if (prepared.boundOnly) { appDialog.notify('已比较并固定目标，请再次更新。'); return; }
       if (pushCopyMode && (project.uploadTarget || project.forkTarget)) throw new Error('该来源已固定目标，不能再次上传为新副本；请更新或同步已有目标。');
       const version = pushBackupTarget || viewingBackup || undefined;
       const sourceBranch = version?.branch || sourceOf(project).branch;
@@ -1959,7 +1999,7 @@ export default config;
       if (!target) throw new Error('目标仓库未指定');
       if (!project.uploadTarget) {
         const guard = await firstTarget(project, token, 'upload', requested.repo, target);
-        if (guard.skipped) { logOperation('指定仓库首次上传', 'skipped', project, guard.message); alert(guard.message); return; }
+        if (guard.skipped) { logOperation('指定仓库首次上传', 'skipped', project, guard.message); appDialog.notify(guard.message); return; }
       }
       const destinationBranch = !pushCopyMode && project.uploadTarget ? targetForBranch(project, sourceBranch)!.branch : pushTargetBranch.trim() || sourceBranch;
       assertDestinationBranch(project, { ...target, branch: destinationBranch }, sourceBranch);
@@ -1968,8 +2008,8 @@ export default config;
       await recordUpload(project, result, purgePushCacheOption, version, {}, token, !pushCopyMode && (!!project.uploadTarget || !version));
       logOperation('上传指定仓库', 'success', project, '提交及账号记录已验证');
       setIsPushModalOpen(false); setPushBackupTarget(null);
-      alert(`已验证上传 ${files.length} 个文件。${purgePushCacheOption ? '对应版本源码已清理，快照已保留。' : '对应版本源码已保留。'}`);
-    } catch (error) { logOperation('上传指定仓库', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '上传指定分支', error); alert('上传未完成：' + (error as Error).message); }
+      appDialog.notify(`已验证上传 ${files.length} 个文件。${purgePushCacheOption ? '对应版本源码已清理，快照已保留。' : '对应版本源码已保留。'}`);
+    } catch (error) { logOperation('上传指定仓库', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '上传指定分支', error); appDialog.notify('上传未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -2021,20 +2061,20 @@ export default config;
   };
   const handleOneClickUpdate = async (repo: TrackedRepo) => {
     startOperation(); setErrorMsg('');
-    try { const message = await updateProject(repo); logOperation('更新', 'success', repo, message); alert(message); }
-    catch (error) { logOperation('更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取或上传', error); alert('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
+    try { const message = await updateProject(repo); logOperation('更新', 'success', repo, message); appDialog.notify(message); }
+    catch (error) { logOperation('更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取或上传', error); appDialog.notify('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
   const handleDeleteRepo = async (repoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!confirm('确定移除该项目的本地记录和缓存？远程仓库不会删除。')) return;
+    if (!(await appDialog.confirm('确定移除该项目的本地记录和缓存？远程仓库不会删除。'))) return;
     try {
-      await localCache.deleteProjectFiles(repoId);
+      await flushCredentials(); await localCache.deleteProjectFiles(repoId);
       persistRepos(reposRef.current.filter(r => r.id !== repoId));
       setSelectedProjectIds(prev => prev.filter(id => id !== repoId));
       if (activeRepoId === repoId) { setActiveRepoId(null); setCurrentView('projects'); }
-    } catch (error) { alert('删除未完成：' + (error as Error).message); }
+    } catch (error) { appDialog.notify('删除未完成：' + (error as Error).message); }
   };
 
   // ================= BATCH OPERATIONS ON PROJECTS =================
@@ -2043,9 +2083,50 @@ export default config;
     if (repo.origin && repo.forkScope === scope) return repo.uploadTarget?.repo || repo.repo;
     return (scope === 'full' ? source.repo : `${source.owner}-${source.repo}-${source.branch}`).replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 100);
   };
-  const openProjectBatch = (task: 'fork' | 'update' | 'sync') => {
+  const taskContext = (items: Array<{id?:string}>) => items.map(item => {
+    const repo = reposRef.current.find(repo => repo.id === item.id);
+    return { id: item.id, status: 'pending', branch: repo ? sourceOf(repo).branch : undefined, source: repo ? `https://github.com/${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, targetId: repo?.uploadTarget?.id };
+  });
+  const assertTaskContext = (repo: TrackedRepo, kind: 'projects'|'upload') => {
+    const context = (kind === 'projects' ? projectTaskContext : uploadTaskContext).current?.find(item => item.id === repo.id);
+    if (context && (context.branch !== sourceOf(repo).branch || context.source !== `https://github.com/${sourceOf(repo).owner}/${sourceOf(repo).repo}` || (context.targetId !== undefined && context.targetId !== repo.uploadTarget?.id))) throw new Error('项目来源、分支或固定仓库已变化，请重新建立任务，未写入其他分支。');
+  };
+  const saveProjectTask = (items: ProjectBatchItem[]) => checkpoint({ kind: 'projects', action: batchTask!, scope: batchForkScope, purge: batchForkPurge, items: items.map(item => ({ ...projectTaskContext.current?.find(context => context.id === item.id), ...item })) });
+  const saveUploadTask = (items: BatchUploadItemStatus[], purge: boolean) => checkpoint({ kind: 'upload', purge, items: items.map(item => ({ ...uploadTaskContext.current?.find(context => context.id === item.id), ...item })) });
+  const openRecoveredTask = (task: SavedTask) => {
+    if (isLoading || isBatchPublishing || batchTaskLock.current || batchUploadLock.current || importLock.current) { appDialog.notify('请先完成或取消当前任务'); return; }
+    (task.kind === 'projects' ? projectTaskContext : uploadTaskContext).current = task.items;
+    if (task.kind === 'import') {
+      setImportMode('batch'); setBatchLinks(task.items.filter(item => item.url).map(item => `${item.remark || ''} ${item.url}`).join('\n'));
+      setImportResults(task.items.map(item => ({ input: item.url || '无效链接，请重新导入', url: item.url, remark: item.remark, status: item.status as ImportLink['status'], message: item.status === 'error' ? '上次未完成；可重试，远端写入会先核验' : undefined })));
+      setIsAddModalOpen(true);
+    } else if (task.kind === 'release') {
+      const repo = reposRef.current.find(repo => repo.id === task.projectId);
+      if (!repo) { appDialog.notify('原项目已移除，无法继续归档发布；远端记录仍保留。'); return; }
+      releaseContext.current = task.items; setActiveRepoId(repo.id); setCurrentView('workbench');
+      setBatchReleaseTitlePrefix(task.prefix || '归档发布'); setPurgeCacheOption(!!task.purge);
+      setSelectedBackupIds(task.items.map(item => item.id!));
+      setBatchReleaseProgress(task.items.map(item => ({ id: item.id!, tag: item.name || '', status: item.status as BatchReleaseItemStatus['status'], error: item.status === 'cancelled' ? '上次中断，重试前会检查已有 Release 和标签' : undefined })));
+      setIsBatchReleaseModalOpen(true);
+    } else if (task.kind === 'upload') {
+      setBatchUploadStatusList(task.items.map(item => ({ id: item.id!, name: item.name || '', repo: item.repo || '', status: item.status as BatchUploadItemStatus['status'], error: item.status === 'cancelled' ? '上次中断，请重试未完成项' : undefined }))); setIsBatchUploadModalOpen(true);
+    } else {
+      setBatchTask(task.action!); setBatchForkScope(task.scope || 'full'); setBatchForkPurge(!!task.purge); setBatchTaskToken('');
+      setBatchTaskItems(task.items.map(item => ({ id: item.id!, name: item.name || '', label: item.label || item.id!, status: item.status as ProjectBatchItem['status'], message: item.status === 'cancelled' ? '上次中断，请核对后重试' : undefined })));
+    }
+    setRecoveryTasks(tasks => tasks.filter(item => item.kind !== task.kind));
+  };
+  const confirmNewTask = async (kind: SavedTask['kind']) => {
+    try {
+      const existing = readTasks().find(item => item.kind === kind && hasUnfinished(item));
+      if (existing && !await appDialog.confirm('此类型已有未完成任务。建立新任务会替换旧任务的恢复队列，已完成的文件和远端记录会保留。继续？')) return false;
+      setRecoveryTasks(tasks => tasks.filter(item => item.kind !== kind)); return true;
+    } catch (error) { appDialog.notify((error as Error).message); return false; }
+  };
+  const openProjectBatch = async (task: 'fork' | 'update' | 'sync') => {
     const items = reposRef.current.filter(repo => selectedProjectIds.includes(repo.id)).map(repo => ({ id: repo.id, label: `${repo.owner}/${repo.repo} · ${repo.branch}`, name: suggestedCopyName(repo, 'full'), status: 'pending' as const }));
-    if (!items.length) return;
+    if (!items.length || !await confirmNewTask('projects')) return;
+    projectTaskContext.current = taskContext(items);
     setBatchTask(task); setBatchTaskItems(items); setBatchForkScope('full'); setBatchTaskToken(''); setBatchForkPurge(false);
   };
   const startProjectBatch = async (retry = false) => {
@@ -2063,12 +2144,14 @@ export default config;
     }
     try {
       const batchId = crypto.randomUUID();
-      await runProjectBatch(items, { signal, onChange: setBatchTaskItems, onResult: (item, error) => logOperation(`批量${batchTask === 'fork' ? '分叉' : batchTask === 'sync' ? '同步' : '更新'}`, item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === item.id), item.message || '', '批量任务', error, batchId), run: async item => {
+      saveProjectTask(items);
+      await runProjectBatch(items, { signal, onChange: items => { saveProjectTask(items); setBatchTaskItems(items); }, onResult: (item, error) => logOperation(`批量${batchTask === 'fork' ? '分叉' : batchTask === 'sync' ? '同步' : '更新'}`, item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === item.id), item.message || '', '批量任务', error, batchId), run: async item => {
         const repo = reposRef.current.find(project => project.id === item.id);
         if (!repo) throw new Error('项目已移除，未执行');
+        assertTaskContext(repo, 'projects');
         const token = batchTaskToken.trim() || (batchTask === 'sync' ? repo.forkTarget?.token : undefined) || repo.uploadTarget?.token || globalToken || repo.token || '';
         if (batchTask !== 'update' && !token) throw new Error('请填写 GitHub Token 或配置全局 Token 后重试');
-        if (batchTask === 'update') return { message: await updateProject(repo, token) };
+        if (batchTask === 'update') { const message = await updateProject(repo, token); await flushCredentials(); return { message }; }
         const source = sourceOf(repo);
         if (batchTask === 'fork') {
           const sourceKey = `${source.owner}/${source.repo}`.toLowerCase();
@@ -2087,9 +2170,10 @@ export default config;
           const message = await createProjectCopy(repo, batchForkScope, name, token, batchForkPurge);
           if (!message.skipped) seen.add(sourceKey); return message;
         }
-        return { message: await syncProjectUpstream(repo, token, syncedTargets) };
+        const message = await syncProjectUpstream(repo, token, syncedTargets); await flushCredentials(); return { message };
       } });
-    } finally { batchTaskLock.current = false; setBatchTaskRunning(false); }
+    } catch (error) { appDialog.notify('批量任务未完成：' + (error as Error).message); }
+    finally { batchTaskLock.current = false; setBatchTaskRunning(false); }
   };
 
   const handleToggleSelectProject = (id: string, e?: React.MouseEvent) => {
@@ -2119,12 +2203,12 @@ export default config;
 
   // Batch Delete Projects
   const handleBatchDeleteProjects = async () => {
-    if (!selectedProjectIds.length || !confirm('删除所选项目的本地记录和缓存？远程仓库不会删除。')) return;
+    if (!selectedProjectIds.length || !(await appDialog.confirm('删除所选项目的本地记录和缓存？远程仓库不会删除。'))) return;
     try {
-      for (const id of selectedProjectIds) { await localCache.deleteProjectFiles(id); persistRepos(reposRef.current.filter(r => r.id !== id)); }
+      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id); persistRepos(reposRef.current.filter(r => r.id !== id)); }
       if (activeRepoId && selectedProjectIds.includes(activeRepoId)) { setActiveRepoId(null); setCurrentView('projects'); }
       setSelectedProjectIds([]);
-    } catch (error) { alert('部分删除未完成：' + (error as Error).message); }
+    } catch (error) { appDialog.notify('部分删除未完成：' + (error as Error).message); }
   };
 
   // Open Batch Add Tag Modal
@@ -2146,12 +2230,12 @@ export default config;
       try{await publishAccountRecord(next,accountRecord(next,next.uploadTarget,next.forkScope==='full'?'full':next.uploadTarget.kind||'upload',sourceOf(next).branch,next.uploadTarget.branch,next.remoteSnapshot?.sourceSha,next.remoteSnapshot?.commitSha),next.uploadTarget.token||globalToken||next.token||'');}
       catch(error){failed++;logOperation('批量保存标签','partial',next,(error as Error).message,'保存账号资料',error);}
     }
-    setIsBatchTagModalOpen(false);alert(`已保存 ${selected.length} 个项目的本地标签${failed?`，${failed} 个账号记录待重试`: '及已绑定项目的跨设备资料'}。`);
+    setIsBatchTagModalOpen(false);appDialog.notify(`已保存 ${selected.length} 个项目的本地标签${failed?`，${failed} 个账号记录待重试`: '及已绑定项目的跨设备资料'}。`);
   };
 
   // Open Batch Upload Modal
-  const handleOpenBatchUploadModal = () => {
-    if (selectedProjectIds.length === 0) return;
+  const handleOpenBatchUploadModal = async () => {
+    if (selectedProjectIds.length === 0 || !await confirmNewTask('upload')) return;
     const selectedRepos = repos.filter(r => selectedProjectIds.includes(r.id));
     const initialList: BatchUploadItemStatus[] = selectedRepos.map(r => ({
       id: r.id,
@@ -2159,6 +2243,7 @@ export default config;
       repo: r.repo,
       status: 'pending'
     }));
+    uploadTaskContext.current = taskContext(initialList);
     setBatchUploadStatusList(initialList);
     setIsBatchUploadModalOpen(true);
   };
@@ -2166,23 +2251,27 @@ export default config;
   // Execute Batch Upload to User's GitHub Private Repositories
   const handleStartBatchUpload = async (retry = false) => {
     if (batchUploadLock.current) return;
-    const token = globalToken || prompt('请输入 GitHub Token：')?.trim();
-    if (!token) return;
-    const purge = confirm('上传验证成功后是否清理本地源码？\n确定：清理源码并保留快照；取消：保留源码。');
+    batchUploadLock.current = true;
+    const token = globalToken || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
+    if (!token) { batchUploadLock.current = false; return; }
+    const purge = await appDialog.confirm('上传验证成功后是否清理本地源码？快照与历史记录会保留，导出到手机目录的文件不会删除。', { accept: '清理源码', cancel: '保留源码' });
     const queue = batchUploadStatusList.map(item => retry && ['error', 'cancelled'].includes(item.status) ? { ...item, status: 'pending' as const, error: undefined } : { ...item });
     batchUploadLock.current = true; beginGithubOperation(); setIsBatchUploading(true);
     const signal = operationSignal(), batchId = crypto.randomUUID();
     const status = (id: string, value: Partial<BatchUploadItemStatus>, error?: unknown) => {
       const item = queue.find(item => item.id === id)!; Object.assign(item, value);
+      saveUploadTask(queue, purge);
       setBatchUploadStatusList(queue.map(item => ({ ...item })));
       if (['success', 'error', 'skipped', 'cancelled'].includes(item.status)) logOperation('批量上传', item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === id), item.error || '首次上传与账号记录已验证完成', '首次上传', error, batchId);
     };
     try {
+      saveUploadTask(queue, purge);
       for (const item of queue) {
         if (item.status !== 'pending' || signal.aborted) continue;
         const repo = reposRef.current.find(repo => repo.id === item.id);
         try {
           if (!repo) throw new Error('项目已移除');
+          assertTaskContext(repo, 'upload');
           status(repo.id, { status: 'creating', error: undefined });
           const auth = token;
           const guard = await firstTarget(repo, auth, 'upload', item.name);
@@ -2200,16 +2289,17 @@ export default config;
         } catch (error) { status(item.id, { status: signal.aborted ? 'cancelled' : 'error', error: (error as Error).message }, error); }
       }
       for (const item of queue) if (item.status === 'pending') status(item.id, { status: 'cancelled', error: '已取消，尚未执行，可重试' });
-    } finally { batchUploadLock.current = false; setIsBatchUploading(false); }
+    } catch (error) { appDialog.notify('批量上传未完成：' + (error as Error).message); }
+    finally { batchUploadLock.current = false; setIsBatchUploading(false); }
   };
 
   // Batch Purge Local Cache for selected projects
   const handleBatchPurgeCache = async () => {
-    if (!selectedProjectIds.length || !confirm('清理所选项目的本地源码？项目快照和版本记录会保留。')) return;
+    if (!selectedProjectIds.length || !(await appDialog.confirm('清理所选项目的本地源码？项目快照和版本记录会保留。'))) return;
     try {
-      for (const id of selectedProjectIds) { await localCache.deleteProjectFiles(id); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
-      setSelectedProjectIds([]); alert('本地源码已清理，快照已保留。');
-    } catch (error) { alert('缓存清理未完成：' + (error as Error).message); }
+      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
+      setSelectedProjectIds([]); appDialog.notify('本地源码已清理，快照已保留。');
+    } catch (error) { appDialog.notify('缓存清理未完成：' + (error as Error).message); }
   };
 
   // Selection Experience Enhancements for Backups
@@ -2247,8 +2337,8 @@ export default config;
   };
 
   // Open Batch Release Modal
-  const handleOpenBatchReleaseModal = () => {
-    if (!activeRepo || selectedBackupIds.length === 0) return;
+  const handleOpenBatchReleaseModal = async () => {
+    if (!activeRepo || selectedBackupIds.length === 0 || !await confirmNewTask('release')) return;
     const initialList: BatchReleaseItemStatus[] = activeRepo.backups
       .filter(b => selectedBackupIds.includes(b.id))
       .map(b => ({
@@ -2256,102 +2346,80 @@ export default config;
         tag: b.tag,
         status: 'pending'
       }));
+    releaseContext.current = initialList.map(item => {
+      const version = activeRepo.backups.find(version => version.id === item.id)!;
+      return { id: item.id, status: 'pending', name: item.tag, sha: version.commitSha, branch: version.branch, targetId: version.remoteSnapshot?.repoId, targetOwner: version.remoteSnapshot?.owner || activeRepo.owner, targetRepo: version.remoteSnapshot?.repo || activeRepo.repo };
+    });
     setBatchReleaseProgress(initialList);
     setIsBatchReleaseModalOpen(true);
   };
 
   // Execute Batch Release
   const handleStartBatchPublish = async () => {
-    if (!activeRepo) return;
-    let token = activeRepo.token || globalToken;
-    if (!token) {
-      const entered = prompt('请输入您的 GitHub Personal Access Token (PAT)：');
-      if (!entered) return;
-      token = entered.trim();
-    }
-
-    const selectedBackups = activeRepo.backups.filter(b => selectedBackupIds.includes(b.id));
-    beginGithubOperation();
-    setIsBatchPublishing(true);
-
-    let successCount = 0;
-    const updatedBackups = [...activeRepo.backups];
-
-    for (let i = 0; i < selectedBackups.length; i++) {
-      const b = selectedBackups[i];
-      setBatchReleaseProgress(prev => prev.map((item, idx) =>
-        idx === i ? { ...item, status: 'releasing' } : item
-      ));
-
-      try {
-        const releaseBody = `## 🚀 GitVault 自动归档版本: ${b.tag}\n\n- **提交信息**: ${b.commitMessage}\n- **提交作者**: ${b.commitAuthor}\n- **归档时间**: ${new Date(b.backedUpAt).toLocaleString()}\n- **Commit SHA**: \`${b.commitSha}\`\n\n> 本 Release 由 GitVault 批量发布中心自动生成。`;
-        const res = await safeFetchJson('/api/github/release', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            owner: b.remoteSnapshot?.owner || activeRepo.owner,
-            repo: b.remoteSnapshot?.repo || activeRepo.repo,
-            commitSha: b.remoteSnapshot?.commitSha || b.commitSha,
-            tagName: b.tag,
-            releaseName: `${batchReleaseTitlePrefix.trim()} ${b.tag}`,
-            body: releaseBody,
-            token
-          })
-        });
-
-        const targetIdx = updatedBackups.findIndex(x => x.id === b.id);
-        if (targetIdx !== -1) {
-          updatedBackups[targetIdx] = {
-            ...updatedBackups[targetIdx],
-            isReleased: true,
-            releaseUrl: res.releaseUrl,
-            isCachePurged: purgeCacheOption ? true : updatedBackups[targetIdx].isCachePurged,
-            tree: updatedBackups[targetIdx].tree
-          };
+    if (!activeRepo || releaseLock.current) return;
+    releaseLock.current = true;
+    try {
+      const token = activeRepo.uploadTarget?.token || activeRepo.token || globalToken || (await appDialog.prompt('请输入您的 GitHub Personal Access Token (PAT)：'))?.trim();
+      if (!token) return;
+      const repoId = activeRepo.id;
+      const queue = batchReleaseProgress.map(item => ['error','cancelled'].includes(item.status) ? { ...item, status: 'pending' as const, error: undefined } : { ...item });
+      const save = () => {
+        checkpoint({ kind: 'release', projectId: repoId, prefix: batchReleaseTitlePrefix, purge: purgeCacheOption, items: queue.map(item => ({ ...releaseContext.current.find(context => context.id === item.id), id: item.id, name: item.tag, status: item.status })) });
+        setBatchReleaseProgress(queue.map(item => ({ ...item })));
+      };
+      beginGithubOperation(); setIsBatchPublishing(true); save();
+      const signal = operationSignal();
+      for (const item of queue) {
+        if (item.status !== 'pending' || signal.aborted) continue;
+        try {
+          const current = reposRef.current.find(repo => repo.id === repoId);
+          const version = current?.backups.find(version => version.id === item.id);
+          const context = releaseContext.current.find(context => context.id === item.id);
+          if (!current || !version || !context || context.sha !== version.commitSha || context.name !== version.tag) throw new Error('归档版本已变化，请重新选择版本建立发布任务');
+          const owner = version.remoteSnapshot?.owner || current.owner, repository = version.remoteSnapshot?.repo || current.repo;
+          if (owner !== context.targetOwner || repository !== context.targetRepo) throw new Error('归档目标仓库已变化，请重新建立任务');
+          item.status = 'releasing'; item.error = undefined; save();
+          if (context.targetId) await githubClient.repository(owner, repository, token, context.targetId);
+          const body = `GitVault 归档版本: ${version.tag}\n提交: ${version.commitMessage}\n来源 SHA: ${version.commitSha}`;
+          const result = await githubClient.release(owner, repository, version.tag, `${batchReleaseTitlePrefix.trim()} ${version.tag}`, body, token, version.remoteSnapshot?.commitSha || version.commitSha);
+          patchRepo(repoId, { backups: current.backups.map(backup => backup.id === item.id ? { ...backup, isReleased: true, releaseUrl: result.releaseUrl } : backup) });
+          await flushCredentials();
+          if (purgeCacheOption) {
+            await localCache.deleteProjectFiles(repoId, version.commitSha);
+            patchRepo(repoId, { backups: (reposRef.current.find(repo => repo.id === repoId)?.backups || []).map(backup => backup.id === item.id ? { ...backup, isCachePurged: true } : backup) });
+          }
+          item.status = 'success'; item.releaseUrl = result.releaseUrl; save();
+          logOperation('批量归档发布', 'success', current, `已核验 ${version.tag}，保留原提交历史`);
+        } catch (error) {
+          item.status = signal.aborted ? 'cancelled' : 'error'; item.error = (error as Error).message; save();
+          logOperation('批量归档发布', signal.aborted ? 'cancelled' : 'error', activeRepo, item.error, '发布归档', error);
         }
-
-        setBatchReleaseProgress(prev => prev.map((item, idx) =>
-          idx === i ? { ...item, status: 'success', releaseUrl: res.releaseUrl } : item
-        ));
-        if (purgeCacheOption) await localCache.deleteProjectFiles(activeRepo.id, b.commitSha);
-        successCount++;
-      } catch (err: any) {
-        setBatchReleaseProgress(prev => prev.map((item, idx) =>
-          idx === i ? { ...item, status: 'error', error: err.message || '发布失败' } : item
-        ));
       }
-    }
-
-    // Save updated backups to state
-    setRepos(prev => prev.map(r => {
-      if (r.id === activeRepo.id) {
-        return { ...r, backups: updatedBackups };
-      }
-      return r;
-    }));
-
-    setIsBatchPublishing(false);
+      for (const item of queue) if (item.status === 'pending') { item.status = 'cancelled'; item.error = '未执行，可重试'; }
+      save();
+    } catch (error) { appDialog.notify('批量归档发布未完成：' + (error as Error).message); }
+    finally { releaseLock.current = false; setIsBatchPublishing(false); }
   };
 
   // Purge local cache for single backup
   const handlePurgeBackupCache = async (backupId: string, e?: React.MouseEvent) => {
     e?.stopPropagation(); if (!activeRepo) return;
     const backup = activeRepo.backups.find(b => b.id === backupId);
-    if (!backup || !confirm('清理此版本的本地源码？版本快照会保留。')) return;
+    if (!backup || !(await appDialog.confirm('清理此版本的本地源码？版本快照会保留。'))) return;
     try {
-      await localCache.deleteProjectFiles(activeRepo.id, backup.commitSha);
+      await flushCredentials(); await localCache.deleteProjectFiles(activeRepo.id, backup.commitSha);
       patchRepo(activeRepo.id, { backups: activeRepo.backups.map(b => b.id === backupId ? { ...b, isCachePurged: true } : b) });
-    } catch (error) { alert('清理失败：' + (error as Error).message); }
+    } catch (error) { appDialog.notify('清理失败：' + (error as Error).message); }
   };
 
   // Purge local cache for the active project
   const handlePurgeProjectCache = async (repoId: string, e?: React.MouseEvent) => {
-    e?.stopPropagation(); if (!confirm('清理该项目的本地源码？项目快照和历史版本记录会保留。')) return;
+    e?.stopPropagation(); if (!(await appDialog.confirm('清理该项目的本地源码？项目快照和历史版本记录会保留。'))) return;
     try {
-      await localCache.deleteProjectFiles(repoId);
+      await flushCredentials(); await localCache.deleteProjectFiles(repoId);
       patchRepo(repoId, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === repoId)?.backups || []).map(b => ({ ...b, isCachePurged: true })) });
       if (activeRepoId === repoId) { setSelectedFilePath(null); setFileContent(null); }
-    } catch (error) { alert('清理失败：' + (error as Error).message); }
+    } catch (error) { appDialog.notify('清理失败：' + (error as Error).message); }
   };
 
   // Re-pull and restore cache from GitHub for a project
@@ -2361,8 +2429,8 @@ export default config;
     try {
       const files = await versionFiles(repo);
       patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: files.length });
-      alert(`已恢复当前快照的 ${files.length} 个文件；获取新版本请使用更新操作。`);
-    } catch (error) { alert('恢复未完成：' + (error as Error).message); }
+      appDialog.notify(`已恢复当前快照的 ${files.length} 个文件；获取新版本请使用更新操作。`);
+    } catch (error) { appDialog.notify('恢复未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -2398,7 +2466,7 @@ export default config;
   const handleLoadHistory = async () => {
     if (!activeRepo) return;
     const token = activeRepo.uploadTarget?.token || globalToken || activeRepo.token;
-    if (!token) return alert('请先填写 GitHub Token');
+    if (!token) return appDialog.notify('请先填写 GitHub Token');
     startOperation();
     try {
       const target = await boundTarget(activeRepo, token);
@@ -2415,7 +2483,7 @@ export default config;
       }
       patchRepo(activeRepo.id, { backups: [...activeRepo.backups, ...loaded] });
       setHistoryPage(page => page + 1); setHistoryHasMore(entries.length === 30);
-    } catch (error) { logOperation('获取历史', 'error', activeRepo, (error as Error).message, '读取历史', error); alert('获取历史失败：' + (error as Error).message); }
+    } catch (error) { logOperation('获取历史', 'error', activeRepo, (error as Error).message, '读取历史', error); appDialog.notify('获取历史失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
   const handleDownloadVersion = async (version: BackupVersion) => {
@@ -2426,25 +2494,25 @@ export default config;
       const { default: JSZip } = await import('jszip'); const zip = new JSZip();
       for (const file of files) zip.file(file.path, file.content, { base64: file.isBase64 });
       const blob = await zip.generateAsync({ type: 'blob' });
-      const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `${activeRepo.repo}-${version.commitSha.slice(0, 12)}.zip`; link.click(); URL.revokeObjectURL(url);
-    } catch (error) { logOperation('版本下载', 'error', activeRepo, (error as Error).message, '下载历史文件', error); alert('版本下载失败：' + (error as Error).message); }
+      await saveDownload(blob, `${activeRepo.repo}-${version.commitSha.slice(0, 12)}.zip`);
+    } catch (error) { logOperation('版本下载', 'error', activeRepo, (error as Error).message, '下载历史文件', error); appDialog.notify('版本下载失败：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
   const handleRestoreVersion = async (version: BackupVersion) => {
-    if (!activeRepo || !confirm(`将此历史版本恢复到 ${version.branch || sourceOf(activeRepo).branch} 对应的目标分支？会创建新提交，保留之后的全部历史。`)) return;
+    if (!activeRepo || !(await appDialog.confirm(`将此历史版本恢复到 ${version.branch || sourceOf(activeRepo).branch} 对应的目标分支？会创建新提交，保留之后的全部历史。`))) return;
     const token = activeRepo.uploadTarget?.token || globalToken || activeRepo.token;
-    if (!token) return alert('请填写 GitHub Token');
+    if (!token) return appDialog.notify('请填写 GitHub Token');
     startOperation();
     try {
       const prepared = await updateAccountBinding(activeRepo, token); const project = prepared.repo;
-      if (prepared.boundOnly) { alert('目标已比较并绑定，请再次选择恢复版本。'); return; }
+      if (prepared.boundOnly) { appDialog.notify('目标已比较并绑定，请再次选择恢复版本。'); return; }
       const files = await versionFiles(project, version);
       const branch = version.branch || sourceOf(project).branch;
       const result = await pushSnapshot(project, files, token, `Restore historical version ${version.remoteSnapshot?.commitSha || version.commitSha}`, branch);
       const restored = { ...project, latestCommitSha: version.commitSha, tree: version.tree, commitMessage: version.commitMessage, commitAuthor: version.commitAuthor, commitDate: version.commitDate };
       await recordUpload(restored, result, false, branch === sourceOf(project).branch ? undefined : version, {}, token);
-      alert(`历史版本已恢复为目标分支 ${result.branch} 的新提交，原有历史全部保留。`);
-    } catch (error) { logOperation('恢复版本', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '恢复目标分支', error); alert('恢复未完成，本地文件保留：' + (error as Error).message); }
+      appDialog.notify(`历史版本已恢复为目标分支 ${result.branch} 的新提交，原有历史全部保留。`);
+    } catch (error) { logOperation('恢复版本', operationSignal().aborted ? 'cancelled' : 'error', activeRepo, (error as Error).message, '恢复目标分支', error); appDialog.notify('恢复未完成，本地文件保留：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
 
@@ -2472,7 +2540,7 @@ export default config;
         return r;
       }));
     } catch (err) {
-      alert('日志生成失败：' + (err as Error).message);
+      appDialog.notify('日志生成失败：' + (err as Error).message);
     } finally {
       setAiLoading(false);
     }
@@ -2674,18 +2742,11 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 `);
 
       const blobContent = await zip.generateAsync({ type: 'blob' });
-      const blobUrl = URL.createObjectURL(blobContent);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = `${projectSettingsTarget.repo}-${cleanFolderName}-apk-export.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(blobUrl);
+      await saveDownload(blobContent, `${projectSettingsTarget.repo}-${cleanFolderName}-apk-export.zip`);
 
-      alert(`自选文件夹 [${selectedFolderToDownload}] 打包下载成功！\n成功提取 ${fetchedCount} 个文件，已适配移动端/APK离线目录规范。`);
+      appDialog.notify(`自选文件夹 [${selectedFolderToDownload}] 打包下载成功！\n成功提取 ${fetchedCount} 个文件，已适配移动端/APK离线目录规范。`);
     } catch (err: any) {
-      alert('打包下载文件夹失败: ' + err.message);
+      appDialog.notify('打包下载文件夹失败: ' + err.message);
     } finally {
       setIsDownloadingFolder(false);
       setIsLoading(false);
@@ -2755,6 +2816,15 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
   return (
     <div className="app-shell min-h-screen bg-[#F8F6F1] text-[#2E2B27] flex flex-col font-sans selection:bg-[#9CB09D] selection:text-white pb-24 md:pb-20">
+      <AppDialogs onLogs={() => setIsLogOpen(true)} />
+      {!!recoveryTasks.length && <div className="mx-3 mt-3 rounded-2xl border border-[#DFD8CE] bg-[#FAF8F5] p-3 text-xs text-[#554F45]" role="status">
+        <p>发现上次未完成的批量任务。已完成项会保留，重新检查固定目标后可手动重试。</p>
+        {recoveryTasks.map(task => <div key={task.kind} className="mt-2 flex flex-wrap gap-2 items-center">
+          <span>{task.kind === 'import' ? '批量导入' : task.kind === 'upload' ? '批量上传' : task.kind === 'release' ? '批量归档发布' : task.action === 'fork' ? '批量分叉' : task.action === 'sync' ? '批量分叉同步' : '批量更新'} · {task.items.filter(item => !['success','skipped'].includes(item.status)).length} 项未完成</span>
+          <button type="button" onClick={() => openRecoveredTask(task)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl">查看并继续</button>
+          <button type="button" onClick={async () => { if (await appDialog.confirm('移除这个任务的恢复记录？已下载文件、仓库绑定和远端提交仍会保留。')) { forgetTask(task.kind); setRecoveryTasks(items => items.filter(item => item.kind !== task.kind)); } }} className="px-3 py-2 text-[#8C5D54]">移除恢复记录</button>
+        </div>)}
+      </div>}
       {/* Top Navbar */}
       <header className="app-header border-b border-[#E5DFD7] bg-[#FFFFFF]/90 backdrop-blur sticky top-0 z-30 px-4 md:px-8 py-3 flex flex-row items-center justify-between shadow-xs">
         <div className="flex flex-row items-center gap-4 md:gap-8">
@@ -4174,11 +4244,11 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               <div className="bg-[#FAF8F5] p-3 rounded-xl border border-[#DFD8CE] text-[11px] text-[#6B6358] leading-relaxed">
                 {isApkEnvironment ? (
                   <span className="text-[#3D4F3A] font-medium">
-                    📱 已处于 APK 原生运行环境：拉取时将自动落盘存储至本地目录 <code>{apkDownloadDirectory}</code>。
+                    📱 已处于 APK 原生环境：源码保存到应用缓存，已授权目录可额外导出 <code>{apkDownloadDirectory}</code>。
                   </span>
                 ) : (
                   <span>
-                    🌐 网页端提示：受浏览器安全沙箱限制，直接拉取项目进入本地高速持久化缓存；打包为 APK 后拉取将自动直接下载落盘至系统目录。
+                    🌐 网页端提示：受浏览器安全沙箱限制，直接拉取项目进入本地高速持久化缓存；APK 可通过系统选择器授权导出目录；默认保存在应用缓存。
                   </span>
                 )}
               </div>
@@ -4390,10 +4460,10 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
             <p className="text-[#7A7367]">{entry.project}{entry.branch ? ` · ${entry.branch}` : ''}{entry.target ? ` → ${entry.target}` : ''}{entry.stage ? ` · ${entry.stage}` : ''}{entry.httpStatus ? ` · HTTP ${entry.httpStatus}` : ''}</p>
             <p className="whitespace-pre-wrap break-words text-[#8C5D54]">{entry.message}</p>
           </div>)}{!operationLogs.length && <p className="text-xs text-[#7A7367]">暂无操作记录</p>}</div>
-          <div className="flex flex-wrap justify-end gap-2"><button type="button" onClick={() => {
-            const url = URL.createObjectURL(new Blob([JSON.stringify(operationLogs, null, 2)], {type:'application/json'}));
-            const link = document.createElement('a'); link.href = url; link.download = 'gitvault-operation-logs.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-          }} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl text-xs">导出日志</button><button type="button" onClick={() => { if (confirm('清空本设备的操作日志？')) { clearOperationLogs(); setLogStorageError(''); } }} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-xs">清空日志</button></div>
+          <div className="flex flex-wrap justify-end gap-2"><button type="button" onClick={async () => {
+            try { await saveDownload(new Blob([JSON.stringify(operationLogs, null, 2)], {type:'application/json'}), 'gitvault-operation-logs.json'); }
+            catch (error) { appDialog.notify('日志导出未完成：' + (error as Error).message); }
+          }} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl text-xs">导出日志</button><button type="button" onClick={async () => { if ((await appDialog.confirm('清空本设备的操作日志？'))) { clearOperationLogs(); setLogStorageError(''); } }} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-xs">清空日志</button></div>
         </div>
       </div>}
 
@@ -4486,7 +4556,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                         <CheckCircle className="w-3.5 h-3.5 shrink-0" /> 成功
                       </span>
                     )}
-                    {item.status === 'error' && (
+                    {(item.status === 'error' || item.status === 'cancelled') && (
                       <span className="text-[#B6847A] font-semibold flex flex-row items-center gap-1" title={item.error}>
                         <AlertCircle className="w-3.5 h-3.5 shrink-0" /> 失败
                       </span>
@@ -4747,7 +4817,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     <div className="flex flex-col gap-1">
                       <span className="font-bold text-[#2B2723]">已检测到 Android APK 原生环境</span>
                       <p className="text-[11px] text-[#474239] leading-relaxed">
-                        新建链接拉取项目时，系统将直接调用文件系统下载并落盘保存至下方设定的本地存储目录中。
+                        源码缓存保存在应用内部空间。选择系统目录并授权后，新导入会额外导出项目文件；缓存清理不会删除这些导出文件。
                       </p>
                     </div>
                   </div>
@@ -4757,7 +4827,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     <div className="flex flex-col gap-1">
                       <span className="font-bold text-[#6F342B]">网页端运行环境提示</span>
                       <p className="text-[11px] text-[#554F45] leading-relaxed">
-                        当前运行在 Web 浏览器环境中，受现代浏览器安全沙箱限制，无法直接调用手机 Android 本地原生文件目录；新建链接拉取时将自动保存在应用高速离线存储与文件流中。<strong>在打包为 APK 客户端运行后，该功能将自动激活，直接落盘至您设定的目录。</strong>
+                        当前运行在 Web 浏览器环境中，受现代浏览器安全沙箱限制，无法直接调用手机 Android 本地原生文件目录；新建链接拉取时将自动保存在应用高速离线存储与文件流中。<strong>Android 安装包需接入原生文件插件，并由用户通过系统选择器授权目录。</strong>
                       </p>
                     </div>
                   </div>
@@ -4767,28 +4837,27 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <label className="text-xs font-semibold text-[#474239]">APK 本地存储下载目录</label>
                   <input
                     type="text"
-                    value={apkDownloadDirectory}
-                    onChange={e => setApkDownloadDirectory(e.target.value)}
-                    placeholder="/storage/emulated/0/Download/GitVault"
+                    value={apkDownloadDirectory.startsWith('content://') ? apkDownloadDirectory : ''}
+                    readOnly
+                    placeholder="尚未选择；默认仅保存在应用内部空间"
                     className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27] focus:outline-none focus:border-[#8E9F8B] font-mono"
                   />
                   <p className="text-[11px] text-[#91887C] leading-relaxed">
-                    在打包为 Android APK 运行时，新建拉取链接将直接存储到此路径。常用路径推荐：<code>/storage/emulated/0/Download/GitVault</code> 或 <code>/sdcard/Documents/GitVault</code>。
+                    目录必须通过系统选择器授权。项目按账号、仓库、分支和提交分别导出；符号链接按文本保存，文件模式保留在导出清单。仅选择目录不会导出现有项目。
                   </p>
                 </div>
 
                 <div className="flex flex-row justify-end pt-3 border-t border-[#EDE7DF] whitespace-nowrap">
                   <button
                     type="button"
-                    onClick={() => {
-                      localStorage.setItem('gitvault_apk_download_dir', apkDownloadDirectory.trim());
-                      alert('APK 存储目录已保存！打包为 APK 后将生效。');
-                      setIsSettingsModalOpen(false);
-                    }}
+                    disabled={!hasNativeFiles()}
+                    onClick={chooseApkDirectory}
                     className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold shadow-xs whitespace-nowrap shrink-0"
                   >
-                    保存目录设定
+                    选择并授权目录
                   </button>
+                  {isApkEnvironment && <button type="button" disabled={!activeRepo || !apkDownloadDirectory.startsWith('content://') || isLoading} onClick={exportCurrentProject} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-xs disabled:opacity-40">导出当前项目</button>}
+                  {apkDownloadDirectory && <button type="button" onClick={() => { localStorage.removeItem('gitvault_apk_download_dir'); setApkDownloadDirectory(''); }} className="px-3 py-2 text-xs text-[#7A7367]">停止自动导出</button>}
                 </div>
               </div>
             )}
@@ -4833,7 +4902,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               />
             </div>
 
-            
+
             {/* Progress list */}
             <div className="max-h-56 overflow-y-auto flex flex-col gap-2 border border-[#E5DFD7] rounded-xl p-3 bg-[#FAF8F5]">
               {batchReleaseProgress.map(item => (
@@ -4851,7 +4920,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                         <CheckCircle className="w-3.5 h-3.5 shrink-0" /> 成功
                       </span>
                     )}
-                    {item.status === 'error' && (
+                    {(item.status === 'error' || item.status === 'cancelled') && (
                       <span className="text-[#B6847A] font-semibold flex flex-row items-center gap-1" title={item.error}>
                         <AlertCircle className="w-3.5 h-3.5 shrink-0" /> 失败
                       </span>
@@ -4877,8 +4946,9 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 onClick={handleStartBatchPublish}
                 className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold shadow-xs whitespace-nowrap shrink-0 disabled:opacity-40"
               >
-                {isBatchPublishing ? '正在批量发布...' : '开始批量发布'}
+                {isBatchPublishing ? '正在批量发布...' : batchReleaseProgress.some(item => ['error','cancelled'].includes(item.status)) ? '重试未完成发布' : '开始批量发布'}
               </button>
+              {isBatchPublishing && <button type="button" onClick={cancelGithubOperation} className="px-3 py-2 border border-[#DFD8CE] text-[#8C5D54] rounded-xl text-xs">取消剩余发布</button>}
             </div>
           </div>
         </div>

@@ -533,7 +533,19 @@ export const githubClient = {
       while (tag.object.type === 'tag') tag = { object: await json(`${root(owner, repo)}/git/tags/${tag.object.sha}`, token).then(t => t.object) };
       if (tag.object.sha !== commitSha) throw new Error('该标签已指向其他版本，请更换标签名称');
     } catch (error) { if (!(error instanceof GitHubError) || error.status !== 404) throw error; }
-    const release = await json(`${root(owner, repo)}/releases`, token, body('POST', { tag_name: tagName, name: releaseName || tagName, body: releaseBody, target_commitish: commitSha, draft: false, prerelease: false }));
+    let release;
+    try {
+      release = await json(`${root(owner, repo)}/releases`, token, body('POST', { tag_name: tagName, name: releaseName || tagName, body: releaseBody, target_commitish: commitSha, draft: false, prerelease: false }));
+    } catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 422) throw error;
+      // A previous attempt may have succeeded before the app stopped. Verify the
+      // tag again (including annotated tags) before accepting an existing Release.
+      let tag = await json(`${root(owner, repo)}/git/ref/tags/${refPath(tagName)}`, token);
+      while (tag.object.type === 'tag') tag = { object: await json(`${root(owner, repo)}/git/tags/${tag.object.sha}`, token).then(value => value.object) };
+      if (tag.object.sha !== commitSha) throw new Error('该标签已指向其他版本，请更换标签名称');
+      release = await json(`${root(owner, repo)}/releases/tags/${refPath(tagName)}`, token);
+      if (release.tag_name !== tagName) throw new Error('已有 Release 标签不一致，未标记成功');
+    }
     return { success: true, releaseUrl: release.html_url, tagName: release.tag_name };
   },
 };
