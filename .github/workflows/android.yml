@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: android-${{ github.ref }}
@@ -27,6 +27,9 @@ jobs:
     env:
       GITVAULT_VERSION_CODE: ${{ github.run_number }}
       GITVAULT_VERSION_NAME: 1.0.${{ github.run_number }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,6 +53,20 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
           log-accepted-android-sdk-licenses: false
+      - name: Prepare release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+            umask 077
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/gitvault-release.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/gitvault-release.jks" >> "$GITHUB_ENV"
+          fi
       - name: Build and check test APK
         working-directory: android
         run: |
@@ -84,20 +101,6 @@ jobs:
             android-device-screenshots/
             android/app/build/reports/androidTests/
             android/app/build/outputs/androidTest-results/
-      - name: Prepare release signing
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        shell: bash
-        run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
-            umask 077
-            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/gitvault-release.jks"
-            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/gitvault-release.jks" >> "$GITHUB_ENV"
-          fi
       - name: Build release APK
         working-directory: android
         env:
@@ -111,6 +114,16 @@ jobs:
           name: GitVault-release-apk
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+      - name: Publish fixed-signature APK update channel
+        if: env.ANDROID_KEYSTORE_PATH != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android-update
+          cp android/app/build/outputs/apk/debug/app-debug.apk android-update/GitVault-debug.apk
+          cp android/app/build/outputs/apk/release/app-release.apk android-update/GitVault-release.apk
+          node scripts/create-update-manifests.mjs
+          gh release create "android-v$GITVAULT_VERSION_NAME" android-update/* --prerelease --title "GitVault Android $GITVAULT_VERSION_NAME" --notes "固定签名更新包。应用内检查更新、下载后由 Android 确认覆盖安装，保留应用数据。"
       - name: Remove temporary signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/gitvault-release.jks"
@@ -118,7 +131,7 @@ jobs:
         shell: bash
         run: |
           echo '### GitVault Android' >> "$GITHUB_STEP_SUMMARY"
-          echo 'GitVault-test-apk 是可安装的测试包，包名 com.gitvault.app.debug。' >> "$GITHUB_STEP_SUMMARY"
+          echo 'GitVault-test-apk 为测试包，包名 com.gitvault.app.debug；只有配置固定签名的构建才支持持续覆盖更新。' >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$ANDROID_KEYSTORE_PATH" ]; then
             echo 'GitVault-release-apk 已使用配置的签名生成；后续升级必须继续使用同一签名。' >> "$GITHUB_STEP_SUMMARY"
           else

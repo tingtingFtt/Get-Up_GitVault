@@ -10,3 +10,5 @@ collect_screenshots() {
 trap collect_screenshots EXIT
 cd "$project_root/android"
 ./gradlew --no-daemon :app:connectedDebugAndroidTest
+
+bash "$project_root/scripts/test-android-upgrade.sh"

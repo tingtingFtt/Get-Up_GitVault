@@ -91,3 +91,23 @@ cd android
 自动验证包括异步弹窗取消／输入、凭证迁移失败、文件路径与二进制导出、取消清理暂存、队列中断恢复、分支变化阻止续办、Release 重试及原有同步用例。响应式检查覆盖新增弹窗和恢复界面。
 
 仍需真机验收：系统目录授权及撤销、横屏键盘、返回键、后台切回／进程结束后的续办、签名升级保留数据，以及真实账号双设备导入和对应分支更新。测试不使用用户 Token 创建验收仓库。
+
+
+## 应用内更新与覆盖安装
+
+设置 → APK 下载存储目录 → 应用更新，可以检查版本、下载安装包、取消下载以及打开 Android 安装界面。默认启动检查，自动下载可单独开启；下载交给 Android DownloadManager，可跨页面和重启继续。系统可能因网络或电量暂停，恢复网络后由 DownloadManager 续办。应用不会静默安装，首次可能需要允许“安装未知应用”，授权返回后再次点击安装。
+
+仅从本项目的 HTTPS Release 下载 APK；安装前核对 SHA-256、大小、包名、更高 versionCode 和与当前安装相同的签名，防止安装错误渠道、旧版本或其他证书的包。使用安装器覆盖保留原有应用数据。只有检查状态，不会自动卸载应用。
+
+### 必须一次配置固定签名
+
+以前每个 Actions runner 临时生成的 debug key 无法从 APK 恢复，所以旧包不能通过代码变成同签名；迁移到固定签名包可能需要先导出记录与源码，再卸载旧测试包。新包配置以下 repository Actions Secrets 后，debug 和 release 各自固定包名并一直使用同一密钥：
+
+- ANDROID_KEYSTORE_BASE64：你自己保管的密钥库的 Base64。
+- ANDROID_KEYSTORE_PASSWORD：密钥库密码。
+- ANDROID_KEY_ALIAS：签名别名。
+- ANDROID_KEY_PASSWORD：密钥密码。
+
+不要把私钥提交到仓库、放进公共缓存或发布到 Release。公开的证书摘要不包含私钥。未配置 Secrets 时仍构建普通测试 APK、正式 APK 为 unsigned，但**不发布自动更新渠道，不承诺跨构建覆盖**。GitHub 连接器不提供 Secrets 写入能力，因此本次代码不能替你完成仓库签名密钥的配置。
+
+配置完成后，main 构建通过回归、Android Git/界面检查和覆盖安装保留数据检查，再发布 android-v1.0.N 的预发布 Release，包含 GitVault-debug.apk、GitVault-release.apk 及 SHA-256 清单。Pages 在 Android workflow 完成后重新部署，将经过校验的清单放到 android/latest-debug.json 和 android/latest-release.json。用户只需点击应用内更新，无需填写服务地址或 Token。不要删除现用密钥或重置工作流 versionCode。

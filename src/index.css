@@ -52,3 +52,25 @@ html, body, #root { width: 100%; min-width: 0; margin: 0; }
   .app-shell .grid-cols-2 { grid-template-columns: minmax(0, 1fr); }
   .app-shell button { font-size: .6875rem; }
 }
+
+/* A single compact header row; secondary actions remain in existing navigation. */
+.app-shell .app-header { flex-wrap: nowrap; gap: .5rem; padding: .4rem 1rem; min-height: 3rem; }
+.app-shell .app-header .header-brand-nav, .app-shell .app-header .header-brand, .app-shell .app-header .header-actions { flex-wrap: nowrap; }
+.app-shell .app-header .header-brand-nav { flex: 1 1 auto; gap: .75rem; }
+.app-shell .app-header .header-brand { gap: .4rem; flex: 0 1 auto; }
+.app-shell .app-header .header-actions { flex: 0 0 auto; gap: .375rem; }
+.app-shell .app-header .header-logo { width: 2rem; height: 2rem; border-radius: .75rem; font-size: .875rem; }
+.app-shell .app-header .header-title > span:first-child { font-size: .875rem; white-space: nowrap; }
+.app-shell .app-header .header-title > span:last-child { display: none; }
+.app-shell .app-header button { white-space: nowrap; padding: .4rem .55rem; font-size: .6875rem; }
+.app-shell .app-header button > span { white-space: nowrap; overflow-wrap: normal; }
+.app-shell .app-header .header-add-short { display: none; }
+@media (max-width: 639px) {
+ .app-shell .app-header { padding: .375rem .5rem; gap: .35rem; }
+ .app-shell .app-header .header-actions { gap: .25rem; }
+ .app-shell .app-header .header-add-full { display: none; }
+ .app-shell .app-header .header-add-short { display: inline; }
+ .app-shell .app-header button { padding: .4rem .45rem; font-size: .625rem; }
+ .app-shell .app-header .header-title > span:first-child { font-size: .8125rem; }
+}
+@media (max-width: 359px) { .app-shell .app-header .header-logo { width: 1.75rem; height: 1.75rem; font-size: .75rem; } }

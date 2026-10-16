@@ -65,7 +65,7 @@ test('primary exhaustion honors the later reset and Retry-After also accepts an 
   }
 });
 test('bounded rate retries leave the cooldown in force for subsequent operations', async () => {
-  const f = fixture();
+  const f = fixture({ retries: 2 });
   f.handle(async () => ok({ message: 'secondary rate limit' }, 403));
   await assert.rejects(f.request(), error => error instanceof GitHubError && error.rateLimited && error.retryAt === origin + 420000);
   assert.equal(f.calls.length, 3);
@@ -123,4 +123,11 @@ test('invalid persisted deadlines cannot trap the queue indefinitely', async () 
   localStorage.setItem('gitvault_github_last_write_v1', 'invalid');
   const f = fixture({ shareAcrossTabs: true }); await f.request('PUT');
   assert.equal(f.calls.length, 1); assert.equal(f.sleeps.length, 0);
+});
+
+test('production policy survives more than two rate rejections and resumes the same operation', async()=>{
+ const f=fixture();let count=0;
+ f.handle(async()=>++count<=5?ok({message:'secondary rate limit'},403):ok({saved:true}));
+ const response=await f.request('POST');assert.equal(response.status,200);assert.equal(f.calls.length,6);
+ assert.deepEqual(f.calls.map(call=>call.at-origin),[0,60000,180000,420000,900000,1860000]);
 });

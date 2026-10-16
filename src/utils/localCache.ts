@@ -61,9 +61,13 @@ export const transferCache = {
     });
   },
   async save(transfer: string, commitSha: string, file: CachedFile): Promise<void> {
+    return transferCache.saveBatch(transfer, commitSha, [file]);
+  },
+  async saveBatch(transfer: string, commitSha: string, files: CachedFile[]): Promise<void> {
+    if (!files.length) return;
     await withDB(async db => {
       const tx = db.transaction(TRANSFERS, 'readwrite'); const done = completed(tx);
-      tx.objectStore(TRANSFERS).put({ id: `${transfer}:${file.path}`, transfer, commitSha, file });
+      for (const file of files) tx.objectStore(TRANSFERS).put({ id: `${transfer}:${file.path}`, transfer, commitSha, file });
       await done;
     });
   },

@@ -4,6 +4,10 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Build Android APK"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -45,6 +49,11 @@ jobs:
 
       - name: Build
         run: npm run build -- --base=/Get-Up_GitVault/
+
+      - name: Include published APK update feeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-update-feed.mjs
 
       - name: Check build output
         run: test -f dist/index.html

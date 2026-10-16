@@ -450,7 +450,7 @@ async function waitFor(check: () => boolean) {
 }
 
 async function click(text: string) {
-  const button = buttons().find(b => b.textContent?.trim() === text);
+  const button = buttons().find(b => b.textContent?.trim() === text || b.getAttribute('aria-label') === text);
   assert.ok(button, `Missing button ${text}`);
   await act(async () => { button.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
 }

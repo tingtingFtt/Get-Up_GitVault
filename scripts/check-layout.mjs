@@ -80,11 +80,12 @@ const failures = []; let checks = 0;
 const pause = () => new Promise(resolve => setTimeout(resolve, 60));
 function buttons(doc) { return [...doc.querySelectorAll('button')]; }
 async function click(doc, text) {
-  const button = buttons(doc).find(button => button.textContent.trim() === text);
+  const button = buttons(doc).find(button => button.textContent.trim() === text || button.getAttribute('aria-label') === text);
   if (!button) throw new Error('Missing control: ' + text);
   button.click(); await pause();
 }
 function inspect(doc, width, scenario) {
+  const header=doc.querySelector('.app-header'); if(header&&header.getBoundingClientRect().height>58) failures.push({width,scenario,issue:'header too tall',actual:header.getBoundingClientRect().height});
   if (doc.documentElement.scrollWidth > width + 1) failures.push({width, scenario, issue:'document overflow', actual:doc.documentElement.scrollWidth});
   for (const el of doc.querySelectorAll('button,input,textarea,select,p,h1,h2,h3,label,a,.workbench-banner,.batch-toolbar')) {
     const rect = el.getBoundingClientRect();

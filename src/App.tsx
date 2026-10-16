@@ -1,3 +1,4 @@
+import AppUpdates, { openAppUpdater } from './components/AppUpdates';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   GitBranch, FolderGit2, RefreshCw, History, Tag, Download,
@@ -2847,18 +2848,19 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
           <button type="button" onClick={async () => { if (await appDialog.confirm('移除这个任务的恢复记录？已下载文件、仓库绑定和远端提交仍会保留。')) { forgetTask(task.kind); setRecoveryTasks(items => items.filter(item => item.kind !== task.kind)); } }} className="px-3 py-2 text-[#8C5D54]">移除恢复记录</button>
         </div>)}
       </div>}
+      <AppUpdates />
       {/* Top Navbar */}
       <header className="app-header border-b border-[#E5DFD7] bg-[#FFFFFF]/90 backdrop-blur sticky top-0 z-30 px-4 md:px-8 py-3 flex flex-row items-center justify-between shadow-xs">
-        <div className="flex flex-row items-center gap-4 md:gap-8">
+        <div className="header-brand-nav flex flex-row items-center gap-4 md:gap-8">
           <div
-            className="flex flex-row items-center gap-3 cursor-pointer group"
+            className="header-brand flex flex-row items-center gap-3 cursor-pointer group"
             onClick={() => { setCurrentView('dashboard'); setActiveRepoId(null); setViewingBackup(null); }}
           >
-            <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-[#8E9F8B] via-[#A3B4A0] to-[#C7A39B] flex items-center justify-center shadow-sm text-white font-serif font-bold text-lg tracking-wide border border-[#8E9F8B]/40 group-hover:scale-105 transition shrink-0">
+            <div className="header-logo w-10 h-10 rounded-2xl bg-gradient-to-tr from-[#8E9F8B] via-[#A3B4A0] to-[#C7A39B] flex items-center justify-center shadow-sm text-white font-serif font-bold text-lg tracking-wide border border-[#8E9F8B]/40 group-hover:scale-105 transition shrink-0">
               GV
             </div>
             {/* Perfectly stacked: 智能管家 aligned directly underneath GitVault */}
-            <div className="flex flex-col items-start justify-center">
+            <div className="header-title flex flex-col items-start justify-center">
               <span className="text-base md:text-lg font-bold tracking-tight text-[#2B2723] font-serif leading-none whitespace-nowrap">
                 GitVault
               </span>
@@ -2896,13 +2898,13 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         </div>
 
         {/* Right Actions - Single horizontal line */}
-        <div className="flex flex-row items-center gap-2.5 whitespace-nowrap">
+        <div className="header-actions flex flex-row items-center gap-2.5 whitespace-nowrap">
           {/* Quick Connection Test Button */}
           <button
             onClick={() => handleTestGitHubConnection(globalToken)}
             disabled={testStatus === 'testing'}
             className="hidden sm:flex flex-row items-center gap-1.5 px-3 py-1.5 bg-[#FAF8F5] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] shadow-xs transition disabled:opacity-50 whitespace-nowrap shrink-0"
-            title="一键测试当前配置的 GitHub Token 连通性与 API 额度"
+            aria-label="测试连接" title="一键测试当前配置的 GitHub Token 连通性与 API 额度"
           >
             {testStatus === 'testing' ? (
               <Loader2 className="w-3.5 h-3.5 text-[#8E9F8B] animate-spin shrink-0" />
@@ -2913,18 +2915,18 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
           </button>
 
           <button
-            onClick={() => setIsAddModalOpen(true)}
+            aria-label="新建链接/拉取项目" onClick={() => setIsAddModalOpen(true)}
             className="flex flex-row items-center gap-1.5 px-3.5 py-1.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] hover:brightness-105 text-white rounded-xl text-xs font-semibold shadow-xs transition whitespace-nowrap shrink-0"
           >
             <Plus className="w-3.5 h-3.5 shrink-0" />
-            <span>新建链接/拉取项目</span>
+            <span className="header-add-full">新建链接/拉取项目</span><span className="header-add-short">新建</span>
           </button>
 
           <button type="button" onClick={() => setIsLogOpen(true)} className="px-3 py-2 bg-white border border-[#DFD8CE] text-[#554F45] rounded-xl text-xs">操作日志</button>
           <button
             onClick={() => setIsSettingsModalOpen(true)}
             className="p-2 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#554F45] rounded-xl border border-[#DFD8CE] shadow-xs transition shrink-0"
-            title="系统设置、备份恢复与 APK 本地目录"
+            aria-label="系统设置" title="系统设置、备份恢复与 APK 本地目录"
           >
             <Settings className="w-4 h-4 shrink-0" />
           </button>
@@ -4773,11 +4775,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
                 <div className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-2xl p-3 flex flex-col gap-2">
                   <label className="font-semibold text-[#474239]" htmlFor="git-transfer-mode">源码传输方式</label>
-                  <select id="git-transfer-mode" aria-label="源码传输方式" value={gitSettings.mode} onChange={e => setGitSettings({...gitSettings,mode:e.target.value as 'rest'|'git'})} className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]">
-                    <option value="rest">GitHub REST API（无需额外服务）</option>
+                  <select id="git-transfer-mode" aria-label="源码传输方式" value={gitSettings.mode} onChange={e => setGitSettings({...gitSettings,mode:e.target.value as 'rest'|'git'|'native'})} className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]">
+                    <option value="rest">GitHub REST API（合并文本上传，无需额外服务）</option>
+                    {isApkEnvironment&&<option value="native">APK 原生 Git（直连 GitHub，无需服务）</option>}
                     <option value="git">Git 推送／拉取（使用自有服务）</option>
                   </select>
-                  <p className="text-[11px] text-[#7A7367] leading-relaxed">当前选择：{gitSettings.mode==='git'?'Git 服务传输源码；仓库管理继续使用 GitHub API。':'GitHub API 传输，已启用限速与暂停重试。'}</p>
+                  <p className="text-[11px] text-[#7A7367] leading-relaxed">当前选择：{gitSettings.mode==='native'?'APK 原生 Git 直接拉取和推送源码，无需填写服务地址。':gitSettings.mode==='git'?'Git 服务传输源码；仓库管理继续使用 GitHub API。':'GitHub API 传输，已启用限速与暂停重试。'}</p>
                   {gitSettings.mode==='git' && <>
                     <label className="font-semibold text-[#474239]" htmlFor="git-service-url">Git 服务地址</label>
                     <input id="git-service-url" aria-label="Git 服务地址" type="url" value={gitSettings.url} onChange={e=>setGitSettings({...gitSettings,url:e.target.value})} placeholder="https://git.example.com" className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]" />
@@ -4848,6 +4851,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
             {/* TAB 3: APK DOWNLOAD DIRECTORY */}
             {settingsTab === 'apk' && (
               <div className="flex-1 overflow-y-auto flex flex-col gap-4 text-xs pr-1">
+                {isApkEnvironment&&<button type="button" onClick={openAppUpdater} className="px-3 py-2 border border-[#DFD8CE] rounded-xl bg-[#FAF8F5] text-[#4D5E4A]">应用更新 · 检查、下载与覆盖安装</button>}
                 {/* APK Environment Status Alert */}
                 {isApkEnvironment ? (
                   <div className="bg-[#8E9F8B]/20 border border-[#8E9F8B]/30 p-4 rounded-2xl flex flex-row items-start gap-3">

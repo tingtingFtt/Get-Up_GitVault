@@ -554,3 +554,17 @@ test('all-branch synchronization replaces file snapshots and appends target hist
   const parents = calls.filter(c => c.path.endsWith('/git/commits') && c.init.method === 'POST').map(c => JSON.parse(c.init.body as string).parents);
   assert.deepEqual(parents, [['old-main'], ['old-feature']]);
 });
+
+test('UTF-8 source snapshots combine text in a single verified tree request without per-file blob writes',async()=>{
+ const {gitTreeSha}=await import('../src/utils/gitFiles');
+ const files=[file('a.txt','a'),file('dir/中文.txt','中文\n'),{...file('run.sh','echo hi\n'),mode:'100755'},file('z.txt','z')];
+ const treeSha=await gitTreeSha(files.map(f=>({path:f.path,mode:f.mode!,sha:f.sha!})));destination();const base=handler;
+ handler=(path,init)=>path.endsWith('/git/trees')?response({sha:treeSha}):path.endsWith('/git/commits/new-commit')?response({tree:{sha:treeSha}}):base(path,init);
+ const result=await githubClient.push('me','backup','release','token',files,'batch');assert.equal(result.verified,true);
+ assert.equal(calls.filter(c=>c.path.endsWith('/git/blobs')).length,0);
+ const body=JSON.parse(String(calls.find(c=>c.path.endsWith('/git/trees'))!.init.body));assert.equal(body.tree.length,4);assert.ok(body.tree.every((f:any)=>typeof f.content==='string'&&!('sha' in f)));
+});
+test('an incorrect combined tree stops before creating a commit or changing a branch',async()=>{
+ destination();await assert.rejects(githubClient.push('me','backup','release','token',[file('a','a'),file('b','b'),file('c','c'),file('d','d')],'batch'),/文件树哈希不一致/);
+ assert.ok(!calls.some(c=>c.path.endsWith('/git/commits')||c.init.method==='PATCH'));
+});

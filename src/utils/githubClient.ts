@@ -1,4 +1,4 @@
-import { gitBlobSha } from './gitFiles';
+import { gitBlobSha, gitTreeSha } from './gitFiles';
 export { gitBlobSha } from './gitFiles';
 import { transferCache, uploadCache } from './localCache';
 import type { CachedFile } from './localCache';
@@ -159,6 +159,9 @@ export const githubClient = {
     const resumed = checkpoint ? await checkpoint.load(transfer) : [];
     const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
     const files = new Map<string, CachedFile>();
+    let pendingParts: CachedFile[] = [], saving = Promise.resolve();
+    const flushParts = () => { const batch = pendingParts; pendingParts = []; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
+    const savePart = async (file: CachedFile) => { if (!checkpoint) return; pendingParts.push(file); if (pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
     let done = 0;
     const missing: RepoEntry[] = [];
     for (const entry of entries) {
@@ -166,7 +169,7 @@ export const githubClient = {
       if (old?.sha === entry.sha) { files.set(entry.path, { ...old, mode: entry.mode }); done++; }
       else missing.push(entry);
     }
-    if (gitServiceConfig().mode === 'git' && missing.length) {
+    if (gitServiceConfig().mode !== 'rest' && missing.length) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
       const result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha }, token || '', signal);
@@ -179,7 +182,7 @@ export const githubClient = {
         if (!entry || received.has(remote.path) || remote.sha !== entry.sha || remote.mode !== entry.mode || remote.encoding !== 'base64') throw new Error('Git 文件清单校验失败，本地原版本已保留');
         received.add(remote.path);
         const file = await cachedFile(entry, bytesFromBase64(remote.content));
-        if (checkpoint) await checkpoint.save(transfer, commit.sha, file);
+        await savePart(file);
         files.set(entry.path, file);
       }
       done = files.size;
@@ -203,13 +206,14 @@ export const githubClient = {
             if (!item) throw new Error(`压缩包缺少文件: ${entry.path}`);
             const bytes = await item.async('uint8array');
             const file = await cachedFile(entry, bytes);
-            if (checkpoint) await checkpoint.save(transfer, commit.sha, file);
+            await savePart(file);
             files.set(entry.path, file);
             progress(`正在校验并解压 ${++done}/${entries.length}：${entry.path}`, options);
             if (done % 25 === 0) await new Promise(resolve => setTimeout(resolve, 0));
           }
           break;
         } catch (error) {
+          await flushParts();
           if (signal.aborted) throw signal.reason;
           if (error instanceof GitHubError && error.rateLimited) throw error;
           // Reuse verified entries even when an archive was only partially usable.
@@ -218,15 +222,15 @@ export const githubClient = {
         }
       }
     }
-    await mapConcurrent(missing.filter(e => !files.has(e.path)), 5, async entry => {
+    try { await mapConcurrent(missing.filter(e => !files.has(e.path)), 5, async entry => {
       signal.throwIfAborted();
       const data = await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal);
       const bytes = bytesFromBase64(data.content);
       const file = await cachedFile(entry, bytes);
-      if (checkpoint) await checkpoint.save(transfer, commit.sha, file);
+      await savePart(file);
       files.set(entry.path, file);
       progress(`正在下载并校验 ${++done}/${entries.length}：${entry.path}`, options);
-    });
+    }); } finally { await flushParts(); }
     if (files.size !== entries.length) throw new Error('文件下载不完整，已保留原版本，请重试');
     // LFS pointer files are project files, but not the binary objects they reference.
     const lfsPointers = [...files.values()].filter(f => !f.isBase64 && f.content.startsWith('version https://git-lfs.github.com/spec/v1')).map(f => f.path);
@@ -360,7 +364,7 @@ export const githubClient = {
       if (!file.path || file.path.startsWith('/') || file.path.split('/').some(p => p === '..' || !p) || paths.has(file.path)) throw new Error(`无效或重复的文件路径: ${file.path}`);
       paths.add(file.path);
     }
-    if (gitServiceConfig().mode === 'git') {
+    if (gitServiceConfig().mode !== 'rest') {
       if (!Number.isSafeInteger(identity.id) || !identity.id || identity.id <= 0) throw new Error('目标仓库缺少可信 ID，未开始 Git 推送');
       progress(`正在通过 Git 推送 ${allFiles.length} 个文件到 ${targetOwner}/${targetRepo}:${branch}…`);
       const prepared = await Promise.all(allFiles.map(async file => ({ ...file, sha: await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) })));
@@ -384,12 +388,23 @@ export const githubClient = {
     const checkpoints = typeof indexedDB !== 'undefined' && Number.isSafeInteger(checkpointId) && checkpointId > 0 ? uploadCache : undefined;
     const acknowledged = checkpoints ? await checkpoints.load(checkpointId) : new Set<string>();
     const verifiedBlobs = new Set([...existing.values()].filter(item => item.type === 'blob').map(item => item.sha));
+    let inlineBudget = 2 * 1024 * 1024, inlineCount = 0;
+    const expectedFiles: Array<{path:string;mode:string;sha:string}> = [];
     const treeItems = await mapConcurrent(allFiles, 1, async file => {
       signal.throwIfAborted();
       const bytes = file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content);
       const hash = await gitBlobSha(bytes);
+      expectedFiles.push({path:file.path,mode:file.mode || '100644',sha:hash});
       const old = existing.get(file.path);
       let sha = hash;
+      // Small UTF-8 sources can be created in one tree request. Binary and large
+      // files retain verified blob checkpoints. Never send both content and sha.
+      const inlineSize = new TextEncoder().encode(JSON.stringify(file.content)).length;
+      if (allFiles.length >= 4 && !file.isBase64 && old?.sha !== hash && !verifiedBlobs.has(hash) && inlineSize <= 128 * 1024 && inlineSize <= inlineBudget && !acknowledged.has(hash)) {
+        inlineBudget -= inlineSize; inlineCount++;
+        progress(`正在合并文本文件 ${++done}/${allFiles.length}：${file.path}`);
+        return {path:file.path,mode:file.mode || '100644',type:'blob',content:file.content};
+      }
       if (old?.sha !== hash && !verifiedBlobs.has(hash)) {
         let reusable = false;
         if (acknowledged.has(hash)) {
@@ -417,6 +432,7 @@ export const githubClient = {
       // Git's well-known empty tree supports legitimate empty source commits.
       treeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
     }
+    if (inlineCount && treeSha !== await gitTreeSha(expectedFiles)) throw new Error('合并上传后的文件树哈希不一致，未更新目标分支；本地文件已保留');
     let expectedParent = parent;
     for (let attempt = 0; attempt < (options.rebaseOnConflict ? 3 : 1); attempt++) {
       signal.throwIfAborted();
@@ -459,13 +475,13 @@ export const githubClient = {
   async fetchBranches(url: string, token?: string, signal?: AbortSignal): Promise<string[]> {
     const { owner, repo } = parseRepository(url);
     // Branch lookup is independent of any cancelled download/upload operation.
-    const deadline = AbortSignal.timeout(20000);
-    const lookupSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const lookupSignal = signal || new AbortController().signal;
+    const lookup = async (path: string) => (await request(path, token, {}, lookupSignal, 20000)).json();
     try {
-      const meta = await json(root(owner, repo), token, {}, lookupSignal);
+      const meta = await lookup(root(owner, repo));
       const names = new Set<string>();
       for (let page = 1; ; page++) {
-        const data = await json(`${root(owner, repo)}/branches?per_page=100&page=${page}`, token, {}, lookupSignal);
+        const data = await lookup(`${root(owner, repo)}/branches?per_page=100&page=${page}`);
         if (!Array.isArray(data)) throw new Error('GitHub 返回的分支列表格式异常，请重试');
         for (const branch of data) if (typeof branch.name === 'string') names.add(branch.name);
         if (data.length < 100) break;
@@ -474,7 +490,7 @@ export const githubClient = {
       return [...names].sort((a, b) => a === meta.default_branch ? -1 : b === meta.default_branch ? 1 : a.localeCompare(b));
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
-      if (deadline.aborted) throw new Error('获取分支超时（20 秒），请检查 GitHub API 连接后重试');
+      if ((error as Error).name === 'TimeoutError') throw new Error('获取分支超时（20 秒），请检查 GitHub API 连接后重试');
       if (error instanceof GitHubError && error.status === 401) throw new Error('GitHub Token 无效或已过期。公开仓库可清空专属及全局 Token 后重试；私有仓库请更换有效 Token');
       if (error instanceof GitHubError && error.status === 404) throw new Error('仓库不存在，或当前 Token 没有访问此私有仓库的权限');
       if (error instanceof TypeError) throw new Error('无法连接 GitHub 分支接口，请检查网络连接后重试');

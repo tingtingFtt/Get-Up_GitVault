@@ -39,7 +39,9 @@ export function createGithubTransport(options: TransportOptions = {}) {
   const writeInterval = options.writeInterval ?? 1100;
   const requestInterval = options.requestInterval ?? 150;
   const hourlyWrites = options.hourlyWrites ?? 450;
-  const retries = options.retries ?? 2;
+  // Explicit rate-limit rejections are safe to resume. Keep the task alive until
+  // it succeeds or the user cancels; uncertain writes are never replayed here.
+  const retries = options.retries ?? Infinity;
   let cooldown = 0, nextStart = 0, nextWrite = 0, readers = 0;
   let writeHistory: number[] = [];
   let writeTail = Promise.resolve(), admissionTail = Promise.resolve();
@@ -126,7 +128,7 @@ export function createGithubTransport(options: TransportOptions = {}) {
           const after = Number.isFinite(seconds) ? now + Math.max(0, seconds) * 1000 : retryAfter ? Date.parse(retryAfter) : NaN;
           const reset = response.headers.get('x-ratelimit-remaining') === '0' ? Number(response.headers.get('x-ratelimit-reset')) * 1000 : NaN;
           const delay = Number.isFinite(after) ? Math.max(1000, after - now) : 60000;
-          retryAt = Math.max(now + delay * 2 ** attempt, Number.isFinite(reset) ? reset : 0);
+          retryAt = Math.max(now + delay * 2 ** Math.min(attempt, 4), Number.isFinite(reset) ? reset : 0);
           message = `${message.slice(0, 300)}；请求队列已暂停，可在 ${new Date(retryAt).toLocaleTimeString()} 后继续`;
         }
         throw new GitHubError(`GitHub (${response.status}): ${message.slice(0, 450)}`, response.status, limited, retryAt);
