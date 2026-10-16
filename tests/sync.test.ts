@@ -2,7 +2,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import 'fake-indexeddb/auto';
-import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, parseRepository } from '../src/utils/githubClient';
+import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, parseRepository, TargetRepositoryError } from '../src/utils/githubClient';
 import { localCache } from '../src/utils/localCache';
 import type { CachedFile } from '../src/utils/localCache';
 
@@ -39,6 +39,25 @@ test('import comparison preserves rate-limit errors and never treats them as a m
   handler = path => path === '/repos/me/project' ? response({ id: 77 }) : response({ message: 'API rate limit exceeded' }, 403);
   await assert.rejects(githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'project', branch: 'main' }, 'token'), /API rate limit exceeded/);
   assert.equal(calls.length, 2);
+});
+test('repository failures distinguish inaccessible targets, expired credentials, permissions, rate limits and transient failures', async () => {
+  for (const [status, message, expected] of [[404, 'Not Found', 'unavailable'], [401, 'Bad credentials', 'auth'], [403, 'Resource not accessible', 'forbidden'], [403, 'API rate limit exceeded', 'limited'], [429, 'Too many requests', 'limited'], [503, 'Server error', 'error']] as const) {
+    handler = () => response({ message }, status);
+    await assert.rejects(githubClient.repository('me', 'backup', 'token', 77), error => error instanceof TargetRepositoryError && error.health.status === expected);
+  }
+  assert.ok(calls.every(call => !call.init.method || call.init.method === 'GET'));
+});
+test('a renamed target with the same immutable ID remains valid while a newly created same-name repository is rejected', async () => {
+  handler = () => response({ id: 77, name: 'renamed', owner: { login: 'me' }, default_branch: 'main' });
+  assert.equal((await githubClient.repository('me', 'old-name', 'token', 77)).repo, 'renamed');
+  await assert.rejects(githubClient.repository('me', 'old-name', 'token', 88), error => error instanceof TargetRepositoryError && error.health.status === 'identity-changed');
+});
+test('cancelling repository checks does not turn an interrupted request into an inaccessible target', async () => {
+  const controller = new AbortController();
+  handler = (_path, init) => new Promise<Response>((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true }));
+  const request = githubClient.repository('me', 'backup', 'token', 77, controller.signal);
+  controller.abort();
+  await assert.rejects(request, error => !(error instanceof TargetRepositoryError) && (error as Error).name === 'AbortError');
 });
 
 const originalFetch = globalThis.fetch;

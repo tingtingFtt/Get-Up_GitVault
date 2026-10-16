@@ -16,16 +16,17 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
 const importMock = `<script>
-if (new URLSearchParams(location.search).has('audit-import')) {
+if (new URLSearchParams(location.search).has('audit-import') || new URLSearchParams(location.search).has('audit-target')) {
   const fixture = ${JSON.stringify(fixture)};
   const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
   fixture.url = 'https://github.com/' + fixture.owner + '/' + fixture.repo;
   fixture.uploadTarget = target;
+  if(new URLSearchParams(location.search).has('audit-target')) fixture.privateRepoUrl = 'https://github.com/'+target.owner+'/'+target.repo;
   localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
   const sourceRoot = '/repos/' + fixture.owner + '/' + fixture.repo, targetRoot = '/repos/' + target.owner + '/' + target.repo;
   const original = window.fetch;
@@ -35,7 +36,11 @@ if (new URLSearchParams(location.search).has('audit-import')) {
     if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
     const reply = value => new Response(JSON.stringify(value), {headers:{'Content-Type':'application/json'}});
     if (path === sourceRoot) return reply({id:42, default_branch:fixture.branch, owner:{login:fixture.owner}, name:fixture.repo, html_url:fixture.url});
-    if (path === targetRoot) return reply({...target, id:new URLSearchParams(location.search).get('audit-import')==='error'?99:77, owner:{login:target.owner}, name:target.repo});
+    if (path === targetRoot) {
+      const state = new URLSearchParams(location.search).get('audit-target');
+      if(state==='error'||state==='detached') return new Response(JSON.stringify({message:'Not Found'}),{status:404});
+      return reply({...target, id:new URLSearchParams(location.search).get('audit-import')==='error'?99:77, owner:{login:target.owner}, name:target.repo});
+    }
     if (path.startsWith(sourceRoot + '/commits/')) return reply({sha:'source-new', commit:{tree:{sha:'audit-source-tree'},message:'new',author:{}}});
     if (path.startsWith(targetRoot + '/commits/')) return reply({sha:'target-old', commit:{tree:{sha:'audit-target-tree'},message:'old',author:{}}});
     if (path.includes('/git/trees/audit-source-tree')) return reply({tree:[{...fixture.tree[0], sha:${JSON.stringify(mockBlob)}}]});
@@ -86,7 +91,7 @@ function inspect(doc, width, scenario) {
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : ''); }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       const doc = frame.contentDocument;
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario)) {
         await click(doc,'仓库已有项目 (1)');
@@ -99,6 +104,11 @@ function inspect(doc, width, scenario) {
         if (scenario==='push') await click(doc,'上传指定仓库');
         if (scenario==='folders'||scenario==='storage') { await click(doc,'下载自选文件夹'); if(scenario==='storage') await click(doc,'本地存储与缓存'); }
         if (scenario==='metadata') await click(doc,'编辑备注与描述');
+      } else if(scenario.startsWith('remote-target')) {
+        await click(doc,'工作台'); await click(doc,'管理远端目标');
+        if(!doc.querySelector('[aria-label="管理远端目标"]')) throw new Error('Target manager did not open');
+        if(scenario==='remote-target-error'&&!doc.body.textContent.includes('可能已删除')) throw new Error('Missing inaccessible target explanation');
+        if(scenario==='remote-target-detached') { frame.contentWindow.confirm=()=>true; await click(doc,'解除此目标的所有绑定'); if(!doc.body.textContent.includes('重新设置上传')) throw new Error('Missing target recovery controls'); }
       } else if(scenario.startsWith('import-')) {
         await click(doc,'新建链接/拉取项目');
         const fields = [...doc.querySelectorAll('input')];

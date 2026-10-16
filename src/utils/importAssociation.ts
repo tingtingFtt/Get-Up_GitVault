@@ -1,5 +1,6 @@
 import type { RepoEntry } from './githubClient';
 import { sourceOf, type ProjectSource, type UploadTarget, type RemoteSnapshot } from './projectModel';
+import { sameTarget, type TargetIdentity } from './targetLifecycle';
 
 type KnownProject = ProjectSource & {
   id: string; remark?: string; origin?: ProjectSource; uploadTarget?: UploadTarget;
@@ -7,6 +8,7 @@ type KnownProject = ProjectSource & {
   forkTarget?: { id?: number; owner: string; repo: string; branch: string; branches?: string[] };
   savedCopies?: RemoteSnapshot[];
   latestCommitSha?: string; backups?: Array<{ commitSha: string; branch?: string }>;
+  detachedTargets?: TargetIdentity[];
 };
 export interface ImportCandidate {
   key: string; projectId: string; remark: string; source: ProjectSource;
@@ -25,6 +27,7 @@ export function importCandidates(projects: KnownProject[], incoming: ProjectSour
     if (project.uploadTarget && !project.branchUploadPending) bindings.push({ target: project.uploadTarget, branch: source.branch });
     if (project.forkTarget) bindings.push({ target: { ...project.forkTarget, kind: 'full', purgeAfterUpload: false }, fullFork: true, branches: project.forkTarget.branches });
     for (const copy of project.savedCopies || []) {
+      if (project.detachedTargets?.some(target => sameTarget(target, { ...copy, id: copy.repoId }))) continue;
       const branch = copy.sourceSha === project.latestCommitSha ? source.branch : project.backups?.find(version => version.commitSha === copy.sourceSha)?.branch;
       bindings.push({ branch: branch || (copy.branch === source.branch ? source.branch : undefined), target: { id: copy.repoId, owner: copy.owner, repo: copy.repo, branch: copy.branch, kind: 'current', purgeAfterUpload: false } });
     }

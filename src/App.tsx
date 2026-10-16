@@ -14,12 +14,13 @@ import {
 } from 'lucide-react';
 const RepoHeatmap = React.lazy(() => import('./components/RepoHeatmap'));
 import { localCache, transferCache, CachedFile } from './utils/localCache';
-import { githubClient, beginGithubOperation, cancelGithubOperation, operationSignal, parseRepository, gitBlobSha } from './utils/githubClient';
+import { githubClient, beginGithubOperation, cancelGithubOperation, operationSignal, parseRepository, gitBlobSha, GitHubError, TargetRepositoryError } from './utils/githubClient';
 import { safeFetchJson } from './utils/api';
 import { sourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
+import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 
 interface RepoTreeItem {
@@ -31,6 +32,8 @@ interface RepoTreeItem {
 }
 
 interface TrackedRepo {
+  targetHealth?: Record<string, TargetHealth>;
+  detachedTargets?: TargetIdentity[];
   remoteSnapshot?: RemoteSnapshot;
   uploadTarget?: UploadTarget;
   branchTargets?: Record<string, UploadTarget>;
@@ -38,7 +41,7 @@ interface TrackedRepo {
   origin?: ProjectSource;
   savedCopies?: RemoteSnapshot[];
   forkScope?: 'current' | 'full';
-  forkTarget?: { id?: number; owner: string; repo: string; branch: string; htmlUrl: string; branches?: string[] };
+  forkTarget?: { id?: number; owner: string; repo: string; branch: string; htmlUrl: string; branches?: string[]; token?: string };
   id: string;
   url: string;
   owner: string;
@@ -136,8 +139,8 @@ function formatFileSize(bytes?: number): string {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
-function publicProjectRecord({ token, uploadTarget, branchTargets, ...repo }: TrackedRepo) {
-  return { ...repo, uploadTarget: uploadTarget ? { ...uploadTarget, token: undefined } : undefined, branchTargets: branchTargets ? Object.fromEntries(Object.entries(branchTargets).map(([branch, target]) => [branch, { ...target, token: undefined }])) : undefined };
+function publicProjectRecord({ token, uploadTarget, branchTargets, forkTarget, ...repo }: TrackedRepo) {
+  return { ...repo, forkTarget: forkTarget ? { ...forkTarget, token: undefined } : undefined, uploadTarget: uploadTarget ? { ...uploadTarget, token: undefined } : undefined, branchTargets: branchTargets ? Object.fromEntries(Object.entries(branchTargets).map(([branch, target]) => [branch, { ...target, token: undefined }])) : undefined };
 }
 function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
@@ -209,6 +212,12 @@ export default function App() {
   const [isPushModalOpen, setIsPushModalOpen] = useState(false);
   const [isSingleUploadModalOpen, setIsSingleUploadModalOpen] = useState(false);
   const [singleUploadTargetRepo, setSingleUploadTargetRepo] = useState<TrackedRepo | null>(null);
+  const [targetManagerId, setTargetManagerId] = useState<string | null>(null);
+  const [targetManagerToken, setTargetManagerToken] = useState('');
+  const [targetManagerMessage, setTargetManagerMessage] = useState('');
+  const [targetManagerBusy, setTargetManagerBusy] = useState(false);
+  const [detachedTargetName, setDetachedTargetName] = useState('');
+  const latestTargetChecks = useRef(new Map<string, number>());
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'github' | 'backup' | 'apk'>('github');
   const [isDiffModalOpen, setIsDiffModalOpen] = useState(false);
@@ -393,6 +402,49 @@ export default function App() {
   const patchRepo = (id: string, patch: Partial<TrackedRepo>) => {
     persistRepos(reposRef.current.map(repo => repo.id === id ? { ...repo, ...patch } : repo));
   };
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const { target, health, identity, checkId } = (event as CustomEvent<{ target: TargetIdentity; health: TargetHealth; identity?: { id?: number; owner: string; repo: string; htmlUrl: string }; checkId: number }>).detail;
+      const key = targetKey(target);
+      if ((latestTargetChecks.current.get(key) || 0) > checkId) return;
+      latestTargetChecks.current.set(key, checkId);
+      let changed = false;
+      const next = reposRef.current.map(project => {
+        if (!projectTargets(project).some(item => sameTarget(item, target))) return project;
+        changed = true;
+        const renamed = identity && target.id && identity.id === target.id && !sameRepository(target, identity)
+          ? renamedProject(project, { ...target, branch: '', purgeAfterUpload: false }, identity) : project;
+        return { ...renamed, targetHealth: { ...renamed.targetHealth, [targetKey(health)]: health } };
+      });
+      if (changed) { try { persistRepos(next); } catch { setErrorMsg('远端状态保存失败，请检查浏览器存储空间'); } }
+    };
+    window.addEventListener('gitvault-target-health', listener);
+    return () => window.removeEventListener('gitvault-target-health', listener);
+  }, []);
+  useEffect(() => {
+    if (singleUploadTargetRepo) {
+      const current = repos.find(project => project.id === singleUploadTargetRepo.id) || null;
+      if (current?.uploadTarget && current.uploadTarget.repo !== singleUploadTargetRepo.uploadTarget?.repo) setSingleUploadRepoName(current.uploadTarget.repo);
+      setSingleUploadTargetRepo(current);
+    }
+  }, [repos, singleUploadTargetRepo?.id]);
+
+  const targetToken = (repo: TrackedRepo, target: TargetIdentity, override = '') => override || [repo.uploadTarget, repo.forkTarget, ...Object.values(repo.branchTargets || {})].find(binding => binding && sameTarget(binding, target))?.token || globalToken || repo.token || '';
+  const checkRepoTargets = async (repo: TrackedRepo, override = '', signal = operationSignal()) => {
+    for (const target of projectTargets(repo)) {
+      signal.throwIfAborted();
+      try { await githubClient.repository(target.owner, target.repo, targetToken(repo, target, override), target.id, signal); }
+      catch (error) { if (signal.aborted) throw signal.reason; if (!(error instanceof TargetRepositoryError)) throw error; }
+    }
+  };
+  useEffect(() => {
+    if (currentView !== 'workbench' || !activeRepoId) return;
+    const project = reposRef.current.find(item => item.id === activeRepoId);
+    if (!project || !projectTargets(project).length) return;
+    const controller = new AbortController();
+    void checkRepoTargets(project, '', controller.signal).catch(() => { /* States are reported per target; navigation aborts silently. */ });
+    return () => controller.abort();
+  }, [currentView, activeRepoId]);
   const versionFiles = async (repo: TrackedRepo, version?: BackupVersion): Promise<CachedFile[]> => {
     const sha = version?.commitSha || repo.latestCommitSha;
     let files = await localCache.getProjectFiles(repo.id, sha);
@@ -417,7 +469,21 @@ export default function App() {
     const remote = version?.remoteSnapshot || savedSnapshot(repo, sha);
     let data: Awaited<ReturnType<typeof githubClient.fetchRepo>>;
     if (remote) {
-      data = await githubClient.fetchRepo(`${remote.owner}/${remote.repo}`, remote.branch, repo.uploadTarget?.token || globalToken || repo.token, { ref: remote.commitSha });
+      try {
+        const token = repo.uploadTarget?.token || globalToken || repo.token;
+        await githubClient.repository(remote.owner, remote.repo, token, remote.repoId);
+        data = await githubClient.fetchRepo(`${remote.owner}/${remote.repo}`, remote.branch, token, { ref: remote.commitSha });
+      } catch (error) {
+        if (operationSignal().aborted) throw operationSignal().reason;
+        if (!(error instanceof GitHubError) || error.rateLimited || ![401, 403, 404, 409].includes(error.status)) throw error;
+        const source = sourceOf(repo);
+        try {
+          data = await githubClient.fetchRepo(source.url, version?.branch || source.branch, repo.token || globalToken, { ref: sha === 'HEAD' ? undefined : sha });
+          const expected = (version?.tree || repo.tree).filter(item => item.type !== 'tree');
+          const actual = new Map(data.tree.filter(item => item.type !== 'tree').map(item => [item.path, item]));
+          if (sha === 'HEAD' || actual.size !== expected.length || expected.some(item => { const next = actual.get(item.path); return !next || next.sha !== item.sha || next.mode !== item.mode || next.type !== item.type; })) throw new Error('原始来源与保存的版本清单不一致');
+        } catch (fallbackError) { throw new Error(`旧远端版本无法访问，原始提交也未能完整恢复；本地快照仍保留。需要该版本缓存、导出文件或恢复旧仓库后重试：${(fallbackError as Error).message}`); }
+      }
       const sourcePaths = new Map((version?.tree || repo.tree).filter(f => f.type === 'blob').map(f => [f.path, f]));
       // Only the source manifest belongs to this snapshot; generated metadata is excluded.
       data.files = data.files.filter(f => sourcePaths.has(f.path));
@@ -438,15 +504,16 @@ export default function App() {
     const current = reposRef.current.find(r => r.id === repo.id) || repo;
     const sourceBranch = version?.branch || sourceOf(repo).branch;
     const binding: UploadTarget = { ...current.uploadTarget, id: result.repoId || current.uploadTarget?.id, owner: result.owner, repo: result.repo, branch: result.branch, purgeAfterUpload: purge, token: uploadToken || current.uploadTarget?.token };
+    const targetHealth = { ...current.targetHealth, [targetKey(binding)]: { id: binding.id, owner: binding.owner, repo: binding.repo, status: 'available' as const, checkedAt: new Date().toISOString(), message: '远端上传已验证成功' } };
     const branchTargets = bindTarget ? { ...current.branchTargets, [sourceBranch]: binding } : current.branchTargets;
-    if (version) patchRepo(repo.id, { branchTargets, backups: current.backups.map(b => b.id === version.id ? { ...b, remoteSnapshot: snapshot } : b) });
+    if (version) patchRepo(repo.id, { targetHealth, branchTargets, backups: current.backups.map(b => b.id === version.id ? { ...b, remoteSnapshot: snapshot } : b) });
     else if (!bindTarget) patchRepo(repo.id, { savedCopies: [snapshot, ...(current.savedCopies || [])] });
     else {
       const previous = current.remoteSnapshot;
       const priorVersion = previous && previous.sourceSha !== current.latestCommitSha ? current.backups.find(item => item.commitSha === previous.sourceSha) : undefined;
       const archived = previous ? archiveVersion(priorVersion ? { ...current, ...priorVersion, latestCommitSha: priorVersion.commitSha, remoteSnapshot: previous } : current) : undefined;
       const backups = previous && previous.commitSha !== snapshot.commitSha && archived ? [archived, ...current.backups] : current.backups;
-      patchRepo(repo.id, { ...extra, backups, remoteSnapshot: snapshot, branchTargets, uploadTarget: binding, branchUploadPending: false, lastUploadedToPrivateAt: new Date().toISOString() });
+      patchRepo(repo.id, { ...extra, targetHealth, backups, remoteSnapshot: snapshot, branchTargets, uploadTarget: binding, branchUploadPending: false, lastUploadedToPrivateAt: new Date().toISOString() });
     }
     if (purge) {
       try {
@@ -471,6 +538,58 @@ export default function App() {
     }
     return undefined;
   };
+  const openTargetManager = (repo: TrackedRepo) => {
+    setIsSingleUploadModalOpen(false); setIsPushModalOpen(false);
+    setTargetManagerId(repo.id); setTargetManagerToken(''); setTargetManagerMessage(''); setDetachedTargetName('');
+  };
+  const handleCheckTarget = async (repoId: string, target?: TargetIdentity) => {
+    const repo = reposRef.current.find(project => project.id === repoId);
+    if (!repo || targetManagerBusy) return;
+    beginGithubOperation(); setTargetManagerBusy(true); setTargetManagerMessage('');
+    const signal = operationSignal(), override = targetManagerToken.trim();
+    try {
+      for (const item of target ? [target] : projectTargets(repo)) {
+        try {
+          await githubClient.repository(item.owner, item.repo, targetToken(repo, item, override), item.id, signal);
+          signal.throwIfAborted();
+          if (override) persistRepos(reposRef.current.map(project => ({ ...project,
+            uploadTarget: project.uploadTarget && sameTarget(project.uploadTarget, item) ? { ...project.uploadTarget, token: override } : project.uploadTarget,
+            forkTarget: project.forkTarget && sameTarget(project.forkTarget, item) ? { ...project.forkTarget, token: override } : project.forkTarget,
+            branchTargets: project.branchTargets ? Object.fromEntries(Object.entries(project.branchTargets).map(([branch, binding]) => [branch, sameTarget(binding, item) ? { ...binding, token: override } : binding])) : undefined,
+          })));
+        } catch (error) { if (signal.aborted || !(error instanceof TargetRepositoryError)) throw error; }
+      }
+      setTargetManagerMessage(override ? '检测完成；仅对身份验证成功的目标保存了新 Token。' : '检测完成；异常目标的原绑定仍保留，可按状态处理。');
+    } catch (error) { setTargetManagerMessage(signal.aborted ? '检测已取消，原绑定保持不变。' : (error as Error).message); }
+    finally { setTargetManagerBusy(false); }
+  };
+  const handleDetachTarget = (repoId: string, target: TargetIdentity) => {
+    if (targetManagerBusy) return;
+    const affected = reposRef.current.filter(project => projectTargets(project).some(item => sameTarget(item, target)));
+    if (!affected.length || !confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n之后需要重新选择上传目标或创建分叉。若只是 Token 无权限，建议先更新 Token 并重新检测。`)) return;
+    try {
+      persistRepos(reposRef.current.map(project => detachedTarget(project, target)));
+      setDetachedTargetName(target.repo);
+      setTargetManagerMessage(`已解除 ${affected.length} 个记录的旧目标绑定。可以重新设置上传或创建分叉；本地文件和历史快照已保留。GitHub 上已删除的历史无法在新仓库中自动重建。`);
+      setTargetManagerId(repoId);
+    } catch (error) { setTargetManagerMessage('解除绑定未保存：' + (error as Error).message); }
+  };
+  const reopenTargetSetup = (repoId: string, fork: boolean) => {
+    const repo = reposRef.current.find(project => project.id === repoId);
+    if (!repo) return;
+    handleOpenSingleUploadModal(repo);
+    if (fork) { setProjectSyncTab('fork'); setForkScope('full'); setForkRepoName(detachedTargetName || sourceOf(repo).repo); }
+    else if (!repo.uploadTarget && !repo.privateRepoUrl) setSingleUploadRepoName(detachedTargetName || sourceOf(repo).repo);
+    setTargetManagerId(null);
+  };
+  const targetWarning = (repo: TrackedRepo) => {
+    const unavailable = projectTargets(repo).map(target => targetHealthOf(repo, target)).filter(health => health && health.status !== 'available');
+    return unavailable.length ? <div className="bg-[#C7A39B]/15 border border-[#C7A39B]/30 rounded-xl p-3 text-xs text-[#8C5D54] flex flex-col gap-2">
+      <p role="alert">{unavailable[0]!.message}</p>
+      <button type="button" onClick={() => openTargetManager(repo)} className="self-start px-3 py-2 border border-[#DFD8CE] bg-[#FAF8F5] rounded-xl">处理远端目标异常{unavailable.length > 1 ? `（${unavailable.length}）` : ''}</button>
+    </div> : null;
+  };
+  const hasTargetIssue = (repo: TrackedRepo) => projectTargets(repo).some(target => { const health = targetHealthOf(repo, target); return health && health.status !== 'available'; });
   const assertDestinationBranch = (repo: TrackedRepo, destination: { id?: number; owner: string; repo: string; branch: string }, branch = sourceOf(repo).branch) => {
     for (const item of reposRef.current) {
       const bindings = { ...item.branchTargets, ...(item.uploadTarget && !item.branchUploadPending ? { [sourceOf(item).branch]: item.uploadTarget } : {}) };
@@ -945,6 +1064,7 @@ export default config;
   }, [repos]);
 
   const activeRepo = repos.find(r => r.id === activeRepoId);
+  const targetManagerRepo = repos.find(r => r.id === targetManagerId);
 
   const handleWorkbenchBranches = async () => {
     if (!activeRepo) return;
@@ -999,6 +1119,7 @@ export default config;
     checkingRepos.current.add(repoId);
     if (!isBackground) { startOperation(); setLoadingText(`正在检测 ${repo.repo} 的更新…`); }
     try {
+      await checkRepoTargets(repo);
       const source = sourceOf(repo);
       const data = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, repo.token || globalToken);
       const current = reposRef.current.find(item => item.id === repoId);
@@ -1280,7 +1401,9 @@ export default config;
 
   const syncProjectUpstream = async (repo: TrackedRepo, token: string, syncedTargets?: Map<string, Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>>): Promise<string> => {
     if (repo.forkScope === 'current') return updateProject(repo, token);
+    if (repo.detachedTargets?.length && !repo.forkTarget && !repo.forkScope) throw new Error('旧分叉绑定已解除，请先在“分叉与私有仓”中重新创建或关联分叉。');
     const target = repo.forkTarget || { owner: repo.owner, repo: repo.repo, branch: repo.branch };
+    await githubClient.repository(target.owner, target.repo, token, 'id' in target ? target.id : undefined);
     if (repo.forkScope === 'full' && repo.origin || repo.forkTarget?.branches?.length) {
       const key = `${target.owner}/${target.repo}`.toLowerCase();
       const results = syncedTargets?.get(key) || await githubClient.syncAllForkBranches(target.owner, target.repo, token);
@@ -1295,7 +1418,7 @@ export default config;
     return `分叉 ${target.owner}/${target.repo}：${result.message}`;
   };
   const handleSyncUpstream = async (repo: TrackedRepo) => {
-    const token = repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
+    const token = repo.forkTarget?.token || repo.uploadTarget?.token || globalToken || repo.token || prompt('请输入 GitHub Token：')?.trim();
     if (!token) return;
     startOperation();
     try { alert(await syncProjectUpstream(repo, token)); }
@@ -1340,6 +1463,7 @@ export default config;
       }
       const source = sourceOf(repo);
       const token = repo.token || authToken || globalToken;
+      if (repo.uploadTarget || repo.privateRepoUrl) await boundTarget(repo, repo.uploadTarget?.token || authToken || globalToken || token);
       const status = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, token);
       if (!status.hasUpdate) {
         patchRepo(repo.id, { hasUpdate: false, lastCheckedAt: new Date().toISOString() });
@@ -1416,7 +1540,7 @@ export default config;
       await runProjectBatch(items, { signal, onChange: setBatchTaskItems, run: async item => {
         const repo = reposRef.current.find(project => project.id === item.id);
         if (!repo) throw new Error('项目已移除，未执行');
-        const token = batchTaskToken.trim() || repo.uploadTarget?.token || globalToken || repo.token || '';
+        const token = batchTaskToken.trim() || (batchTask === 'sync' ? repo.forkTarget?.token : undefined) || repo.uploadTarget?.token || globalToken || repo.token || '';
         if (batchTask !== 'update' && !token) throw new Error('请填写 GitHub Token 或配置全局 Token 后重试');
         if (batchTask === 'update') return { message: await updateProject(repo, token) };
         const source = sourceOf(repo);
@@ -1723,7 +1847,14 @@ export default config;
       else {
         const remote = version?.remoteSnapshot || savedSnapshot(activeRepo, sha);
         const source = sourceOf(activeRepo);
-        data = await githubClient.getFile(remote?.owner || source.owner, remote?.repo || source.repo, filePath, remote ? activeRepo.uploadTarget?.token || globalToken || activeRepo.token : activeRepo.token || globalToken, remote?.commitSha || sha);
+        try { data = await githubClient.getFile(remote?.owner || source.owner, remote?.repo || source.repo, filePath, remote ? activeRepo.uploadTarget?.token || globalToken || activeRepo.token : activeRepo.token || globalToken, remote?.commitSha || sha); }
+        catch (error) {
+          if (!remote || !(error instanceof GitHubError) || error.rateLimited || ![401, 403, 404, 409].includes(error.status)) throw error;
+          const files = await versionFiles(activeRepo, version || undefined);
+          const recovered = files.find(file => file.path === filePath);
+          if (!recovered) throw new Error('保存的版本中没有该文件');
+          data = { content: recovered.content, type: recovered.isBase64 ? 'base64' : 'text' };
+        }
       }
       if (requestId === fileRequest.current) { setFileContent(data.content); setFileContentType(data.type); }
     } catch (error) { if (requestId === fileRequest.current) { setFileContent('读取失败：' + (error as Error).message); setFileContentType('text'); } }
@@ -2344,7 +2475,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           <div className="flex flex-row items-center gap-1 shrink-0 whitespace-nowrap">
                             {repo.privateRepoUrl && (
                               <span className="text-[10px] bg-[#8E9F8B]/15 text-[#3D4F3A] px-2 py-0.5 rounded-full font-mono border border-[#8E9F8B]/30 whitespace-nowrap shrink-0">
-                                私人仓已同步
+                                {hasTargetIssue(repo) ? '远端目标异常' : '私人仓已同步'}
                               </span>
                             )}
                             {repo.isCachePurged && (
@@ -2602,7 +2733,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                                 title="点击直接打开个人私人仓库"
                               >
                                 <ShieldCheck className="w-3 h-3 text-[#5D6F5A] shrink-0" />
-                                <span>私人仓库已同步</span>
+                                <span>{hasTargetIssue(repo) ? '远端目标异常' : '私人仓库已同步'}</span>
                               </a>
                             ) : (
                               <span className="text-[10px] bg-[#EFECE6] text-[#7A7367] px-2 py-0.5 rounded-full font-mono border border-[#DFD8CE] shrink-0">
@@ -2643,6 +2774,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           )}
 
                           {/* Tags & meta line */}
+                          {targetWarning(repo)}
                           <div className="flex flex-row items-center gap-2 flex-wrap">
                             {repo.tags.map(t => (
                               <span key={t} className="inline-flex flex-row items-center text-[10px] bg-[#EFECE6] text-[#474239] px-2 py-0.5 rounded border border-[#DFD8CE] shrink-0 leading-none">
@@ -2822,6 +2954,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     <button type="button" disabled={isLoading || !workbenchBranchInput.trim() || workbenchBranchInput.trim() === activeRepo.branch} onClick={handleSwitchBranch} className="px-3 py-2 bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl text-xs text-[#4D5E4A] disabled:opacity-40">切换并重新拉取</button>
                   </div>
                   {activeRepo.uploadTarget && <p className="text-[11px] text-[#7A7367] mt-1 break-all">上传分支：{activeRepo.uploadTarget.owner}/{activeRepo.uploadTarget.repo} · {activeRepo.uploadTarget.branch}</p>}
+                  {projectTargets(activeRepo).length > 0 && <button type="button" onClick={() => openTargetManager(activeRepo)} className="mt-2 text-xs text-[#5D6F5A] hover:underline">管理远端目标</button>}
                   {workbenchBranchError && <p role="alert" className="text-xs text-[#8C5D54] mt-1 break-words">{workbenchBranchError}</p>}
 
                   {activeRepo.description && (
@@ -2844,6 +2977,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 </div>
               </div>
 
+              {targetWarning(activeRepo)}
               {/* Workbench Actions */}
               <div className="workbench-actions">
                 <button
@@ -3260,6 +3394,50 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         )}
       </main>
 
+      {targetManagerRepo && <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
+        <div role="dialog" aria-modal="true" aria-label="管理远端目标" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-6 shadow-xl flex flex-col gap-4">
+          <div className="flex flex-row justify-between items-start gap-3">
+            <h3 className="text-base font-bold font-serif text-[#2B2723]">管理远端目标</h3>
+            <button type="button" aria-label="关闭远端目标管理" disabled={targetManagerBusy} onClick={() => setTargetManagerId(null)} className="p-1 text-[#91887C] disabled:opacity-40"><X className="w-5 h-5" /></button>
+          </div>
+          <p className="text-xs text-[#7A7367] leading-relaxed">仓库被删除、私有仓权限不足或改名都可能导致访问失败。检测不会删除本地内容，也不会自动解除绑定。确认旧目标不再使用后，可解除该目标在所有项目中的当前绑定，再重新上传或创建分叉。</p>
+          <p className="text-xs text-[#474239] break-all">当前项目：{sourceOf(targetManagerRepo).owner}/{sourceOf(targetManagerRepo).repo} · {sourceOf(targetManagerRepo).branch}</p>
+          <label className="text-xs text-[#474239]">更新该目标的 GitHub Token（可选）<input aria-label="远端目标 Token" type="password" autoComplete="off" disabled={targetManagerBusy} value={targetManagerToken} onChange={e => setTargetManagerToken(e.target.value)} className="w-full mt-1 px-3 py-2 bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl" /></label>
+          <p className="text-xs text-[#7A7367]">新 Token 仅在目标身份验证通过后保存到对应绑定；不会替换全局 Token。</p>
+          <div className="flex flex-col gap-3">
+            {projectTargets(targetManagerRepo).map(target => {
+              const health = targetHealthOf(targetManagerRepo, target);
+              const count = repos.filter(project => projectTargets(project).some(item => sameTarget(item, target))).length;
+              return <div key={targetKey(target)} className="p-3 border border-[#DFD8CE] rounded-xl bg-[#FAF8F5] flex flex-col gap-2 text-xs">
+                <a href={`https://github.com/${target.owner}/${target.repo}`} target="_blank" rel="noreferrer" className="font-semibold text-[#4D5E4A] break-all">{target.owner}/{target.repo}</a>
+                <p className="text-[#7A7367]">关联 {count} 个项目记录{target.id ? ` · 仓库 ID：${target.id}` : ''}</p>
+                <p className={health?.status === 'available' ? 'text-[#5D6F5A]' : 'text-[#8C5D54]'}>{health?.message || '尚未检测，请点击重新检测。'}</p>
+                {health?.checkedAt && <p className="text-[#7A7367]">检测时间：{new Date(health.checkedAt).toLocaleString()}</p>}
+                <div className="grid grid-cols-2 gap-2">
+                  <button type="button" disabled={targetManagerBusy} onClick={() => void handleCheckTarget(targetManagerRepo.id, target)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-[#5D6F5A] disabled:opacity-40">重新检测此目标</button>
+                  <button type="button" disabled={targetManagerBusy} onClick={() => handleDetachTarget(targetManagerRepo.id, target)} className="px-3 py-2 border border-[#C7A39B] rounded-xl text-[#8C5D54] disabled:opacity-40">解除此目标的所有绑定</button>
+                </div>
+              </div>;
+            })}
+            {!projectTargets(targetManagerRepo).length && <p className="text-xs text-[#5D6F5A]">当前没有上传或分叉目标绑定，可重新设置。</p>}
+          </div>
+          {targetManagerMessage && <p role="status" className="text-xs text-[#5D6F5A]">{targetManagerMessage}</p>}
+          {detachedTargetName && <div className="grid grid-cols-2 gap-2">
+            <button type="button" onClick={() => reopenTargetSetup(targetManagerRepo.id, false)} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl text-xs">重新设置上传</button>
+            <button type="button" onClick={() => reopenTargetSetup(targetManagerRepo.id, true)} className="px-3 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs">重新创建分叉</button>
+          </div>}
+          <div className="flex flex-row flex-wrap justify-end gap-2 border-t border-[#EDE7DF] pt-3">
+            {targetManagerBusy ? <button type="button" onClick={cancelGithubOperation} className="px-3 py-2 text-xs text-[#8C5D54]">取消检测</button> : <>
+              <button type="button" onClick={() => setTargetManagerId(null)} className="px-3 py-2 bg-[#EFECE6] rounded-xl text-xs text-[#554F45]">关闭</button>
+              {projectTargets(targetManagerRepo).length > 0 && <>
+                <button type="button" onClick={() => void handleCheckTarget(targetManagerRepo.id)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-xs text-[#5D6F5A]">重新检测全部</button>
+                <button type="button" disabled={!targetManagerToken.trim()} onClick={() => void handleCheckTarget(targetManagerRepo.id)} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl text-xs disabled:opacity-40">应用 Token 并重新检测</button>
+              </>}
+            </>}
+          </div>
+        </div>
+      </div>}
+
       {importMatch && <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
         <div role="dialog" aria-modal="true" aria-label="选择已有项目作为同步基础" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-6 shadow-xl flex flex-col gap-4">
           <div className="flex flex-row justify-between items-start gap-3">
@@ -3484,6 +3662,11 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 <X className="w-5 h-5" />
               </button>
             </div>
+
+            {projectTargets(singleUploadTargetRepo).length > 0 && <div className="flex flex-col gap-2">
+              {targetWarning(singleUploadTargetRepo)}
+              <button type="button" onClick={() => openTargetManager(singleUploadTargetRepo)} className="self-start text-xs text-[#5D6F5A] hover:underline">管理远端目标</button>
+            </div>}
 
             {/* Tabs */}
             <div className="flex flex-row border-b border-[#EDE7DF] gap-4 whitespace-nowrap overflow-x-auto">

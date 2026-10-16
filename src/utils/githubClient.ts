@@ -2,6 +2,7 @@ import { gitBlobSha } from './gitFiles';
 export { gitBlobSha } from './gitFiles';
 import { transferCache } from './localCache';
 import type { CachedFile } from './localCache';
+import type { TargetHealth, TargetIdentity } from './targetLifecycle';
 
 export interface RepoEntry {
   path: string;
@@ -33,7 +34,14 @@ function headers(token?: string, raw = false): Record<string, string> {
   };
 }
 export class GitHubError extends Error {
-  constructor(message: string, public status: number) { super(message); }
+  constructor(message: string, public status: number, public rateLimited = false) { super(message); }
+}
+export class TargetRepositoryError extends GitHubError {
+  constructor(public health: TargetHealth, status: number) { super(health.message, status, health.status === 'limited'); }
+}
+let repositoryCheckSequence = 0;
+function targetHealthEvent(target: TargetIdentity, health: TargetHealth, checkId: number, identity?: { id?: number; owner: string; repo: string; htmlUrl: string }) {
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('gitvault-target-health', { detail: { target, health, identity, checkId } }));
 }
 
 // All requests have a deadline, including reading the response body. Mutations are never retried blindly.
@@ -56,7 +64,7 @@ async function request(path: string, token?: string, init: RequestInit = {}, sig
         const reset = response.headers.get('x-ratelimit-reset');
         message += reset ? `；请求受限，可在 ${new Date(Number(reset) * 1000).toLocaleTimeString()} 后重试` : '；请检查访问权限或稍后重试';
       }
-      throw new GitHubError(`GitHub (${response.status}): ${message.slice(0, 350)}`, response.status);
+      throw new GitHubError(`GitHub (${response.status}): ${message.slice(0, 350)}`, response.status, response.status === 429 || response.headers.get('x-ratelimit-remaining') === '0' || !!response.headers.get('retry-after') || /rate limit|secondary limit/i.test(message));
     }
     return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
   } catch (error) {
@@ -253,10 +261,24 @@ export const githubClient = {
     return { hasUpdate: commit.sha !== currentSha, latestSha: commit.sha, latestCommit: { sha: commit.sha, message: commit.commit.message, author: commit.commit.author?.name, date: commit.commit.author?.date } };
   },
 
-  async repository(owner: string, repo: string, token?: string, expectedId?: number) {
-    const meta = await json(root(owner, repo), token, { cache: 'no-store' });
-    if (expectedId && meta.id !== expectedId) throw new Error('目标仓库身份已变化，已停止操作，请检查绑定，避免写入同名的新仓库');
-    return { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
+  async repository(owner: string, repo: string, token?: string, expectedId?: number, signal = operation.signal) {
+    const target = { id: expectedId, owner, repo };
+    const checkId = ++repositoryCheckSequence;
+    try {
+      const meta = await json(root(owner, repo), token, { cache: 'no-store' }, signal);
+      if (expectedId && meta.id !== expectedId) throw new TargetRepositoryError({ ...target, status: 'identity-changed', checkedAt: new Date().toISOString(), message: '目标仓库身份已变化，身份校验失败，已停止操作；可能删除后创建了同名仓库。请通过“管理远端目标”确认解除旧绑定后重新设置，避免误写新仓库。' }, 409);
+      const identity = { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
+      targetHealthEvent(target, { id: identity.id, owner: identity.owner, repo: identity.repo, status: 'available', checkedAt: new Date().toISOString(), message: '远端仓库可访问，身份校验通过' }, checkId, { id: identity.id, owner: identity.owner, repo: identity.repo, htmlUrl: identity.htmlUrl });
+      return identity;
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      const status = error instanceof GitHubError ? error.status : 0;
+      const kind: TargetHealth['status'] = error instanceof TargetRepositoryError ? error.health.status : status === 404 ? 'unavailable' : status === 401 ? 'auth' : error instanceof GitHubError && error.rateLimited ? 'limited' : status === 403 ? 'forbidden' : 'error';
+      const explanation = { available: '', unavailable: '远端目标无法访问：可能已删除、改名，或当前 Token 无权限。请重新检测、更新 Token，或确认后解除旧绑定。', auth: 'GitHub Token 无效或已过期，请更新 Token 后重新检测。', forbidden: '当前 Token 无访问权限，或需要组织授权；请检查权限后重新检测。', limited: 'GitHub 请求受限，请在限流恢复后重试；绑定已保留。', error: '远端检测暂时失败，请检查网络并重试；绑定已保留。', 'identity-changed': '' }[kind];
+      const health: TargetHealth = error instanceof TargetRepositoryError ? error.health : { ...target, status: kind, checkedAt: new Date().toISOString(), message: `${explanation} ${(error as Error).message}` };
+      targetHealthEvent(target, health, checkId);
+      throw new TargetRepositoryError(health, status);
+    }
   },
 
   async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string }) {
@@ -318,8 +340,8 @@ export const githubClient = {
   async push(targetOwner: string, targetRepo: string, targetBranch: string, token: string, files: CachedFile[], commitMessage: string, description?: string, remark?: string, originalSourceUrl?: string, options: { rebaseOnConflict?: boolean; expectedRepoId?: number } = {}) {
     const signal = operation.signal;
     const base = root(targetOwner, targetRepo);
-    const meta = await json(base, token);
-    if (options.expectedRepoId && meta.id !== options.expectedRepoId) throw new Error('目标仓库身份校验失败，上传已停止');
+    const identity = await githubClient.repository(targetOwner, targetRepo, token, options.expectedRepoId, signal);
+    const meta = { id: identity.id, default_branch: identity.defaultBranch };
     const branch = targetBranch || meta.default_branch || 'main';
     const refUrl = `${base}/git/ref/heads/${refPath(branch)}`;
     const readHead = async () => (await json(refUrl, token, { cache: 'no-store' }, signal)).object.sha as string;

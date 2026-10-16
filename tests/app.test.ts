@@ -10,6 +10,7 @@ import { beginGithubOperation, githubClient } from '../src/utils/githubClient';
 import App from '../src/App';
 
 const originalFetch = globalThis.fetch;
+const withoutTargetHealth = (saved: string | null) => JSON.stringify(JSON.parse(saved!).map(({ targetHealth, ...project }: any) => project));
 const sha = (s: string) => createHash('sha1').update(`blob ${Buffer.byteLength(s)}\0`).update(s).digest('hex');
 const file = (content: string) => ({ path: 'a.txt', content, isBase64: false, sha: sha(content), mode: '100644' });
 const entry = (content: string) => ({ path: 'a.txt', sha: sha(content), mode: '100644', type: 'blob', size: content.length });
@@ -103,6 +104,160 @@ beforeEach(async () => {
 });
 afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; });
 
+const storedProjects = () => JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+const targetManager = () => document.querySelector('[aria-label="管理远端目标"]');
+function deletedTargetFixture(options: { recreate?: boolean; restoreSource?: boolean; missingSource?: boolean } = {}) {
+  const base = globalThis.fetch; let recreated = false;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    if (path === '/repos/destination/backup') {
+      requests.push({ path, payload: null });
+      return recreated ? ok({ id: 99, private: true, name: 'backup', owner: { login: 'destination' }, default_branch: 'main', html_url: 'https://github.com/destination/backup' }) : ok({ message: 'Not Found' }, 404);
+    }
+    if (options.recreate && path === '/user') return ok({ login: 'destination' });
+    if (options.recreate && path === '/user/repos') { recreated = true; requests.push({ path, payload: JSON.parse(init.body as string) }); return ok({ id: 99, name: 'backup', owner: { login: 'destination' }, default_branch: 'main', html_url: 'https://github.com/destination/backup' }); }
+    if (options.restoreSource && path === '/repos/source/project') return ok({ id: 42, default_branch: 'develop' });
+    if (options.restoreSource && path === '/repos/source/project/commits/v2') { requests.push({ path, payload: null }); return options.missingSource ? ok({ message: 'Not Found' }, 404) : ok({ sha: 'v2', commit: { tree: { sha: 'recovered-source-tree' }, message: 'new', author: {} } }); }
+    if (path.includes('/git/trees/recovered-source-tree')) return ok({ tree: [entry('new')] });
+    if (path.includes('/git/blobs/') && path.endsWith(sha('new'))) return ok({ encoding: 'base64', content: Buffer.from('new').toString('base64') });
+    return base(url, init);
+  };
+}
+async function openDeletedTargetManager() {
+  await enterWorkbench();
+  await waitFor(() => storedProjects()[0].targetHealth?.['id:77']?.status === 'unavailable');
+  await click('管理远端目标');
+}
+test('a deleted or inaccessible target is detected on workbench entry and update fails with a recovery action without removing data', async () => {
+  await reloadProject(boundProject()); deletedTargetFixture();
+  await enterWorkbench(); await waitFor(() => storedProjects()[0].targetHealth?.['id:77']?.status === 'unavailable');
+  assert.ok(document.body.textContent?.includes('可能已删除'));
+  await click('一键更新'); await waitFor(() => alerts.length > 0);
+  assert.equal(storedProjects()[0].uploadTarget.id, 77); assert.equal(storedProjects()[0].backups.length, 1);
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.ok(requests.every(request => request.payload === null));
+  assert.ok(!requests.some(request => request.path.includes('/commits/')));
+});
+test('updating the target Token restores access for every shared binding without changing global or source credentials', async () => {
+  const first = boundProject(), second = { ...repo(), id: 'fork-reference', forkTarget: { id: 77, owner: 'destination', repo: 'backup', branch: 'develop', htmlUrl: 'https://github.com/destination/backup', branches: ['develop'] } };
+  await reloadProjects([first, second]);
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url) === 'https://api.github.com/repos/destination/backup') return (init.headers as any)?.Authorization === 'Bearer replacement-token' ? ok({ id: 77, owner: { login: 'destination' }, name: 'backup' }) : ok({ message: 'Not Found' }, 404);
+    return base(url, init);
+  };
+  await openDeletedTargetManager();
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="远端目标 Token"]')!, 'replacement-token');
+  await click('应用 Token 并重新检测'); await waitFor(() => storedProjects()[0].uploadTarget.token === 'replacement-token');
+  assert.equal(storedProjects()[0].targetHealth['id:77'].status, 'available');
+  assert.equal(storedProjects()[1].forkTarget.token, 'replacement-token');
+  assert.equal(storedProjects()[0].token, 'fake-test-token'); assert.equal(localStorage.getItem('gitvault_global_token'), null);
+  assert.equal(storedProjects()[0].uploadTarget.id, 77); assert.ok(!targetManager()?.textContent?.includes('目标无法访问'));
+});
+test('a late failed background check cannot overwrite a successful Token repair', async () => {
+  await reloadProject(boundProject());
+  const base = globalThis.fetch; let completeOldCheck: (() => void) | undefined;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url) === 'https://api.github.com/repos/destination/backup') {
+      if ((init.headers as any)?.Authorization === 'Bearer repaired-token') return ok({ id: 77, name: 'backup', owner: { login: 'destination' } });
+      return new Promise<Response>(resolve => { completeOldCheck = () => resolve(ok({ message: 'Not Found' }, 404)); });
+    }
+    return base(url, init);
+  };
+  await enterWorkbench(); await waitFor(() => !!completeOldCheck); await click('管理远端目标');
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="远端目标 Token"]')!, 'repaired-token');
+  await click('应用 Token 并重新检测'); await waitFor(() => storedProjects()[0].uploadTarget.token === 'repaired-token');
+  await act(async () => { completeOldCheck!(); await new Promise(resolve => setTimeout(resolve, 20)); });
+  assert.equal(storedProjects()[0].targetHealth['id:77'].status, 'available');
+  assert.equal(storedProjects()[0].uploadTarget.id, 77);
+});
+test('system backup excludes repaired Fork, branch, upload and source credentials', async () => {
+  const saved = boundProject();
+  saved.branchTargets = { develop: { ...saved.uploadTarget, token: 'branch-secret' } };
+  saved.forkTarget = { ...saved.uploadTarget, token: 'fork-secret', htmlUrl: 'old' };
+  await reloadProject(saved);
+  const create = URL.createObjectURL, revoke = URL.revokeObjectURL, anchorClick = dom.window.HTMLAnchorElement.prototype.click;
+  let exported: Blob | undefined;
+  URL.createObjectURL = blob => { exported = blob as Blob; return 'blob:backup'; };
+  URL.revokeObjectURL = () => {}; dom.window.HTMLAnchorElement.prototype.click = () => {};
+  try {
+    await click('设置'); await click('数据备份与恢复');
+    const exportButton = buttons().find(button => button.textContent?.includes('导出全量备份 (JSON)'))!;
+    assert.ok(exportButton); await act(async () => exportButton.click());
+    assert.ok(exported);
+    const content = await exported.text();
+    for (const secret of ['target-token', 'branch-secret', 'fork-secret', 'fake-test-token']) assert.ok(!content.includes(secret));
+    assert.equal(JSON.parse(content).projects[0].forkTarget.id, 77);
+  } finally { URL.createObjectURL = create; URL.revokeObjectURL = revoke; dom.window.HTMLAnchorElement.prototype.click = anchorClick; }
+});
+test('detaching a missing target clears its shared branch and Fork bindings while keeping other targets, history and version caches', async () => {
+  const first = boundProject();
+  first.branchTargets = { develop: first.uploadTarget, feature: { ...first.uploadTarget, branch: 'feature' }, other: { ...first.uploadTarget, id: 88, repo: 'another', branch: 'other' } };
+  first.forkTarget = { ...first.uploadTarget, htmlUrl: 'old', branches: ['develop', 'feature'] };
+  first.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', commitSha: 'target-v2', sourceSha: 'v2', htmlUrl: 'old' };
+  const managed = { ...first, id: 'managed', owner: 'destination', repo: 'backup', origin: { owner: 'source', repo: 'project', branch: 'develop', url: 'https://github.com/source/project' }, forkScope: 'full' };
+  await reloadProjects([first, managed]); deletedTargetFixture();
+  await openDeletedTargetManager();
+  await click('解除此目标的所有绑定');
+  await waitFor(() => !storedProjects()[0].uploadTarget);
+  const saved = storedProjects();
+  assert.equal(saved[0].forkTarget, undefined); assert.deepEqual(Object.keys(saved[0].branchTargets), ['other']);
+  assert.equal(saved[0].remoteSnapshot.commitSha, 'target-v2'); assert.deepEqual(saved[0].backups, first.backups);
+  assert.equal(saved[1].owner, 'source'); assert.equal(saved[1].forkScope, undefined); assert.equal(saved[1].origin.repo, 'project');
+  assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.ok(targetManager()?.textContent?.includes('2 个记录'));
+});
+test('refusing detach confirmation keeps every binding intact', async () => {
+  await reloadProject(boundProject()); deletedTargetFixture(); await openDeletedTargetManager();
+  const before = localStorage.getItem('gitvault_repos_v8');
+  (globalThis as any).confirm = () => false; await click('解除此目标的所有绑定');
+  assert.equal(localStorage.getItem('gitvault_repos_v8'), before);
+});
+test('after detaching a deleted upload users can recreate the same repository name with a new ID and upload only the source branch', async () => {
+  const saved = boundProject(); saved.privateRepoUrl = 'https://github.com/destination/backup';
+  await reloadProject(saved); deletedTargetFixture({ recreate: true }); await openDeletedTargetManager();
+  await click('解除此目标的所有绑定'); await click('重新设置上传');
+  const name = [...document.querySelectorAll<HTMLInputElement>('input')].find(field => field.value === 'backup')!;
+  assert.equal(name.readOnly, false);
+  await click('立即新建私人仓库并上传'); await waitFor(() => storedProjects()[0].remoteSnapshot?.repoId === 99);
+  assert.equal(storedProjects()[0].uploadTarget.branch, 'develop'); assert.equal(storedProjects()[0].targetHealth['id:99'].status, 'available');
+  assert.equal(storedProjects()[0].backups.length, 1); assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.ok(!requests.some(request => request.path.includes('/git/refs/heads/release')));
+});
+test('purged source can be recovered from its exact original commit after the old target is deleted and recreated under the same name', async () => {
+  const saved = boundProject(); saved.isCachePurged = true; saved.cachedFilesCount = 0;
+  saved.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', commitSha: 'deleted-target-commit', sourceSha: 'v2', htmlUrl: 'old' };
+  await localCache.deleteProjectFiles('tracked', 'v2'); await reloadProject(saved);
+  deletedTargetFixture({ recreate: true, restoreSource: true }); await openDeletedTargetManager();
+  await click('解除此目标的所有绑定'); await click('重新设置上传'); await click('立即新建私人仓库并上传');
+  await waitFor(() => storedProjects()[0].remoteSnapshot?.repoId === 99);
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.equal(storedProjects()[0].isCachePurged, false); assert.ok(requests.some(request => request.path === '/repos/source/project/commits/v2'));
+  assert.ok(!requests.some(request => request.path.includes('/commits/deleted-target-commit')));
+  assert.ok(storedProjects()[0].backups.some((version: any) => version.remoteSnapshot?.repoId === 77));
+});
+test('unrecoverable purged versions stay recorded and are never marked as uploaded to a new target', async () => {
+  const saved = boundProject(); saved.isCachePurged = true;
+  saved.remoteSnapshot = { repoId: 77, owner: 'destination', repo: 'backup', branch: 'release', commitSha: 'deleted-target-commit', sourceSha: 'v2', htmlUrl: 'old' };
+  await localCache.deleteProjectFiles('tracked', 'v2'); await reloadProject(saved);
+  deletedTargetFixture({ recreate: true, restoreSource: true, missingSource: true }); await openDeletedTargetManager();
+  await click('解除此目标的所有绑定'); await click('重新设置上传'); await click('立即新建私人仓库并上传');
+  await waitFor(() => alerts.some(message => message.includes('原始提交也未能完整恢复')));
+  assert.equal(storedProjects()[0].uploadTarget, undefined); assert.equal(storedProjects()[0].remoteSnapshot.repoId, 77);
+  assert.equal(storedProjects()[0].backups.length, 1); assert.equal(storedProjects()[0].isCachePurged, true);
+  assert.ok(!requests.some(request => request.path.endsWith('/git/commits') || request.path.endsWith('/git/blobs')));
+});
+test('a deleted full Fork can be detached and recreated from the original upstream', async () => {
+  const saved = boundProject(); saved.forkScope = 'full'; saved.forkTarget = { ...saved.uploadTarget, htmlUrl: 'old', branches: ['develop', 'other'] };
+  await reloadProject(saved); deletedTargetFixture(); await openDeletedTargetManager();
+  await click('解除此目标的所有绑定'); await click('重新创建分叉');
+  completeForkFixture(); await input('project', 'project'); await click('完整分叉并加入我的项目');
+  await waitFor(() => storedProjects().some((project: any) => project.origin && project.forkTarget?.repo === 'project'));
+  assert.equal(requests.find(request => request.path.endsWith('/forks'))?.path, '/repos/source/project/forks');
+  assert.equal(storedProjects().find((project: any) => project.id === 'tracked').backups.length, 1);
+});
+
 test('matching link waits for a choice, compares target files, reuses its fixed name and preserves old history before later upload', async () => {
   await reloadProject(boundProject()); importAssociationFixture();
   const before = localStorage.getItem('gitvault_repos_v8');
@@ -175,7 +330,8 @@ test('failed identity comparison cannot be accepted and skipping leaves all proj
   await waitFor(() => importDialog()?.textContent?.includes('身份已变化') === true);
   assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
   await click('跳过此链接'); await waitFor(() => !importDialog());
-  assert.equal(localStorage.getItem('gitvault_repos_v8'), previous);
+  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')), withoutTargetHealth(previous));
+  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].targetHealth['id:77'].status, 'identity-changed');
   assert.ok(!requests.some(r => r.path.endsWith('/commits/release')));
   assert.ok(!requests.some(r => r.path.includes('/zipball/') || r.path.includes('/git/blobs/')));
 });
@@ -200,7 +356,7 @@ test('cancelling during comparison stops the batch and leaves both links retryab
   await waitFor(() => requests.some(r => r.path.endsWith('/commits/release')));
   await click('取消本次导入');
   await waitFor(() => !importDialog() && document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 0 · 失败 2');
-  assert.equal(localStorage.getItem('gitvault_repos_v8'), previous);
+  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')), withoutTargetHealth(previous));
   assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
   importAssociationFixture(); await click('重试失败链接'); await waitFor(() => !!importDialog());
   await click('跳过此链接');
@@ -725,7 +881,7 @@ test('workbench metadata can be edited without pulling files or altering branch 
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
   assert.equal(saved.remark, 'new remark'); assert.equal(saved.description, 'new description');
   assert.equal(saved.uploadTarget.branch, 'release'); assert.equal(saved.latestCommitSha, 'v2');
-  assert.equal(requests.length, 0);
+  assert.ok(requests.every(request => request.path === '/repos/destination/backup' && request.payload === null));
 });
 
 test('batch upload after switching uses the matching slash branch and preserves the previously uploaded branch', async () => {
