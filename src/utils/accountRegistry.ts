@@ -5,6 +5,28 @@ import type { TargetIdentity } from './targetLifecycle';
 export const REGISTRY_REPO = '.gitvault-state';
 const MARKER = 'GitVault account sync registry v1';
 const FILE = 'gitvault.json';
+const accountWrites = new Map<string, Promise<void>>();
+function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+function retryDelay(attempt: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, Math.min(2000, 250 * 2 ** attempt) + Math.random() * 150);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+export class AccountRecordPendingError extends Error {
+  constructor(cause: unknown) {
+    super(`项目已在 GitHub 保存，但跨设备记录尚未完成；本地缓存和固定目标已保留，请使用更新／同步重试，不能重复创建：${(cause as Error).message}`, { cause });
+  }
+}
 const report = (message: string) => { if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('gitvault-progress', {detail:message})); };
 export interface TargetHistory { target: TargetIdentity; kind: 'upload' | 'current' | 'full'; bindings: AccountProject['bindings']; changedAt: string }
 export interface AccountProject {
@@ -55,11 +77,11 @@ function validateDocument(value: any, login: string): RegistryDocument {
 }
 
 /** Only account bindings and receipts are stored remotely; never tokens or project file bytes. */
-export function createAccountRegistry(api = githubApi) {
+export function createAccountRegistry(api = githubApi, wait = retryDelay) {
   const ownedCache = new Map<string, { at: number; projects: any[] }>();
   const parentCache = new Map<string, { at: number; meta: any }>();
   const provenanceCache = new Map<string, { at: number; sources: Array<{owner:string;repo:string}> }>();
-  const read = async (token: string, signal = operationSignal(), create = false) => {
+  const read = async (token: string, signal = operationSignal(), create = false, commitRef?: string) => {
     if (!token) throw new Error('跨设备识别需要 GitHub Token，请在设置中填写可访问账号仓库的凭证');
     const user = await api('/user', token, {}, signal);
     if (!validName(user.login)) throw new Error('无法识别当前 GitHub 账号');
@@ -73,27 +95,62 @@ export function createAccountRegistry(api = githubApi) {
       catch (creationError) { if (!(creationError instanceof GitHubError) || ![409, 422].includes(creationError.status)) throw creationError; meta = await api(root, token, { cache: 'no-store' }, signal); }
     }
     if (!meta.private || meta.owner?.login?.toLowerCase() !== user.login.toLowerCase()) throw new Error('跨设备记录仓库必须属于当前账号且为私有仓库，未写入任何记录');
+    // Pin content reads to an immutable commit. A branch Contents response may
+    // lag behind a just-completed write even when browser caching is disabled.
+    const branch = meta.default_branch || 'main';
+    const ref = commitRef || (await api(`${root}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, token, { cache: 'no-store' }, signal)).object.sha;
     let file: any;
-    try { file = await api(`${root}/contents/${FILE}?ref=${encodeURIComponent(meta.default_branch || 'main')}`, token, { cache: 'no-store' }, signal); }
+    try { file = await api(`${root}/contents/${FILE}?ref=${encodeURIComponent(ref)}`, token, { cache: 'no-store' }, signal); }
     catch (error) { if (!missing(error)) throw error; if (meta.description !== MARKER) throw new Error(`私人仓库 ${REGISTRY_REPO} 已被其他用途占用，请更名后重试，未覆盖文件`); }
     if (file && (file.encoding !== 'base64' || !file.content || file.size > 1000000)) throw new Error('跨设备记录文件过大或不可读取，未将其当作空记录');
     const document = file ? validateDocument(decode(file.content), user.login) : { app: 'Get-Up_GitVault', version: 1, account: user.login, projects: [] } as RegistryDocument;
     return { login: user.login as string, root, meta, sha: file?.sha as string | undefined, document };
   };
   const change = async (token: string, edit: (document: RegistryDocument, login: string) => RegistryDocument, signal = operationSignal()) => {
-    for (let attempt = 0; attempt < 4; attempt++) {
+    signal.throwIfAborted();
+    if (!token) throw new Error('跨设备识别需要 GitHub Token，请在设置中填写可访问账号仓库的凭证');
+    const user = await api('/user', token, { cache: 'no-store' }, signal);
+    if (!validName(user.login)) throw new Error('无法识别当前 GitHub 账号');
+    const key = user.login.toLowerCase();
+    const mutate = async () => {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        signal.throwIfAborted();
+        report('正在保存并验证账号来源与分支记录…');
+        try {
+          const current = await read(token, signal, true);
+          if (current.login.toLowerCase() !== key) throw new Error('GitHub 账号发生变化，已停止保存记录');
+          const document = validateDocument(edit(current.document, current.login), current.login);
+          if (JSON.stringify(current.document) === JSON.stringify(document)) return document;
+          const written = await api(`${current.root}/contents/${FILE}`, token, init('PUT', { message: 'Update GitVault account bindings', content: encode(document), branch: current.meta.default_branch || 'main', ...(current.sha ? { sha: current.sha } : {}) }), signal);
+          if (!written.commit?.sha) throw new Error('GitHub 未返回账号记录提交版本，请使用更新／同步重新核实');
+          // Verify our committed snapshot, not the entire mutable branch after
+          // another device has legitimately added its own records.
+          const verified = await read(token, signal, false, written.commit.sha);
+          if (JSON.stringify(verified.document) !== JSON.stringify(document)) throw new GitHubError('账号记录在验证时发生变化，请重试合并', 409);
+          return verified.document;
+        } catch (error) {
+          signal.throwIfAborted();
+          const conflict = error instanceof GitHubError && (error.status === 409 || error.status === 422 && /sha|already exists|reference update|conflict|does not match/i.test(error.message));
+          const uncertain = error instanceof TypeError || error instanceof DOMException && error.name === 'TimeoutError' || error instanceof GitHubError && error.status >= 500;
+          if (!conflict && !uncertain) throw error;
+          if (attempt === 5) throw new Error(`账号记录持续发生写入冲突或响应异常，本地项目已保留，请稍后使用更新／同步重试：${(error as Error).message}`, { cause: error });
+          report(`账号记录已变化，正在等待并合并最新记录（${attempt + 1}/5）…`);
+          await wait(attempt, signal);
+        }
+      }
+      throw new Error('账号记录并发写入冲突，请稍后重试');
+    };
+    const queued = (accountWrites.get(key) || Promise.resolve()).then(async () => {
       signal.throwIfAborted();
-      report('正在保存并验证账号来源与分支记录…');
-      const current = await read(token, signal, true), document = validateDocument(edit(current.document, current.login), current.login);
-      try {
-        await api(`${current.root}/contents/${FILE}`, token, init('PUT', { message: 'Update GitVault account bindings', content: encode(document), branch: current.meta.default_branch || 'main', ...(current.sha ? { sha: current.sha } : {}) }), signal);
-        // Read back to verify the registry write; a lost response is retried by a later sync.
-        const verified = await read(token, signal);
-        if (JSON.stringify(verified.document) !== JSON.stringify(document)) throw new GitHubError('账号记录在验证时发生变化，请重试合并', 409);
-        return verified.document;
-      } catch (error) { if (!(error instanceof GitHubError) || ![409, 422].includes(error.status) || attempt === 3) throw error; }
-    }
-    throw new Error('账号记录并发写入冲突，请稍后重试');
+      // Web Locks also serialize other tabs on the same origin. SHA checks
+      // and merge retries remain required for other devices and APK clients.
+      if (typeof navigator !== 'undefined' && navigator.locks) return navigator.locks.request(`gitvault-account-record:${key}`, { mode: 'exclusive', signal }, mutate);
+      return mutate();
+    });
+    const settled = queued.then(() => {}, () => {});
+    accountWrites.set(key, settled);
+    void settled.then(() => { if (accountWrites.get(key) === settled) accountWrites.delete(key); });
+    return abortable(queued, signal);
   };
   const save = async (project: AccountProject, token: string, signal = operationSignal()) => change(token, document => {
     const old = document.projects.find(item => sameSource(item.source, project.source));
@@ -112,12 +169,14 @@ export function createAccountRegistry(api = githubApi) {
   const reserve = async (source: ProjectSource, name: string, kind: AccountProject['kind'], token: string, signal = operationSignal(), explicit?: TargetIdentity) => {
     if (!validName(name) || name.length > 100 || /^\.+$/.test(name) || name.toLowerCase() === REGISTRY_REPO) throw new Error('目标名称无效或属于跨设备记录仓库，请使用其他名称');
     let selected!: AccountProject;
+    const reservationId = crypto.randomUUID();
     await change(token, (document, login) => {
       const old = document.projects.find(item => sameSource(item.source, source));
+      if (old?.reservationId === reservationId) { selected = old; return document; }
       if (old) throw new ExistingSourceError(old);
       const targetOwner = explicit?.owner || login;
       if (document.projects.some(item => item.target.owner.toLowerCase() === targetOwner.toLowerCase() && item.target.repo.toLowerCase() === name.toLowerCase())) throw new Error('该目标名称已绑定其他来源，请先比较项目，不能覆盖其他来源');
-      selected = { source, target: explicit ? { id: explicit.id, owner: explicit.owner, repo: explicit.repo } : { owner: login, repo: name }, kind, state: 'reserved', createdByApp: true, reservationId: crypto.randomUUID(), bindings: { [source.branch]: { branch: source.branch, updatedAt: new Date().toISOString() } }, updatedAt: new Date().toISOString() };
+      selected = { source, target: explicit ? { id: explicit.id, owner: explicit.owner, repo: explicit.repo } : { owner: login, repo: name }, kind, state: 'reserved', createdByApp: true, reservationId, bindings: { [source.branch]: { branch: source.branch, updatedAt: new Date().toISOString() } }, updatedAt: new Date().toISOString() };
       return { ...document, projects: [...document.projects, selected] };
     }, signal);
     return selected;

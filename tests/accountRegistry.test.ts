@@ -9,6 +9,7 @@ function fixture(options: { exists?: boolean; owned?: any[]; document?: any; con
   beginGithubOperation();
   let exists = options.exists || !!options.document, version = options.document ? 1 : 0;
   let document: any = options.document; let conflict = options.conflict;
+  const snapshots = new Map<string, any>([[String(version), document]]);
   const requests: Array<{ path: string; value: any; method: string }> = [];
   const api = async (path: string, _token?: string, init: RequestInit = {}, signal?: AbortSignal) => {
     signal?.throwIfAborted();
@@ -20,20 +21,23 @@ function fixture(options: { exists?: boolean; owned?: any[]; document?: any; con
       return { private: options.private !== false, owner: { login: 'me' }, default_branch: 'main', description: options.occupied ? 'unrelated' : 'GitVault account sync registry v1' };
     }
     if (path === '/user/repos' && method === 'POST') { exists = true; return { private: true, owner: { login: 'me' }, default_branch: 'main', description: 'GitVault account sync registry v1' }; }
+    if (path === `/repos/me/${REGISTRY_REPO}/git/ref/heads/main`) return { object: { sha: String(version) } };
     if (path.startsWith(`/repos/me/${REGISTRY_REPO}/contents/gitvault.json`)) {
       if (method === 'PUT') {
-        if (conflict) { conflict = false; document = { app: 'Get-Up_GitVault', version: 1, account: 'me', projects: [project({ source: { ...source, owner: 'other', repositoryId: 43 }, target: { id: 88, owner: 'me', repo: 'other-target' } })] }; version++; throw new GitHubError('concurrent write', 409); }
+        if (conflict) { conflict = false; document = { app: 'Get-Up_GitVault', version: 1, account: 'me', projects: [project({ source: { ...source, owner: 'other', repositoryId: 43 }, target: { id: 88, owner: 'me', repo: 'other-target' } })] }; version++; snapshots.set(String(version), document); throw new GitHubError('concurrent write', 409); }
         if (value.sha !== (version ? String(version) : undefined)) throw new GitHubError('stale sha', 409);
-        document = JSON.parse(Buffer.from(value.content, 'base64').toString()); version++; return { content: { sha: String(version) } };
+        document = JSON.parse(Buffer.from(value.content, 'base64').toString()); version++; snapshots.set(String(version), document); return { content: { sha: String(version) }, commit: { sha: String(version) } };
       }
-      if (!document) throw new GitHubError('no file', 404);
-      return { encoding: 'base64', content: encoded(document), sha: String(version), size: 100 };
+      const ref = new URL(path, 'https://api.github.com').searchParams.get('ref') || String(version);
+      const snapshot = snapshots.get(ref);
+      if (!snapshot) throw new GitHubError('no file', 404);
+      return { encoding: 'base64', content: encoded(snapshot), sha: ref, size: 100 };
     }
     if (path.startsWith('/user/repos?')) { if (options.failList) throw new GitHubError('API rate limit exceeded', 403, true); return options.owned || []; }
     if (/^\/repos\/me\/[^/]+$/.test(path)) throw new GitHubError('Not Found',404);
     throw new Error('unexpected API ' + path);
   };
-  return { api, requests, document: () => document, registry: createAccountRegistry(api) };
+  return { api, requests, document: () => document, registry: createAccountRegistry(api, async () => {}) };
 }
 
 test('read-only discovery does not create a repository and quota errors never imply no existing source', async () => {
@@ -58,6 +62,103 @@ test('registry CAS retries merge concurrent changes without losing the other sou
   await f.registry.save(project(), 'token');
   assert.equal(f.document().projects.length, 2);
   assert.equal(f.requests.filter(request => request.method === 'PUT').length, 2);
+});
+test('concurrent clients and different tokens for one account serialize writes and retain both branches', async () => {
+  const f = fixture();
+  const second = createAccountRegistry(f.api, async () => {});
+  await Promise.all([
+    f.registry.save(project(), 'token-a'),
+    second.save(project({ source: { ...source, branch: 'feature/x' }, bindings: { 'feature/x': { branch: 'feature/x', updatedAt: 'later' } } }), 'token-b'),
+  ]);
+  assert.deepEqual(Object.keys(f.document().projects[0].bindings).sort(), ['feature/x', 'main']);
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 2);
+  assert.ok(f.requests.filter(request => request.path.includes('/contents/') && request.method === 'GET').every(request => /ref=\d+$/.test(request.path)));
+});
+test('verification pins our commit even when another device writes a different project before the response arrives', async () => {
+  const f = fixture(); let followed = false;
+  const api = async (path: string, token?: string, init: RequestInit = {}, signal?: AbortSignal) => {
+    const response: any = await f.api(path, token, init, signal);
+    if (init.method === 'PUT' && !followed) {
+      followed = true;
+      const other = project({ source: { ...source, repositoryId: 43, repo: 'other' }, target: { id: 88, owner: 'me', repo: 'other' } });
+      await f.api(path, token, { method: 'PUT', body: JSON.stringify({ sha: response.content.sha, content: encoded({ ...f.document(), projects: [...f.document().projects, other] }) }) }, signal);
+    }
+    return response;
+  };
+  await createAccountRegistry(api, async () => { assert.fail('A later valid commit must not trigger a retry'); }).save(project(), 'token');
+  assert.equal(f.document().projects.length, 2);
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 2);
+});
+test('a lost successful reservation response is reconciled without reserving twice or rejecting our own reservation', async () => {
+  const f = fixture(); let lost = false, waits = 0;
+  const api = async (path: string, token?: string, init: RequestInit = {}, signal?: AbortSignal) => {
+    const response: any = await f.api(path, token, init, signal);
+    if (init.method === 'PUT' && !lost) { lost = true; throw new TypeError('response lost'); }
+    return response;
+  };
+  const reserved = await createAccountRegistry(api, async () => { waits++; }).reserve(source, 'fixed-name', 'upload', 'token');
+  assert.equal(reserved.reservationId, f.document().projects[0].reservationId);
+  assert.equal(f.document().projects.length, 1);
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 1);
+  assert.equal(waits, 1);
+});
+test('repeated SHA conflicts wait and reload before merging, with a bounded failure preserving the cause', async () => {
+  for (const failures of [4, 6]) {
+    const f = fixture(); let puts = 0; const waits: number[] = [];
+    const registry = createAccountRegistry(async (path, token, init = {}, signal) => {
+      if (init.method === 'PUT' && puts++ < failures) throw new GitHubError('gitvault.json does not match latest-sha', 409);
+      return f.api(path, token, init, signal);
+    }, async attempt => { waits.push(attempt); });
+    if (failures === 4) {
+      await registry.save(project(), 'token');
+      assert.equal(f.document().projects[0].target.id, 77);
+    } else {
+      await assert.rejects(registry.save(project(), 'token'), (error: any) => /请稍后使用更新/.test(error.message) && error.cause.status === 409);
+      assert.equal(f.document(), undefined);
+    }
+    assert.deepEqual(waits, Array.from({ length: failures === 4 ? 4 : 5 }, (_, i) => i));
+    assert.equal(f.requests.filter(request => request.path.includes('/git/ref/')).length, failures === 4 ? 5 : 6);
+  }
+});
+test('cancelling conflict backoff stops further requests and frees the account queue', async () => {
+  const f = fixture(), controller = new AbortController(); let puts = 0;
+  const registry = createAccountRegistry(async (path, token, init = {}, signal) => {
+    if (init.method === 'PUT') { puts++; throw new GitHubError('stale sha', 409); }
+    return f.api(path, token, init, signal);
+  }, async (_attempt, signal) => { controller.abort(); signal.throwIfAborted(); });
+  await assert.rejects(registry.save(project(), 'token', controller.signal), { name: 'AbortError' });
+  assert.equal(puts, 1);
+  await f.registry.save(project(), 'token');
+  assert.equal(f.document().projects.length, 1);
+});
+test('queued cancellation returns promptly and never starts the cancelled write', async () => {
+  const f = fixture(); let release!: () => void, started!: () => void;
+  const waiting = new Promise<void>(resolve => { started = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const registry = createAccountRegistry(async (path, token, init = {}, signal) => {
+    if (init.method === 'PUT') { started(); await blocked; }
+    return f.api(path, token, init, signal);
+  });
+  const first = registry.save(project(), 'token'); await waiting;
+  const controller = new AbortController();
+  const second = registry.reserve({ ...source, repositoryId: 100 }, 'cancelled-target', 'upload', 'token', controller.signal);
+  await new Promise(resolve => setImmediate(resolve)); controller.abort();
+  await assert.rejects(second, { name: 'AbortError' });
+  release(); await first;
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 1);
+});
+test('permissions and validation failures are not retried and an unchanged receipt creates no extra commit', async () => {
+  for (const status of [403, 422]) {
+    const f = fixture(); let puts = 0;
+    const registry = createAccountRegistry(async (path, token, init = {}, signal) => {
+      if (init.method === 'PUT') { puts++; throw new GitHubError('permission or invalid content', status); }
+      return f.api(path, token, init, signal);
+    }, async () => { assert.fail('Non-conflict errors must not be retried'); });
+    await assert.rejects(registry.save(project(), 'token'), (error: any) => error.status === status);
+    assert.equal(puts, 1);
+  }
+  const f = fixture(); await f.registry.save(project(), 'token'); await f.registry.save(project(), 'token');
+  assert.equal(f.requests.filter(request => request.method === 'PUT').length, 1);
 });
 test('branch receipts merge into one immutable target and duplicate destination branches are rejected', async () => {
   const f = fixture(); await f.registry.save(project(), 'token');

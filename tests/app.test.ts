@@ -6,7 +6,7 @@ import 'fake-indexeddb/auto';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
-import { beginGithubOperation, githubClient, githubApi } from '../src/utils/githubClient';
+import { beginGithubOperation, githubClient, githubApi, GitHubError } from '../src/utils/githubClient';
 import App from '../src/App';
 import { appDialog } from '../src/utils/appDialog';
 import { checkpoint } from '../src/utils/taskJournal';
@@ -1174,10 +1174,13 @@ test('a verified upload keeps cache and pending account receipt if cloud registr
   const original=accountRegistry.candidates;let active=false;
   accountRegistry.candidates=async()=>({login:'destination',recorded:active?[{...cloudEntry(),bindings:{develop:{branch:'release',sourceSha:'v2',commitSha:'uploaded',updatedAt:'now'}}}]:[],legacy:[]});
   // The first migration must succeed; the subsequent verified receipt write fails.
-  accountRegistry.save=async()=>{saves++;if(saves>1&&failing)throw new Error('registry write denied');active=true;return {} as any;};
+  accountRegistry.save=async()=>{saves++;if(saves>1&&failing)throw new GitHubError('GitHub (409): gitvault.json does not match latest-sha',409);active=true;return {} as any;};
   await enterWorkbench();await upload(true);await waitFor(()=>alerts.some(message=>message.includes('项目已在 GitHub 保存')));
   assert.equal(storedProjects()[0].remoteSnapshot.commitSha,'uploaded');assert.equal(storedProjects()[0].cloudPending.length,1);
   assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');
+  const log=JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!).find((item:any)=>item.action==='上传指定仓库');
+  assert.equal(log.status,'partial');assert.equal(log.httpStatus,409);assert.ok(log.stage.includes('项目已保存'));
+  assert.ok(log.message.includes('gitvault.json does not match'));
   const writes=requests.filter(request=>request.path.endsWith('/git/commits')).length;
   failing=false;
   // Make the remote receipt and unchanged source resolvable during the retry.
@@ -1190,6 +1193,16 @@ test('a verified upload keeps cache and pending account receipt if cloud registr
   await click('一键更新');await waitFor(()=>storedProjects()[0].cloudPending.length===0);
   assert.equal(requests.filter(request=>request.path.endsWith('/git/commits')).length,writes);
   accountRegistry.candidates=original;
+});
+test('a first-upload registry conflict is logged before file upload and creates no target repository',async()=>{
+  accountRegistry.reserve=async()=>{throw new GitHubError('GitHub (409): gitvault.json does not match latest-sha',409);};
+  await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');
+  await waitFor(()=>alerts.some(message=>message.includes('gitvault.json does not match')));
+  const log=JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!).find((item:any)=>item.action==='上传');
+  assert.equal(log.status,'error');assert.equal(log.httpStatus,409);assert.equal(log.stage,'检查并预留账号记录');
+  assert.ok(!requests.some(request=>request.payload));
+  assert.equal(storedProjects()[0].remoteSnapshot,undefined);
+  assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');
 });
 test('failure logs are visible with the original GitHub reason and can be filtered',async()=>{
   failUpload=true;rejectionStatus=422;await enterWorkbench();await upload(false);
@@ -1266,13 +1279,14 @@ function accountHttpFixture() {
       const repo={id:100+ ++counter,name:payload.name,refs:new Map([['main','init']]),fork:false,private:true,description:payload.description};repositories.set(repo.name,repo);return ok(metadata(repo));
     }
     if(path==='/repos/destination/.gitvault-state')return registryExists?ok({private:true,owner:{login:'destination'},default_branch:'main',description:'GitVault account sync registry v1'}):ok({message:'Not Found'},404);
+    if(path==='/repos/destination/.gitvault-state/git/ref/heads/main')return ok({object:{sha:String(registryVersion)}});
     if(path==='/repos/destination/.gitvault-state/contents/gitvault.json'){
       if(method==='PUT'){
         if(failRegistry)return ok({message:'account record denied'},403);
         if(payload.sha!==(registryVersion?String(registryVersion):undefined))return ok({message:'conflict'},409);
-        registryVersion++;documents.set('registry',{sha:String(registryVersion),content:payload.content});return ok({content:{sha:String(registryVersion)}});
+        registryVersion++;const saved={sha:String(registryVersion),content:payload.content};documents.set('registry',saved);documents.set(String(registryVersion),saved);return ok({content:{sha:String(registryVersion)},commit:{sha:String(registryVersion)}});
       }
-      const doc=documents.get('registry');return doc?ok({...doc,encoding:'base64',size:500}):ok({message:'Not Found'},404);
+      const doc=documents.get(parsed.searchParams.get('ref')||'registry');return doc?ok({...doc,encoding:'base64',size:500}):ok({message:'Not Found'},404);
     }
     if(path==='/repos/source/project')return ok({id:42,name:'project',owner:{login:'source'},default_branch:'develop',html_url:'https://github.com/source/project'});
     if(path==='/repos/source/project/branches')return ok([{name:'develop'},{name:'other'}]);

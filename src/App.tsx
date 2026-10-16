@@ -21,7 +21,7 @@ import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
-import { accountRegistry, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject, type TargetHistory } from './utils/accountRegistry';
+import { accountRegistry, AccountRecordPendingError, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject, type TargetHistory } from './utils/accountRegistry';
 import { appendOperationLog, readOperationLogs, clearOperationLogs, type OperationLog } from './utils/operationLog';
 import { bindingLabel, switchedHistory } from './utils/projectBinding';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
@@ -442,23 +442,38 @@ export default function App() {
     return () => window.removeEventListener('gitvault-logs-changed', changed);
   }, []);
   const logOperation = (action: string, status: OperationLog['status'], repo: TrackedRepo | undefined, message: string, stage = '', error?: unknown, batchId?: string) => {
+    if (error instanceof AccountRecordPendingError && status !== 'cancelled') { status = 'partial'; stage = '保存账号记录（项目已保存）'; }
+    let reason = error;
+    while (reason instanceof Error && reason.cause instanceof Error) reason = reason.cause;
     const secrets = [switchToken, ...operationTokens.current, globalToken, tokenInput, pushToken, batchTaskToken, targetManagerToken, ...reposRef.current.flatMap(project => [project.token || '', project.uploadTarget?.token || '', project.forkTarget?.token || '', ...Object.values(project.branchTargets || {}).map(target => target.token || '')])];
-    try { appendOperationLog({ action, status, project: repo ? `${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, branch: repo ? sourceOf(repo).branch : undefined, target: repo?.uploadTarget ? `${repo.uploadTarget.owner}/${repo.uploadTarget.repo}:${repo.uploadTarget.branch}` : undefined, message, stage, httpStatus: error instanceof GitHubError ? error.status : undefined, batchId }, secrets); }
+    try { appendOperationLog({ action, status, project: repo ? `${sourceOf(repo).owner}/${sourceOf(repo).repo}` : undefined, branch: repo ? sourceOf(repo).branch : undefined, target: repo?.uploadTarget ? `${repo.uploadTarget.owner}/${repo.uploadTarget.repo}:${repo.uploadTarget.branch}` : undefined, message, stage, httpStatus: reason instanceof GitHubError ? reason.status : undefined, batchId }, secrets); }
     catch { setLogStorageError('操作日志无法持久保存，请检查浏览器存储空间并导出已有日志'); }
   };
+  const cloudFlushes = useRef(new Map<string, Promise<void>>());
   const flushCloudPending = async (repo: TrackedRepo, token: string) => {
-    const pending = reposRef.current.find(project => project.id === repo.id)?.cloudPending || [];
-    for (const entry of pending) {
-      try {
-        const identity=await githubClient.repository(entry.target.owner, entry.target.repo, token, entry.target.id);
-        await accountRegistry.save({...entry,target:{id:identity.id,owner:identity.owner,repo:identity.repo,private:identity.private}}, token);
-        const current = reposRef.current.find(project => project.id === repo.id);
-        if (current) patchRepo(repo.id, { cloudPending: (current.cloudPending || []).filter(item => item !== entry && JSON.stringify(item) !== JSON.stringify(entry)) });
-      } catch (error) {
-        logOperation('保存跨设备记录', 'partial', repo, (error as Error).message, '账号记录', error);
-        throw new Error(`项目已在 GitHub 保存，但跨设备记录尚未完成；本地缓存和固定目标已保留，请使用更新／同步重试，不能重复创建：${(error as Error).message}`);
+    const running = cloudFlushes.current.get(repo.id);
+    if (running) return running;
+    const task = (async () => {
+      // A new tag edit or branch receipt can be queued while an earlier save is
+      // awaiting GitHub. Drain the latest queue without dropping its replacement.
+      while (true) {
+        const entry = reposRef.current.find(project => project.id === repo.id)?.cloudPending?.[0];
+        if (!entry) return;
+        try {
+          const identity=await githubClient.repository(entry.target.owner, entry.target.repo, token, entry.target.id);
+          await accountRegistry.save({...entry,target:{id:identity.id,owner:identity.owner,repo:identity.repo,private:identity.private}}, token);
+          const current = reposRef.current.find(project => project.id === repo.id);
+          if (current) patchRepo(repo.id, { cloudPending: (current.cloudPending || []).filter(item => item !== entry && JSON.stringify(item) !== JSON.stringify(entry)) });
+        } catch (error) {
+          logOperation('保存跨设备记录', 'partial', repo, (error as Error).message, '账号记录', error);
+          throw new AccountRecordPendingError(error);
+        }
       }
-    }
+    })();
+    cloudFlushes.current.set(repo.id, task);
+    const release = () => { if (cloudFlushes.current.get(repo.id) === task) cloudFlushes.current.delete(repo.id); };
+    void task.then(release, release);
+    return task;
   };
   const queueAccountRecord = (repo: TrackedRepo, entry: AccountProject) => {
     const current = reposRef.current.find(project => project.id === repo.id) || repo;
@@ -1815,6 +1830,7 @@ export default config;
     const token = singleUploadTargetRepo.uploadTarget?.token || globalToken || singleUploadTargetRepo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation(); setIsUploadingToPrivate(true);
+    let stage = '检查并预留账号记录';
     try {
       let repo = singleUploadTargetRepo;
       let name = singleUploadRepoName.trim();
@@ -1827,17 +1843,19 @@ export default config;
         name = guard.name;
       }
       const existing = repo.creationReservation ? undefined : await boundTarget(repo, token);
+      stage = '创建或检查目标仓库';
       const target = existing || await githubClient.ensurePrivateRepo(token, name, singleUploadDescription.trim(), singleUploadRemark.trim());
       if (!existing && 'alreadyExisted' in target && target.alreadyExisted) throw new Error('首次任务执行前目标仓库已出现，本次未写入；请重试并比较已有仓库。');
       const branch = existing?.branch || sourceOf(repo).branch;
       assertDestinationBranch(repo, { ...target, branch });
       const files = await versionFiles(repo);
+      stage = '上传并验证项目文件';
       const result = await githubClient.push(target.owner, target.repo, branch, token, files, `Sync ${repo.repo} @ ${repo.latestCommitSha}`, repo.forkScope === 'full' ? undefined : singleUploadDescription.trim(), repo.forkScope === 'full' ? undefined : singleUploadRemark.trim(), repo.forkScope === 'full' ? undefined : sourceOf(repo).url, { rebaseOnConflict: true, expectedRepoId: target.id });
       await recordUpload(repo, result, singleUploadPurgeCache, undefined, { privateRepoUrl: target.htmlUrl, remark: singleUploadRemark.trim(), description: singleUploadDescription.trim() }, token);
       logOperation('上传', 'success', singleUploadTargetRepo, '项目与账号记录均已验证保存');
       setIsSingleUploadModalOpen(false);
       appDialog.notify(`已验证完整上传 ${files.length} 个文件。${singleUploadPurgeCache ? '本地源码已清理，版本快照已保留。' : '本地源码已保留。'}`);
-    } catch (error) { logOperation('上传', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, '验证上传', error); appDialog.notify('上传未完成：' + (error as Error).message); }
+    } catch (error) { logOperation('上传', operationSignal().aborted ? 'cancelled' : 'error', singleUploadTargetRepo || undefined, (error as Error).message, stage, error); appDialog.notify((error instanceof AccountRecordPendingError ? '账号记录待补存：' : '上传未完成：') + (error as Error).message); }
     finally { setIsUploadingToPrivate(false); setIsLoading(false); }
   };
 
