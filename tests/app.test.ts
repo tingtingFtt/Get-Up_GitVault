@@ -116,6 +116,7 @@ function deletedTargetFixture(options: { recreate?: boolean; restoreSource?: boo
     }
     if (options.recreate && path === '/user') return ok({ login: 'destination' });
     if (options.recreate && path === '/user/repos') { recreated = true; requests.push({ path, payload: JSON.parse(init.body as string) }); return ok({ id: 99, name: 'backup', owner: { login: 'destination' }, default_branch: 'main', html_url: 'https://github.com/destination/backup' }); }
+    if (options.recreate && path === '/repos/source/project/commits/develop') return ok({ sha: 'v2', commit: { message: 'new', author: {} } });
     if (options.restoreSource && path === '/repos/source/project') return ok({ id: 42, default_branch: 'develop' });
     if (options.restoreSource && path === '/repos/source/project/commits/v2') { requests.push({ path, payload: null }); return options.missingSource ? ok({ message: 'Not Found' }, 404) : ok({ sha: 'v2', commit: { tree: { sha: 'recovered-source-tree' }, message: 'new', author: {} } }); }
     if (path.includes('/git/trees/recovered-source-tree')) return ok({ tree: [entry('new')] });
@@ -224,6 +225,9 @@ test('after detaching a deleted upload users can recreate the same repository na
   assert.equal(storedProjects()[0].uploadTarget.branch, 'develop'); assert.equal(storedProjects()[0].targetHealth['id:99'].status, 'available');
   assert.equal(storedProjects()[0].backups.length, 1); assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.ok(!requests.some(request => request.path.includes('/git/refs/heads/release')));
+  const previousAlerts = alerts.length; await click('同步上游'); await waitFor(() => alerts.length > previousAlerts);
+  assert.ok(alerts.at(-1)?.includes('当前已是最新版本'));
+  assert.ok(!requests.some(request => request.path.endsWith('/merge-upstream')));
 });
 test('purged source can be recovered from its exact original commit after the old target is deleted and recreated under the same name', async () => {
   const saved = boundProject(); saved.isCachePurged = true; saved.cachedFilesCount = 0;

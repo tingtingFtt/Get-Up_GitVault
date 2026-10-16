@@ -1400,7 +1400,7 @@ export default config;
   };
 
   const syncProjectUpstream = async (repo: TrackedRepo, token: string, syncedTargets?: Map<string, Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>>): Promise<string> => {
-    if (repo.forkScope === 'current') return updateProject(repo, token);
+    if (repo.forkScope === 'current' || repo.detachedTargets?.length && !repo.forkTarget && repo.uploadTarget) return updateProject(repo, token);
     if (repo.detachedTargets?.length && !repo.forkTarget && !repo.forkScope) throw new Error('旧分叉绑定已解除，请先在“分叉与私有仓”中重新创建或关联分叉。');
     const target = repo.forkTarget || { owner: repo.owner, repo: repo.repo, branch: repo.branch };
     await githubClient.repository(target.owner, target.repo, token, 'id' in target ? target.id : undefined);
