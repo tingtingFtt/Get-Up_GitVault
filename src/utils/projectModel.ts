@@ -1,7 +1,7 @@
 import type { RepoEntry } from './githubClient';
 
 export interface ProjectSource { owner: string; repo: string; url: string; branch: string; repositoryId?: number }
-export interface UploadTarget { id?: number; owner: string; repo: string; branch: string; purgeAfterUpload: boolean; token?: string; kind?: 'upload' | 'current' | 'full' }
+export interface UploadTarget { private?: boolean; id?: number; owner: string; repo: string; branch: string; purgeAfterUpload: boolean; token?: string; kind?: 'upload' | 'current' | 'full' }
 export interface RemoteSnapshot { repoId?: number; owner: string; repo: string; branch: string; commitSha: string; sourceSha: string; htmlUrl: string }
 export interface BackupVersion {
   branch?: string;
@@ -12,6 +12,9 @@ export interface BackupVersion {
 }
 export function sourceOf(project: ProjectSource & { origin?: ProjectSource }): ProjectSource {
   return project.origin || { owner: project.owner, repo: project.repo, url: project.url, branch: project.branch, ...(project.repositoryId ? { repositoryId: project.repositoryId } : {}) };
+}
+export function pullSourceOf(project: ProjectSource & { origin?: ProjectSource; primarySource?: ProjectSource }): ProjectSource {
+  return project.primarySource || sourceOf(project);
 }
 export function savedSnapshot(project: { remoteSnapshot?: RemoteSnapshot; backups: BackupVersion[]; savedCopies?: RemoteSnapshot[] }, sha: string) {
   return [project.remoteSnapshot, ...project.backups.map(b => b.remoteSnapshot), ...(project.savedCopies || [])].find(s => s?.sourceSha === sha);
@@ -34,12 +37,14 @@ export function assertBranchTarget(project: BranchProject, sourceBranch: string,
   }
 }
 /** Rename every stored reference to the same repository, including historical snapshots. */
-export function renamedProject<T extends { uploadTarget?: UploadTarget; branchTargets?: Record<string, UploadTarget>; forkTarget?: { id?: number; owner: string; repo: string; branch: string; htmlUrl: string }; owner: string; repo: string; url: string; origin?: ProjectSource; privateRepoUrl?: string; repoMeta: { htmlUrl?: string }; remoteSnapshot?: RemoteSnapshot; backups: BackupVersion[]; savedCopies?: RemoteSnapshot[] }>(project: T, previous: UploadTarget, next: { id?: number; owner: string; repo: string; htmlUrl: string }): T {
+export function renamedProject<T extends { uploadTarget?: UploadTarget; branchTargets?: Record<string, UploadTarget>; forkTarget?: { id?: number; owner: string; repo: string; branch: string; htmlUrl: string }; owner: string; repo: string; url: string; origin?: ProjectSource; primarySource?: ProjectSource; targetHistory?: Array<{target:{id?:number;owner:string;repo:string}}>; privateRepoUrl?: string; repoMeta: { htmlUrl?: string }; remoteSnapshot?: RemoteSnapshot; backups: BackupVersion[]; savedCopies?: RemoteSnapshot[] }>(project: T, previous: UploadTarget, next: { id?: number; owner: string; repo: string; htmlUrl: string }): T {
   const matches = (value: { id?: number; repoId?: number; owner: string; repo: string } | undefined) => !!value && (previous.id && (value.id || value.repoId) ? previous.id === (value.id || value.repoId) : value.owner.toLowerCase() === previous.owner.toLowerCase() && value.repo.toLowerCase() === previous.repo.toLowerCase());
   const snapshot = (value: RemoteSnapshot | undefined) => matches(value) ? { ...value!, owner: next.owner, repo: next.repo, repoId: next.id, htmlUrl: `${next.htmlUrl}/tree/${value!.branch}` } : value;
   const isManaged = !!project.origin && matches(project);
   return { ...project,
     ...(isManaged ? { owner: next.owner, repo: next.repo, url: next.htmlUrl, repoMeta: { ...project.repoMeta, htmlUrl: next.htmlUrl } } : {}),
+    targetHistory: project.targetHistory?.map(item => matches(item.target) ? {...item,target:{...item.target,id:next.id,owner:next.owner,repo:next.repo}} : item),
+    primarySource: project.primarySource && matches({id:project.primarySource.repositoryId,...project.primarySource}) ? {...project.primarySource,owner:next.owner,repo:next.repo,url:next.htmlUrl,repositoryId:next.id} : project.primarySource,
     uploadTarget: matches(project.uploadTarget) ? { ...project.uploadTarget!, ...next } : project.uploadTarget,
     branchTargets: project.branchTargets ? Object.fromEntries(Object.entries(project.branchTargets).map(([branch, target]) => [branch, matches(target) ? { ...target, ...next } : target])) : undefined,
     forkTarget: matches(project.forkTarget) ? { ...project.forkTarget!, ...next } : project.forkTarget,

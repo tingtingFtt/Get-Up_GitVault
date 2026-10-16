@@ -30,6 +30,7 @@ function fixture(options: { exists?: boolean; owned?: any[]; document?: any; con
       return { encoding: 'base64', content: encoded(document), sha: String(version), size: 100 };
     }
     if (path.startsWith('/user/repos?')) { if (options.failList) throw new GitHubError('API rate limit exceeded', 403, true); return options.owned || []; }
+    if (/^\/repos\/me\/[^/]+$/.test(path)) throw new GitHubError('Not Found',404);
     throw new Error('unexpected API ' + path);
   };
   return { api, requests, document: () => document, registry: createAccountRegistry(api) };
@@ -124,4 +125,26 @@ test('legacy provenance is reused during a batch instead of querying every Fork 
   const registry=createAccountRegistry(api);
   await registry.candidates(source,'token');await registry.candidates({...source,repo:'different',repositoryId:123},'token');
   assert.equal(parents,1);assert.equal(branches,1);assert.equal(files,1);
+});
+test('a switch lease preserves the old target until verified completion and rejects stale or competing moves',async()=>{
+  const f=fixture();await f.registry.save(project(),'token');
+  const target={owner:'me',repo:'new-copy'};
+  const lease=await f.registry.reserveSwitch(source,target,'main',project().target,'token');
+  assert.equal(f.document().projects[0].target.id,77);assert.equal(f.document().projects[0].switchReservation.id,lease.id);
+  await assert.rejects(f.registry.reserveSwitch(source,{owner:'me',repo:'other-copy'},'main',project().target,'token'),/另存任务/);
+  const next=project({target:{...target,id:99},kind:'upload',bindings:{main:{branch:'main',sourceSha:'s2',commitSha:'t2',updatedAt:'later'}}});
+  await assert.rejects(f.registry.completeSwitch(next,'stale','token'),/预留已改变/);
+  await f.registry.completeSwitch(next,lease.id,'token');
+  assert.equal(f.document().projects[0].target.id,99);assert.equal(f.document().projects[0].primary,true);assert.equal(f.document().projects[0].history[0].target.id,77);
+  await f.registry.completeSwitch(next,lease.id,'token');assert.equal(f.document().projects[0].history.length,1);
+  await assert.rejects(f.registry.reserveSwitch(source,{owner:'me',repo:'third'},'main',project().target,'token'),ExistingSourceError);
+});
+test('a same-name owned repository is discovered without an index or a whole-account scan',async()=>{
+  const f=fixture();const api=async(path:string,...args:any[])=>path==='/repos/me/source'?{id:77,name:'source',owner:{login:'me'},private:true,fork:false}:f.api(path,...args);
+  const candidates=await createAccountRegistry(api).candidates(source,'token');assert.equal(candidates.legacy[0].target.private,true);assert.equal(candidates.legacy[0].target.id,77);assert.ok(!f.requests.some(request=>request.path.startsWith('/user/repos?')));
+});
+test('profile-only changes retain branch receipts and store no target credentials',async()=>{
+  const f=fixture();await f.registry.save(project(),'token');
+  await f.registry.save(project({target:{...project().target,token:'never-store'} as any,profile:{tags:['B'],remark:'name',description:'description',updatedAt:'2026-10-16T09:00:00Z'},bindings:{main:{branch:'release',updatedAt:'later'}}}),'token');
+  assert.equal(f.document().projects[0].bindings.main.commitSha,'target-v1');assert.deepEqual(f.document().projects[0].profile.tags,['B']);assert.ok(!JSON.stringify(f.document()).includes('never-store'));
 });

@@ -6,9 +6,9 @@ import 'fake-indexeddb/auto';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
-import { beginGithubOperation, githubClient } from '../src/utils/githubClient';
+import { beginGithubOperation, githubClient, githubApi } from '../src/utils/githubClient';
 import App from '../src/App';
-import { accountRegistry, type AccountProject } from '../src/utils/accountRegistry';
+import { accountRegistry, createAccountRegistry, type AccountProject } from '../src/utils/accountRegistry';
 const registryMethods = { ...accountRegistry };
 
 const originalFetch = globalThis.fetch;
@@ -17,7 +17,7 @@ const sha = (s: string) => createHash('sha1').update(`blob ${Buffer.byteLength(s
 const file = (content: string) => ({ path: 'a.txt', content, isBase64: false, sha: sha(content), mode: '100644' });
 const entry = (content: string) => ({ path: 'a.txt', sha: sha(content), mode: '100644', type: 'blob', size: content.length });
 
-function importAssociationFixture(options: { changedId?: boolean; full?: boolean; delayedComparison?: boolean; missingBranch?: string } = {}) {
+function importAssociationFixture(options: { changedId?: boolean; full?: boolean; delayedComparison?: boolean; missingBranch?: string; identical?:boolean } = {}) {
   const base = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     const path = String(url).replace('https://api.github.com', '');
@@ -41,7 +41,7 @@ function importAssociationFixture(options: { changedId?: boolean; full?: boolean
     if (options.missingBranch && path === '/repos/destination/backup/commits/' + encodeURIComponent(options.missingBranch)) return ok({ message: 'Not Found' }, 404);
     if (options.missingBranch && path.startsWith('/repos/destination/backup/branches?')) return ok([{ name: 'main' }, { name: 'release' }]);
     if (path.includes('/git/trees/import-tree')) { requests.push({ path, payload: null }); return ok({ tree: [entry('latest')] }); }
-    if (path.includes('/git/trees/compare-tree')) { requests.push({ path, payload: null }); return ok({ tree: [entry('old'), { ...entry('delete'), path: 'deleted.txt' }] }); }
+    if (path.includes('/git/trees/compare-tree')) { requests.push({ path, payload: null }); return ok({ tree: options.identical ? [entry('latest')] : [entry('old'), { ...entry('delete'), path: 'deleted.txt' }] }); }
     if (path.includes('/git/blobs/')) {
       const content = ['latest', 'old', 'delete'].find(value => path.endsWith(sha(value)));
       if (content) { requests.push({ path, payload: null }); return ok({ encoding: 'base64', content: Buffer.from(content).toString('base64') }); }
@@ -1063,7 +1063,7 @@ function cloudEntry(full = false): AccountProject {
   return {source:{owner:'source',repo:'project',url:'https://github.com/source/project',branch:'develop',repositoryId:42},target:{id:77,owner:'destination',repo:'backup'},kind:full?'full':'upload',state:'active',createdByApp:true,branches:full?['develop','other']:undefined,bindings:{develop:{branch:'release',sourceSha:'import-new',commitSha:'target-current',updatedAt:'now'}},updatedAt:'now'};
 }
 test('a fresh device importing the original link restores the account target and synced receipt without uploading', async () => {
-  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture();
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({identical:true});
   accountRegistry.candidates = async () => ({login:'destination',recorded:[cloudEntry()],legacy:[]});
   await click('新建链接/拉取项目'); await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');
   await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地'); await waitFor(()=>alerts.length>0);
@@ -1072,7 +1072,7 @@ test('a fresh device importing the original link restores the account target and
   assert.ok(document.body.textContent?.includes('已同步')); assert.ok(!importDialog()); assert.ok(requests.every(request=>!request.payload));
 });
 test('a fresh device importing the destination URL resumes the original source branch and fixed destination', async () => {
-  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture();
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({identical:true});
   const base=globalThis.fetch;
   globalThis.fetch=async(url,init={})=>String(url).endsWith('/repos/destination/backup/commits/main')?ok({sha:'target-current',commit:{tree:{sha:'compare-tree'},message:'old',author:{}}}):base(url,init);
   accountRegistry.candidates = async () => ({login:'destination',recorded:[cloudEntry()],legacy:[]});
@@ -1082,13 +1082,13 @@ test('a fresh device importing the destination URL resumes the original source b
   assert.equal(saved.latestCommitSha,'import-new'); assert.ok(requests.every(request=>!request.payload));
 });
 test('a fresh-device full Fork import displays forked state and keeps its account target', async()=>{
-  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({full:true});
+  localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({full:true,identical:true});
   accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry(true)],legacy:[]});
   await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');await waitFor(()=>alerts.length>0);
   assert.equal(storedProjects()[0].forkTarget.id,77);assert.equal(storedProjects()[0].accountState,'forked');assert.ok(document.body.textContent?.includes('已分叉'));assert.ok(requests.every(request=>!request.payload));
 });
 test('an inaccessible account target remains fixed on a fresh device instead of allowing duplicate creation', async()=>{
-  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture();
+  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture({identical:true});
   const base=globalThis.fetch;globalThis.fetch=async(url,init={})=>String(url)==='https://api.github.com/repos/destination/backup'?ok({message:'Not Found'},404):base(url,init);
   accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry()],legacy:[]});
   await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');await waitFor(()=>alerts.length>0);
@@ -1191,4 +1191,141 @@ test('an existing accessible target cannot be detached to bypass first-upload de
   await enterWorkbench();await click('管理远端目标');await click('解除此目标的所有绑定');
   await waitFor(()=>targetManager()?.textContent?.includes('目标仓库仍然存在')===true);
   assert.equal(storedProjects()[0].uploadTarget.id,77);assert.equal(removed,false);assert.equal(storedProjects()[0].cloudRemovals,undefined);
+});
+
+// Exercise the real registry, GitHub HTTP adapter, comparison and UI together.
+// A/B are isolated browser storage sessions sharing this synthetic GitHub account.
+function accountHttpFixture() {
+  const initial=globalThis.fetch;
+  const documents=new Map<string,{sha:string;content:string}>();let registryExists=false,registryVersion=0;
+  const trees=new Map<string,any[]>([['empty',[]],['source-v2',[entry('new')]],['source-v3',[entry('newest')]],['source-other',[entry('other')]]]);
+  const blobs=new Map<string,string>(['new','newest','other'].map(value=>[sha(value),value]));
+  const commits=new Map<string,any>([['init',{tree:{sha:'empty'},message:'init',author:{}}],['v2',{tree:{sha:'source-v2'},message:'source',author:{}}],['v3',{tree:{sha:'source-v3'},message:'source newer',author:{}}],['other-v',{tree:{sha:'source-other'},message:'other',author:{}}]]);
+  const repositories=new Map<string,{id:number;name:string;refs:Map<string,string>;fork:boolean;private:boolean;description:string}>();
+  let counter=0,sourceHead='v2',failRegistry=false;
+  const sent:Array<{path:string;method:string;payload:any}>=[];
+  globalThis.fetch=async(url,init={})=>{
+    const parsed=new URL(String(url));if(parsed.hostname!=='api.github.com')return initial(url,init);
+    const path=decodeURIComponent(parsed.pathname),method=init.method||'GET',payload=init.body?JSON.parse(String(init.body)):undefined;
+    sent.push({path,method,payload});
+    if(path==='/user')return ok({login:'destination',id:7});
+    if(path==='/rate_limit')return ok({resources:{core:{remaining:4999,limit:5000}}});
+    const metadata=(repo:any)=>({id:repo.id,name:repo.name,owner:{login:'destination'},private:repo.private,default_branch:'develop',description:repo.description,html_url:`https://github.com/destination/${repo.name}`,fork:repo.fork,...(repo.fork?{parent:{id:42,name:'project',owner:{login:'source'},full_name:'source/project'}}:{})});
+    if(path==='/user/repos'&&method==='GET')return ok([...repositories.values()].map(metadata));
+    if(path==='/user/repos'&&method==='POST'){
+      if(payload.name==='.gitvault-state'){registryExists=true;return ok({private:true,owner:{login:'destination'},default_branch:'main',description:'GitVault account sync registry v1'});}
+      if(repositories.has(payload.name))return ok({message:'already exists'},422);
+      const repo={id:100+ ++counter,name:payload.name,refs:new Map([['main','init']]),fork:false,private:true,description:payload.description};repositories.set(repo.name,repo);return ok(metadata(repo));
+    }
+    if(path==='/repos/destination/.gitvault-state')return registryExists?ok({private:true,owner:{login:'destination'},default_branch:'main',description:'GitVault account sync registry v1'}):ok({message:'Not Found'},404);
+    if(path==='/repos/destination/.gitvault-state/contents/gitvault.json'){
+      if(method==='PUT'){
+        if(failRegistry)return ok({message:'account record denied'},403);
+        if(payload.sha!==(registryVersion?String(registryVersion):undefined))return ok({message:'conflict'},409);
+        registryVersion++;documents.set('registry',{sha:String(registryVersion),content:payload.content});return ok({content:{sha:String(registryVersion)}});
+      }
+      const doc=documents.get('registry');return doc?ok({...doc,encoding:'base64',size:500}):ok({message:'Not Found'},404);
+    }
+    if(path==='/repos/source/project')return ok({id:42,name:'project',owner:{login:'source'},default_branch:'develop',html_url:'https://github.com/source/project'});
+    if(path==='/repos/source/project/branches')return ok([{name:'develop'},{name:'other'}]);
+    if(path==='/repos/source/project/forks'&&method==='POST'){
+      const repo={id:100+ ++counter,name:payload.name||'project',refs:new Map([['develop',sourceHead],['other','other-v']]),fork:true,private:false,description:''};repositories.set(repo.name,repo);return ok(metadata(repo));
+    }
+    const match=/^\/repos\/(source|destination)\/([^/]+)(.*)$/.exec(path);
+    if(!match)return ok({message:'Unexpected endpoint'},404);
+    const [,owner,name,suffix]=match;const repo=owner==='destination'?repositories.get(name):undefined;
+    if(owner==='destination'&&!repo)return ok({message:'Not Found'},404);
+    if(repo&&!suffix){if(method==='PATCH'){repositories.delete(repo.name);repo.name=payload.name;repositories.set(repo.name,repo);}return ok(metadata(repo));}
+    if(suffix==='/branches')return ok([...(repo?.refs.keys()||[])].map(name=>({name})));
+    if(suffix.startsWith('/commits/')){
+      const ref=suffix.slice('/commits/'.length);const head=repo?repo.refs.get(ref)||ref:ref==='develop'?sourceHead:ref==='other'?'other-v':ref;
+      const commit=commits.get(head);return commit?ok({sha:head,commit}):ok({message:'Not Found'},404);
+    }
+    if(suffix.startsWith('/git/ref/heads/')){const head=repo?.refs.get(suffix.slice('/git/ref/heads/'.length));return head?ok({object:{sha:head}}):ok({message:'Not Found'},404);}
+    if(suffix==='/git/refs'&&method==='POST'){repo!.refs.set(payload.ref.slice('refs/heads/'.length),payload.sha);return ok({object:{sha:payload.sha}});}
+    if(suffix.startsWith('/git/refs/heads/')&&method==='PATCH'){repo!.refs.set(suffix.slice('/git/refs/heads/'.length),payload.sha);return ok({object:{sha:payload.sha}});}
+    if(suffix==='/git/blobs'&&method==='POST'){const content=payload.encoding==='base64'?Buffer.from(payload.content,'base64').toString():payload.content;blobs.set(sha(content),content);return ok({sha:sha(content)});}
+    if(suffix.startsWith('/git/blobs/')){const hash=suffix.slice('/git/blobs/'.length);return blobs.has(hash)?ok({sha:hash,encoding:'base64',content:Buffer.from(blobs.get(hash)!).toString('base64')}):ok({message:'Not Found'},404);}
+    if(suffix==='/git/trees'&&method==='POST'){
+      const tree=(trees.get(payload.base_tree)||[]).map(item=>({...item}));
+      for(const item of payload.tree){const index=tree.findIndex(old=>old.path===item.path);if(index>=0)tree.splice(index,1);if(item.sha!==null)tree.push(item);}
+      const hash='tree-'+ ++counter;trees.set(hash,tree);return ok({sha:hash});
+    }
+    if(suffix.startsWith('/git/trees/'))return ok({tree:trees.get(suffix.slice('/git/trees/'.length))||[],truncated:false});
+    if(suffix==='/git/commits'&&method==='POST'){const hash='commit-'+ ++counter;commits.set(hash,{tree:{sha:payload.tree},message:payload.message,author:{},parents:payload.parents});return ok({sha:hash});}
+    if(suffix.startsWith('/git/commits/')){const hash=suffix.slice('/git/commits/'.length);return commits.has(hash)?ok(commits.get(hash)):ok({message:'Not Found'},404);}
+    if(suffix.startsWith('/contents/')){
+      const ref=parsed.searchParams.get('ref')||'develop',head=repo?.refs.get(ref)||ref;const commit=commits.get(head);const item=trees.get(commit?.tree.sha)?.find(item=>item.path===suffix.slice('/contents/'.length));
+      return item?ok({type:'file',sha:item.sha,encoding:'base64',size:blobs.get(item.sha)?.length||0,content:Buffer.from(blobs.get(item.sha)||'').toString('base64')}):ok({message:'Not Found'},404);
+    }
+    return ok({message:'Unexpected endpoint '+path},404);
+  };
+  Object.assign(accountRegistry,createAccountRegistry(githubApi));
+  return {repositories,sent,documents,trees,commits,setSource:(sha:string)=>{sourceHead=sha;},failRecords:(value:boolean)=>{failRegistry=value;},document:()=>{const stored=documents.get('registry');return stored?JSON.parse(Buffer.from(stored.content,'base64').toString()):undefined;}};
+}
+async function freshDevice() {localStorage.clear();localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);}
+async function importSourceLink(){await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');}
+test('HTTP A upload -> fresh B same-name compare -> auto-bind -> tag save -> branch-only update without registry mocks',async()=>{
+  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot?.commitSha);
+  const a=storedProjects()[0];const originalHead=server.repositories.get('project')!.refs.get('develop');assert.equal(server.document().projects[0].target.id,a.uploadTarget.id);
+  // A missing index tests same-name discovery and a full manifest comparison.
+  const doc=server.documents.get('registry')!;doc.content=Buffer.from(JSON.stringify({...server.document(),projects:[]})).toString('base64');
+  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);
+  const b=storedProjects()[0];assert.equal(b.uploadTarget.id,a.uploadTarget.id);assert.equal(b.remoteSnapshot.commitSha,originalHead);assert.ok(document.body.textContent?.includes('私人仓库已同步'));assert.ok(!importDialog());
+  await enterWorkbench();await click('编辑备注与描述');
+  const tagField=[...document.querySelectorAll<HTMLInputElement>('input')].find(field=>field.value==='默认')!;assert.ok(tagField);await setField(tagField,'B标签');await click('保存修改');await waitFor(()=>server.document().projects[0].profile.tags.includes('B标签'));
+  server.setSource('v3');await click('一键更新');await waitFor(()=>storedProjects()[0].latestCommitSha==='v3'&&storedProjects()[0].remoteSnapshot?.sourceSha==='v3');
+  assert.notEqual(server.repositories.get('project')!.refs.get('develop'),originalHead);assert.equal(server.repositories.get('project')!.refs.get('main'),'init');
+  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.deepEqual(storedProjects()[0].tags,['B标签']);
+});
+test('HTTP A native Fork -> fresh B restores true Fork tag and all-branch identity',async()=>{
+  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('板块二：创建分叉与上游同步');
+  const select=[...document.querySelectorAll('select')].find(field=>[...field.options].some(option=>option.value==='full'))!;await setField(select,'full');await input('project','project');await click('完整分叉并加入我的项目');await waitFor(()=>storedProjects().some((project:any)=>project.forkScope==='full'));
+  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].forkTarget.repo,'project');assert.ok(document.body.textContent?.includes('已分叉 · 已同步'));
+  assert.equal(server.sent.filter(request=>request.path.endsWith('/forks')&&request.method==='POST').length,1);
+});
+test('HTTP code difference offers a new-name upload and switches primary after verification while preserving old history',async()=>{
+  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+  const oldHead=server.repositories.get('project')!.refs.get('develop');server.setSource('v3');await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>!!importDialog());assert.ok(importDialog()?.textContent?.includes('修改 1'));
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="导入另存仓库名"]')!,'project-custom');await click('使用新名称上传并固定');await waitFor(()=>storedProjects()[0]?.uploadTarget?.repo==='project-custom');
+  assert.equal(server.repositories.get('project')!.refs.get('develop'),oldHead);assert.equal(storedProjects()[0].primarySource.repo,'project-custom');assert.equal(storedProjects()[0].targetHistory[0].target.repo,'project');assert.equal(server.document().projects[0].target.repo,'project-custom');
+  // Follow the renamed primary, preserving its own files instead of copying the template.
+  const before=server.sent.length;await enterWorkbench();await click('一键更新');await waitFor(()=>alerts.some(message=>message.includes('固定主仓库')));assert.ok(!server.sent.slice(before).some(request=>request.path==='/repos/source/project/commits/develop'));
+});
+test('HTTP switch registration failure keeps old binding and cached files; retry commits binding without another upload',async()=>{
+  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+  const oldId=storedProjects()[0].uploadTarget.id;await click('分叉与私有仓');await click('另存并切换固定仓库');await setField(document.querySelector<HTMLInputElement>('[aria-label="另存目标仓库"]')!,'saved-copy');
+  // Allow reservation, then reject only the final switch record.
+  const base=globalThis.fetch;globalThis.fetch=async(url,init={})=>{if(init.method==='PUT'&&String(url).includes('.gitvault-state/contents')){const value=JSON.parse(String(init.body));const doc=JSON.parse(Buffer.from(value.content,'base64').toString());if(doc.projects[0]?.target.repo==='saved-copy'&&doc.projects[0].state==='active')return ok({message:'record denied'},403);}return base(url,init);};
+  await click('确认另存并切换');await waitFor(()=>!!storedProjects()[0].pendingSwitch?.result);await waitFor(()=>document.querySelector('[aria-label="另存并切换固定仓库"]')?.textContent?.includes('旧固定关系保留')===true);
+  assert.equal(storedProjects()[0].uploadTarget.id,oldId);assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');const writes=server.sent.filter(request=>request.path.endsWith('/git/commits')&&request.method==='POST').length;
+  globalThis.fetch=base;await click('继续完成切换');await waitFor(()=>storedProjects()[0].uploadTarget.repo==='saved-copy');assert.equal(server.sent.filter(request=>request.path.endsWith('/git/commits')&&request.method==='POST').length,writes);assert.equal(storedProjects()[0].pendingSwitch,undefined);
+});
+test('HTTP difference can update the selected existing branch immediately while keeping other branches',async()=>{
+ const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+ const previous=server.repositories.get('project')!.refs.get('develop');server.setSource('v3');await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>!!importDialog());await click('更新此仓库（保留历史）');await waitFor(()=>storedProjects()[0]?.remoteSnapshot?.sourceSha==='v3'&&!!alerts.length);
+ assert.notEqual(server.repositories.get('project')!.refs.get('develop'),previous);assert.equal(server.repositories.get('project')!.refs.get('main'),'init');assert.equal(server.repositories.size,1);
+});
+test('HTTP renaming keeps ID, updates shared primary location and can be recovered on another device',async()=>{
+ const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'renamed-copy');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].primarySource?.repo==='renamed-copy');
+ const id=storedProjects()[0].uploadTarget.id;(globalThis as any).prompt=()=> 'renamed-again';await click('分叉与私有仓');await click('修改项目名称');await waitFor(()=>storedProjects()[0].uploadTarget.repo==='renamed-again');assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');assert.equal(server.document().projects[0].target.repo,'renamed-again');
+ await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');
+});
+test('HTTP cancel a switch preserves its previous target and can resume after explicitly comparing the created destination',async()=>{
+ const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);const oldId=storedProjects()[0].uploadTarget.id;
+ await click('分叉与私有仓');await click('另存并切换固定仓库');await setField(document.querySelector<HTMLInputElement>('[aria-label="另存目标仓库"]')!,'cancelled-copy');
+ const base=globalThis.fetch;let blocked=false;globalThis.fetch=async(url,init={})=>{if(String(url).includes('/cancelled-copy/git/blobs')&&init.method==='POST'){blocked=true;return new Promise((_resolve,reject)=>init.signal!.addEventListener('abort',()=>reject(init.signal!.reason),{once:true}));}return base(url,init);};
+ await click('确认另存并切换');await waitFor(()=>blocked);await click('取消剩余操作');await waitFor(()=>!!storedProjects()[0].pendingSwitch&&!document.querySelector('[aria-label="另存并切换固定仓库"]')?.textContent?.includes('取消剩余操作'));
+ assert.equal(storedProjects()[0].uploadTarget.id,oldId);assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');globalThis.fetch=base;
+ await click('比较新目标代码');await waitFor(()=>document.querySelector('[aria-label="另存并切换固定仓库"] [role=status]')!==null);await click('确认另存并切换');await waitFor(()=>storedProjects()[0].uploadTarget.repo==='cancelled-copy');assert.equal(server.repositories.size,2);
+});
+test('HTTP same-name code comparison works when the optional rename index is unreadable and reports its pending record',async()=>{
+ const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+ const base=globalThis.fetch;globalThis.fetch=async(url,init={})=>String(url).includes('/repos/destination/.gitvault-state')?ok({message:'index access denied'},403):base(url,init);
+ await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].uploadTarget.repo,'project');assert.equal(storedProjects()[0].remoteSnapshot.sourceSha,'v2');assert.ok(document.body.textContent?.includes('私人仓库已同步'));assert.ok(document.body.textContent?.includes('账号记录待补存'));assert.equal(server.repositories.size,1);
+});
+test('HTTP primary branch switching reads the fixed repository, registers the branch and never writes another branch',async()=>{
+ const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'my-primary');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].primarySource?.repo==='my-primary');
+ server.repositories.get('my-primary')!.refs.set('feature/demo','other-v');const oldHead=server.repositories.get('my-primary')!.refs.get('develop');const before=server.sent.length;await enterWorkbench();await switchBranch('feature/demo');
+ assert.equal(storedProjects()[0].primarySource.branch,'feature/demo');assert.equal(storedProjects()[0].uploadTarget.branch,'feature/demo');assert.equal(storedProjects()[0].remoteSnapshot.sourceSha,'other-v');assert.equal(server.document().projects[0].bindings['feature/demo'].branch,'feature/demo');assert.equal(server.repositories.get('my-primary')!.refs.get('develop'),oldHead);assert.ok(!server.sent.slice(before).some(request=>request.method==='PATCH'||request.path.startsWith('/repos/source/project/commits/')));
 });

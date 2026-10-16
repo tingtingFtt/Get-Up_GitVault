@@ -1,7 +1,7 @@
 import type { UploadTarget, ProjectSource, RemoteSnapshot } from './projectModel';
 import { sourceOf } from './projectModel';
 
-export type TargetIdentity = { id?: number; owner: string; repo: string };
+export type TargetIdentity = { id?: number; owner: string; repo: string; private?: boolean };
 export type TargetHealth = TargetIdentity & {
   status: 'available' | 'unavailable' | 'auth' | 'forbidden' | 'limited' | 'identity-changed' | 'error';
   message: string; checkedAt: string;
@@ -11,7 +11,7 @@ export function sameTarget(a: TargetIdentity, b: TargetIdentity) {
   return a.id && b.id ? a.id === b.id : a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase();
 }
 type TargetProject = ProjectSource & {
-  origin?: ProjectSource; uploadTarget?: UploadTarget; branchTargets?: Record<string, UploadTarget>;
+  origin?: ProjectSource; primarySource?: ProjectSource; uploadTarget?: UploadTarget; branchTargets?: Record<string, UploadTarget>;
   forkTarget?: TargetIdentity & { branch: string; htmlUrl: string; branches?: string[]; token?: string };
   forkScope?: 'current' | 'full'; privateRepoUrl?: string; branchUploadPending?: boolean;
   targetHealth?: Record<string, TargetHealth>; lastUploadedToPrivateAt?: string; repoMeta: { htmlUrl?: string };
@@ -26,7 +26,7 @@ export function projectTargets(project: TargetProject): TargetIdentity[] {
   }
   return targets.filter((target, index) => !targets.slice(0, index).some(other => sameTarget(other, target))).map(({ id, owner, repo }) => ({ id, owner, repo }));
 }
-export function targetHealthOf(project: TargetProject, target: TargetIdentity) {
+export function targetHealthOf(project: Pick<TargetProject,'targetHealth'>, target: TargetIdentity) {
   return project.targetHealth?.[targetKey(target)] || Object.values(project.targetHealth || {}).find(health => sameTarget(health, target));
 }
 /** Detach only current bindings. Never rewrite historical snapshots or remove cached files. */
@@ -46,7 +46,7 @@ export function detachedTarget<T extends TargetProject>(project: T, target: Targ
   const managedRemoved = !!project.origin && project.owner.toLowerCase() === target.owner.toLowerCase() && project.repo.toLowerCase() === target.repo.toLowerCase();
   const source = sourceOf(project);
   const privateRemoved = uploadRemoved || project.privateRepoUrl?.replace(/\/$/, '').toLowerCase() === `https://github.com/${target.owner}/${target.repo}`.toLowerCase();
-  return { ...project, uploadTarget, branchTargets,
+  return { ...project, primarySource: project.primarySource && sameTarget({...project.primarySource,id:project.primarySource.repositoryId},target) ? undefined : project.primarySource, uploadTarget, branchTargets,
     forkTarget: forkRemoved ? undefined : project.forkTarget,
     forkScope: forkRemoved || uploadRemoved ? (uploadTarget?.kind === 'current' ? 'current' : undefined) : project.forkScope,
     privateRepoUrl: privateRemoved ? undefined : project.privateRepoUrl,

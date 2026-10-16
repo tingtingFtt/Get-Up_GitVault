@@ -415,7 +415,7 @@ export const githubClient = {
         const verifiedHead = await readHead();
         const verifiedCommit = await json(`${base}/git/commits/${commit.sha}`, token, {}, signal);
         if (verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
-        if (verifiedHead === commit.sha) return { success: true, verified: true, repoId: meta.id as number | undefined, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
+        if (verifiedHead === commit.sha) return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: meta.id as number | undefined, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
         // Do not replay after our commit landed and another writer subsequently changed it.
         throw new Error('上传后的分支已被其他提交修改，验证未通过；本地文件已保留，请重新检查');
       }

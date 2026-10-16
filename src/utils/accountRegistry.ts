@@ -6,12 +6,16 @@ export const REGISTRY_REPO = '.gitvault-state';
 const MARKER = 'GitVault account sync registry v1';
 const FILE = 'gitvault.json';
 const report = (message: string) => { if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('gitvault-progress', {detail:message})); };
+export interface TargetHistory { target: TargetIdentity; kind: 'upload' | 'current' | 'full'; bindings: AccountProject['bindings']; changedAt: string }
 export interface AccountProject {
   source: ProjectSource; target: TargetIdentity;
   kind: 'upload' | 'current' | 'full'; state: 'reserved' | 'active';
   createdByApp: boolean; reservationId?: string; branches?: string[];
   bindings: Record<string, { branch: string; sourceSha?: string; commitSha?: string; updatedAt: string }>;
   updatedAt: string;
+  primary?: boolean; profile?: { tags: string[]; remark: string; description: string; updatedAt: string };
+  history?: TargetHistory[];
+  switchReservation?: { id: string; from?: TargetIdentity; target: TargetIdentity; branch: string; sourceSha?: string; sourceBranch?: string; createdAt: string };
 }
 interface RegistryDocument { app: 'Get-Up_GitVault'; version: 1; account: string; projects: AccountProject[] }
 export function sameSource(a: ProjectSource, b: ProjectSource) {
@@ -25,9 +29,10 @@ const encode = (value: unknown) => {
 const decode = (content: string) => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(content.replace(/\s/g, '')), char => char.charCodeAt(0))));
 const init = (method: string, value: unknown): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
 const missing = (error: unknown) => error instanceof GitHubError && error.status === 404;
+const cleanTarget = (target: TargetIdentity) => ({id:target.id,owner:target.owner,repo:target.repo, ...(typeof target.private === 'boolean' ? {private:target.private} : {})});
 const validName = (value: unknown) => typeof value === 'string' && /^[\w.-]+$/.test(value);
 function cleanProject(project: AccountProject): AccountProject {
-  return { source: { owner: project.source.owner, repo: project.source.repo, url: `https://github.com/${project.source.owner}/${project.source.repo}`, branch: project.source.branch, repositoryId: project.source.repositoryId }, target: { id: project.target.id, owner: project.target.owner, repo: project.target.repo }, kind: project.kind, state: project.state, createdByApp: !!project.createdByApp, reservationId: project.reservationId, branches: project.branches?.filter(branch => typeof branch === 'string'), bindings: Object.fromEntries(Object.entries(project.bindings).map(([branch, binding]) => [branch, { branch: binding.branch, sourceSha: binding.sourceSha, commitSha: binding.commitSha, updatedAt: binding.updatedAt }])), updatedAt: project.updatedAt };
+  return { source: { owner: project.source.owner, repo: project.source.repo, url: `https://github.com/${project.source.owner}/${project.source.repo}`, branch: project.source.branch, repositoryId: project.source.repositoryId }, target: cleanTarget(project.target), kind: project.kind, state: project.state, createdByApp: !!project.createdByApp, reservationId: project.reservationId, branches: project.branches?.filter(branch => typeof branch === 'string'), bindings: Object.fromEntries(Object.entries(project.bindings).map(([branch, binding]) => [branch, { branch: binding.branch, sourceSha: binding.sourceSha, commitSha: binding.commitSha, updatedAt: binding.updatedAt }])), updatedAt: project.updatedAt, primary: project.primary, profile: project.profile ? {tags: project.profile.tags.filter(tag => typeof tag === 'string'), remark: project.profile.remark, description: project.profile.description, updatedAt:project.profile.updatedAt} : undefined, history: project.history?.map(item => ({target:cleanTarget(item.target),kind:item.kind,bindings:cleanProject({...project,bindings:item.bindings,history:undefined,switchReservation:undefined}).bindings,changedAt:item.changedAt})), switchReservation: project.switchReservation ? {id:project.switchReservation.id,from:project.switchReservation.from ? cleanTarget(project.switchReservation.from) : undefined,target:cleanTarget(project.switchReservation.target),branch:project.switchReservation.branch,sourceSha:project.switchReservation.sourceSha,sourceBranch:project.switchReservation.sourceBranch,createdAt:project.switchReservation.createdAt} : undefined };
 }
 export class ExistingSourceError extends Error {
   constructor(public existing: AccountProject) { super(`账号已有同源目标 ${existing.target.owner}/${existing.target.repo}，请使用更新／同步，不可重复首次上传或分叉。`); }
@@ -36,6 +41,9 @@ function validateDocument(value: any, login: string): RegistryDocument {
   if (value?.app !== 'Get-Up_GitVault' || value.version !== 1 || value.account?.toLowerCase() !== login.toLowerCase() || !Array.isArray(value.projects)) throw new Error('账号记录格式或所属账号不符，已停止操作，未覆盖记录仓库');
   for (const project of value.projects) {
     if (typeof project.source?.branch !== 'string' || !project.source.branch || !validName(project.source?.owner) || !validName(project.source?.repo) || !validName(project.target?.owner) || !validName(project.target?.repo) || project.target.repo.toLowerCase() === REGISTRY_REPO || !['upload', 'current', 'full'].includes(project.kind) || !['active', 'reserved'].includes(project.state) || !project.bindings || typeof project.bindings !== 'object' || Array.isArray(project.bindings)) throw new Error('账号记录包含无效项目，已停止操作');
+    if (project.profile && (!Array.isArray(project.profile.tags) || typeof project.profile.remark !== 'string' || typeof project.profile.description !== 'string' || typeof project.profile.updatedAt !== 'string')) throw new Error('账号资料格式无效');
+    if (project.history && (!Array.isArray(project.history) || project.history.some((item:any) => !validName(item.target?.owner) || !validName(item.target?.repo) || !item.bindings || !['upload','current','full'].includes(item.kind)))) throw new Error('旧仓库关系记录无效');
+    if (project.switchReservation && (!validName(project.switchReservation.target?.owner) || !validName(project.switchReservation.target?.repo) || typeof project.switchReservation.id !== 'string')) throw new Error('待切换记录无效');
     if (project.source.repositoryId !== undefined && (!Number.isSafeInteger(project.source.repositoryId) || project.source.repositoryId <= 0)) throw new Error('账号记录来源仓库 ID 无效');
     if (project.state === 'active' && (!Number.isSafeInteger(project.target.id) || project.target.id <= 0)) throw new Error('账号记录缺少目标仓库 ID，不能自动绑定');
     for (const binding of Object.values(project.bindings) as any[]) if (!binding || typeof binding.branch !== 'string' || !binding.branch) throw new Error('账号记录包含无效分支映射');
@@ -97,7 +105,8 @@ export function createAccountRegistry(api = githubApi) {
       if (old?.state === 'active' && previous && previous.branch !== binding.branch) throw new Error(`来源分支 ${branch} 已固定目标分支 ${previous.branch}，不能改写其他映射`);
       bindings[branch] = { ...previous, ...binding, sourceSha: binding.sourceSha || previous?.sourceSha, commitSha: binding.commitSha || previous?.commitSha };
     }
-    const merged = { ...old, ...project, kind: old?.kind === 'full' ? 'full' as const : project.kind, branches: project.branches || old?.branches, createdByApp: !!old?.createdByApp || project.createdByApp, bindings };
+    if (old?.profile && project.profile && old.profile.updatedAt !== project.profile.updatedAt && Date.parse(old.profile.updatedAt) > Date.parse(project.profile.updatedAt)) throw new Error('另一台设备的项目资料已更新，请重新读取后再保存标签');
+    const merged = { ...old, ...project, primary: project.primary ?? old?.primary, profile: project.profile || old?.profile, history: project.history || old?.history, switchReservation: old?.switchReservation, kind: old?.kind === 'full' ? 'full' as const : project.kind, branches: project.branches || old?.branches, createdByApp: !!old?.createdByApp || project.createdByApp, bindings };
     return { ...document, projects: [...document.projects.filter(item => !sameSource(item.source, project.source)), merged] };
   }, signal);
   const reserve = async (source: ProjectSource, name: string, kind: AccountProject['kind'], token: string, signal = operationSignal(), explicit?: TargetIdentity) => {
@@ -113,6 +122,34 @@ export function createAccountRegistry(api = githubApi) {
     }, signal);
     return selected;
   };
+  const equalTarget = (a: TargetIdentity | undefined, b: TargetIdentity | undefined) => !a || !b ? a === b : a.id && b.id ? a.id === b.id : a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase();
+  const reserveSwitch = async (source: ProjectSource, target: TargetIdentity, branch: string, expected: TargetIdentity | undefined, token: string, signal = operationSignal(), sourceSha?:string) => {
+    if (!validName(target.owner) || !validName(target.repo) || target.repo.length > 100 || /^\.+$/.test(target.repo) || target.repo.toLowerCase() === REGISTRY_REPO) throw new Error('新仓库名称无效');
+    let reservation!: NonNullable<AccountProject['switchReservation']>;
+    await change(token, document => {
+      const old = document.projects.find(item => sameSource(item.source,source));
+      if (old && !equalTarget(old.target,expected) && !(old.state === 'reserved' && equalTarget(old.target,target))) throw new ExistingSourceError(old);
+      if (old?.switchReservation) {
+        if (!equalTarget(old.switchReservation.target,target) || old.switchReservation.branch !== branch) throw new Error('已有另存任务尚未完成，请继续该任务后再选择其他目标');
+        reservation = old.switchReservation; return document;
+      }
+      if (document.projects.some(item => !sameSource(item.source,source) && (equalTarget(item.target,target) || equalTarget(item.switchReservation?.target,target)))) throw new Error('新目标已绑定其他来源，不能覆盖');
+      reservation = {id:crypto.randomUUID(),from:old?.state==='active'?old.target:undefined,target:cleanTarget(target),branch,sourceSha,sourceBranch:source.branch,createdAt:new Date().toISOString()};
+      const entry: AccountProject = old || {source,target:expected||target,kind:'upload',state:expected?.id?'active':'reserved',createdByApp:true,bindings:expected?{[source.branch]:{branch:(expected as TargetIdentity & {branch?:string}).branch || source.branch,updatedAt:reservation.createdAt}}:{},updatedAt:reservation.createdAt};
+      return {...document,projects:[...document.projects.filter(item=>!sameSource(item.source,source)),{...entry,switchReservation:reservation}]};
+    },signal);
+    return reservation;
+  };
+  const completeSwitch = async (project: AccountProject, reservationId: string, token: string, signal = operationSignal()) => change(token,document => {
+    const old = document.projects.find(item=>sameSource(item.source,project.source));
+    if (old && !old.switchReservation && equalTarget(old.target,project.target)) return document;
+    if (!old?.switchReservation || old.switchReservation.id !== reservationId) throw new Error('切换预留已改变，旧绑定保留，请重新检查账号记录');
+    if (!equalTarget(old.switchReservation.target,project.target)) throw new Error('新目标与切换预留不一致');
+    if (document.projects.some(item=>!sameSource(item.source,project.source)&&equalTarget(item.target,project.target))) throw new Error('新目标已被其他来源绑定');
+    const history = old.state==='active' && !equalTarget(old.target,project.target) ? [...(old.history||[]),{target:old.target,kind:old.kind,bindings:old.bindings,changedAt:project.updatedAt}] : old.history || [];
+    const next = {...project,profile:project.profile || old.profile,history,switchReservation:undefined,primary:true};
+    return {...document,projects:[...document.projects.filter(item=>!sameSource(item.source,project.source)),next]};
+  },signal);
   const remove = async (target: TargetIdentity, token: string, signal = operationSignal()) => {
     const current = await read(token, signal);
     if (!current.meta) return current.document;
@@ -120,10 +157,28 @@ export function createAccountRegistry(api = githubApi) {
   };
   const candidates = async (source: ProjectSource, token: string, signal = operationSignal()) => {
     report('正在读取账号来源记录，识别已有上传与分叉…');
-    const account = await read(token, signal);
+    let account: Awaited<ReturnType<typeof read>>;
+    try { account = await read(token,signal); }
+    catch (registryError) {
+      signal.throwIfAborted();
+      // A readable same-name repository can still be compared without the
+      // optional rename index. Never claim absence when the index is unreadable.
+      const user=await api('/user',token,{},signal);
+      if(!validName(user.login))throw registryError;
+      let meta:any;
+      try{meta=await api(`/repos/${user.login}/${source.repo}`,token,{cache:'no-store'},signal);}catch{throw registryError;}
+      const full=!!meta.fork&&!!meta.parent&&(source.repositoryId&&meta.parent.id?source.repositoryId===meta.parent.id:meta.parent.full_name?.toLowerCase()===`${source.owner}/${source.repo}`.toLowerCase());
+      return {login:user.login as string,recorded:[] as AccountProject[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || user.login,repo:meta.name || source.repo,private:meta.private},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}],registryError:(registryError as Error).message};
+    }
     let recorded = account.document.projects.filter(item => sameSource(item.source, source));
     if (!recorded.length) recorded = account.document.projects.filter(item => source.repositoryId && item.target.id ? source.repositoryId === item.target.id : item.target.owner.toLowerCase() === source.owner.toLowerCase() && item.target.repo.toLowerCase() === source.repo.toLowerCase());
     if (recorded.length) return { login: account.login, recorded, legacy: [] as AccountProject[] };
+    try {
+      const meta = await api(`/repos/${account.login}/${source.repo}`, token, {cache:'no-store'}, signal);
+      const full = !!meta.fork && !!meta.parent && (source.repositoryId && meta.parent.id ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
+      return {login:account.login,recorded:[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || account.login,repo:meta.name || source.repo,private:meta.private},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}]};
+    } catch (error) { if (!missing(error)) throw error; }
+
     let owned = ownedCache.get(token)?.projects;
     if (!owned || Date.now() - ownedCache.get(token)!.at > 60000) {
       owned = [];
@@ -151,7 +206,7 @@ export function createAccountRegistry(api = githubApi) {
         full = !!meta.parent && (source.repositoryId ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
         match ||= full;
       }
-      if (!match && repo.description?.includes('[GitVault 托管]')) {
+      if (!match && !repo.fork) {
         const key = `${token}:${repo.id || `${repo.owner.login}/${repo.name}`}`;
         let provenance = provenanceCache.get(key);
         if (!provenance || Date.now() - provenance.at > 60000) {
@@ -173,12 +228,12 @@ export function createAccountRegistry(api = githubApi) {
           }
           provenance = { at: Date.now(), sources }; provenanceCache.set(key, provenance);
         }
-        match = !provenance.sources.length || provenance.sources.some(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
+        match = (!provenance.sources.length && !!repo.description?.includes('[GitVault 托管]')) || provenance.sources.some(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
       }
       if (match) legacy.push({ source, target: { id: repo.id, owner: repo.owner.login, repo: repo.name }, kind: full ? 'full' : 'upload', state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' });
     }
     return { login: account.login, recorded: [], legacy };
   };
-  return { read, save, reserve, remove, candidates, invalidate: () => { ownedCache.clear(); parentCache.clear(); provenanceCache.clear(); } };
+  return { read, save, reserve, reserveSwitch, completeSwitch, remove, candidates, invalidate: () => { ownedCache.clear(); parentCache.clear(); provenanceCache.clear(); } };
 }
 export const accountRegistry = createAccountRegistry();

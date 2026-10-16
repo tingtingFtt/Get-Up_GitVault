@@ -16,7 +16,7 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-error', 'batch-upload-cancelled'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
@@ -41,6 +41,10 @@ if (new URLSearchParams(location.search).has('audit-import') || new URLSearchPar
   const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
   fixture.url = 'https://github.com/' + fixture.owner + '/' + fixture.repo;
   fixture.uploadTarget = target;
+  const switchScene=new URLSearchParams(location.search).get('audit-switch');
+  if(switchScene==='switch-pending')fixture.pendingSwitch={reservationId:'audit',sourceSha:fixture.latestCommitSha,sourceBranch:fixture.branch,oldTarget:target,request:{mode:'existing',name:target.owner+'/new-'+target.repo,branch:target.branch,purge:false},result:{verified:true,repoId:99,owner:target.owner,repo:'new-'+target.repo,branch:target.branch,commitSha:'saved-new',htmlUrl:'https://github.com/example/new'}};
+  if(switchScene==='switch-history')fixture.targetHistory=[{target:{id:98,owner:target.owner,repo:'old-'+target.repo},kind:'upload',bindings:{main:{branch:'release',updatedAt:'2026-10-16T00:00:00Z'}},changedAt:'2026-10-16T00:00:00Z'}];
+
   if(new URLSearchParams(location.search).has('audit-target')) fixture.privateRepoUrl = 'https://github.com/'+target.owner+'/'+target.repo;
   localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
   const sourceRoot = '/repos/' + fixture.owner + '/' + fixture.repo, targetRoot = '/repos/' + target.owner + '/' + target.repo;
@@ -108,7 +112,7 @@ function inspect(doc, width, scenario) {
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       const doc = frame.contentDocument;
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
         await click(doc,'仓库已有项目 (1)');
@@ -121,6 +125,19 @@ function inspect(doc, width, scenario) {
         if (scenario==='push') await click(doc,'上传指定仓库');
         if (scenario==='folders'||scenario==='storage') { await click(doc,'下载自选文件夹'); if(scenario==='storage') await click(doc,'本地存储与缓存'); }
         if (scenario==='metadata') await click(doc,'编辑备注与描述');
+      } else if(scenario.startsWith('switch-')) {
+        await click(doc,'工作台');await click(doc,'另存并切换固定仓库');
+        const dialog=doc.querySelector('[aria-label="另存并切换固定仓库"]');if(!dialog)throw new Error('Missing save and switch dialog');
+        if(scenario==='switch-existing'||scenario==='switch-error') {
+          const set=(field,value,kind='input')=>{Object.getOwnPropertyDescriptor(kind==='select'?frame.contentWindow.HTMLSelectElement.prototype:frame.contentWindow.HTMLInputElement.prototype,'value').set.call(field,value);field.dispatchEvent(new frame.contentWindow.Event(kind==='select'?'change':'input',{bubbles:true}));};
+          const target=JSON.parse(frame.contentWindow.localStorage.getItem('gitvault_repos_v8'))[0].uploadTarget;
+          set(dialog.querySelector('[aria-label="另存方式"]'),'existing','select');await pause();
+          set(dialog.querySelector('[aria-label="另存目标仓库"]'),target.owner+'/'+target.repo);set(dialog.querySelector('[aria-label="另存目标分支"]'),target.branch);await pause();
+          await click(doc,'比较新目标代码');
+          for(let tries=0;tries<100&&!dialog.querySelector('[role="status"],[role="alert"]');tries++)await pause();
+          if(!dialog.querySelector('[role="status"],[role="alert"]'))throw new Error('Missing switch comparison outcome');
+        }
+        if(scenario==='switch-history'){dialog.querySelector('summary').click();await pause();}
       } else if(scenario.startsWith('remote-target')) {
         await click(doc,'工作台'); await click(doc,'管理远端目标');
         if(!doc.querySelector('[aria-label="管理远端目标"]')) throw new Error('Target manager did not open');
@@ -178,7 +195,7 @@ const server = createServer(async (request, response) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const profile = await mkdtemp(resolve(tmpdir(), 'gitvault-layout-'));
 try {
-  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=60000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
+  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=90000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
   const output = await new Promise((resolve, reject) => {
     const child = spawn(chrome, args); let stdout = ''; let stderr = '';
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Layout audit timed out: ' + stderr.slice(-1500))); }, 90000);
