@@ -19,6 +19,7 @@ import { safeFetchJson } from './utils/api';
 import { sourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
+import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 
 interface RepoTreeItem {
@@ -109,6 +110,9 @@ interface BatchUploadItemStatus {
   error?: string;
   htmlUrl?: string;
 }
+
+type ImportComparison = { status: 'loading' | 'ready' | 'error'; error?: string; target?: UploadTarget; sourceSha?: string; commitSha?: string; missingBranch?: boolean; diff?: ReturnType<typeof compareImportTrees> };
+type ImportChoice = { candidate: ImportCandidate; comparison: ImportComparison } | 'independent' | 'skip';
 
 // Light Morandi Gradient Color Palette for heatmap
 const MORANDI_HEATMAP_COLORS = [
@@ -319,6 +323,29 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [importMatch, setImportMatch] = useState<{ source: ProjectSource; sha: string; tree: RepoTreeItem[]; candidates: ImportCandidate[]; token: string; comparisons: Record<string, ImportComparison> } | null>(null);
+  const importResolver = useRef<((choice: ImportChoice) => void) | null>(null);
+  const importSession = useRef(0);
+  const importLock = useRef(false);
+  useEffect(() => () => { importSession.current++; if (importLock.current) cancelGithubOperation(); importResolver.current = null; }, []);
+  useEffect(() => {
+    if (!importMatch) return;
+    const dialog = document.querySelector<HTMLElement>('[aria-label="选择已有项目作为同步基础"]');
+    if (!dialog) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const controls = () => [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), summary, [href], input:not(:disabled), [tabindex="0"]')];
+    const focus = () => controls()[0]?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); cancelGithubOperation(); }
+      if (event.key !== 'Tab') return;
+      const list = controls(), first = list[0], last = list[list.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) { event.preventDefault(); first?.focus(); }
+    };
+    const focusin = (event: FocusEvent) => { if (!dialog.contains(event.target as Node)) focus(); };
+    focus(); document.addEventListener('keydown', keydown); document.addEventListener('focusin', focusin);
+    return () => { document.removeEventListener('keydown', keydown); document.removeEventListener('focusin', focusin); if (previous?.isConnected) previous.focus(); };
+  }, [!!importMatch]);
   const [aiLoading, setAiLoading] = useState(false);
 
   // Hidden file input ref for backup import
@@ -449,7 +476,7 @@ export default function App() {
       const bindings = { ...item.branchTargets, ...(item.uploadTarget && !item.branchUploadPending ? { [sourceOf(item).branch]: item.uploadTarget } : {}) };
       for (const [sourceBranch, target] of Object.entries(bindings)) {
         const sameRepo = destination.id && target.id ? destination.id === target.id : destination.owner.toLowerCase() === target.owner.toLowerCase() && destination.repo.toLowerCase() === target.repo.toLowerCase();
-        if (sameRepo && destination.branch === target.branch && sourceBranch !== branch) throw new Error(`目标分支 ${target.branch} 已绑定来源分支 ${sourceBranch}，不能用 ${branch} 覆盖。请使用对应分支或另存副本到其他仓库。`);
+        if (sameRepo && destination.branch === target.branch && (sourceBranch !== branch || !sameRepository(sourceOf(item), sourceOf(repo)))) throw new Error(`目标分支 ${target.branch} 已绑定来源 ${sourceOf(item).owner}/${sourceOf(item).repo} 的来源分支 ${sourceBranch}，不能用 ${branch} 覆盖。请使用对应分支或另存副本到其他仓库。`);
       }
     }
   };
@@ -992,11 +1019,91 @@ export default config;
     setIsLoading(false);
   };
 
+  // Import matching is read-only. A destination is bound only after an explicit choice.
+  const chooseImportBase = async (data: { owner: string; repo: string; branch: string; latestCommitSha: string; tree: RepoTreeItem[] }, token: string): Promise<ImportChoice> => {
+    const source = { owner: data.owner, repo: data.repo, branch: data.branch, url: `https://github.com/${data.owner}/${data.repo}` };
+    const candidates = importCandidates(reposRef.current, source);
+    if (!candidates.length) return 'independent';
+    const signal = operationSignal(); signal.throwIfAborted();
+    importSession.current++;
+    setImportMatch({ source, sha: data.latestCommitSha, tree: data.tree, candidates, token, comparisons: {} });
+    setIsLoading(false);
+    try {
+      return await new Promise<ImportChoice>((resolve, reject) => {
+        const finish = (choice: ImportChoice) => { signal.removeEventListener('abort', abort); importResolver.current = null; resolve(choice); };
+        const abort = () => { importResolver.current = null; reject(signal.reason); };
+        signal.addEventListener('abort', abort, { once: true });
+        importResolver.current = finish;
+      });
+    } finally { importSession.current++; setImportMatch(null); setIsLoading(true); }
+  };
+
+  const compareImportBase = async (candidate: ImportCandidate) => {
+    if (!importMatch) return;
+    const session = importSession.current, match = importMatch;
+    const update = (comparison: ImportComparison) => {
+      if (session === importSession.current) setImportMatch(current => current ? { ...current, comparisons: { ...current.comparisons, [candidate.key]: comparison } } : current);
+    };
+    update({ status: 'loading' });
+    try {
+      const token = candidate.target.token || match.token;
+      const sourceManifest = sameRepository(candidate.source, match.source) && candidate.source.branch === match.source.branch ? { latestCommitSha: match.sha, tree: match.tree } : await githubClient.inspectRepo(candidate.source.url, candidate.source.branch, match.token || token);
+      const inspected = await githubClient.inspectImportTarget(candidate.target, token, candidate.fullFork ? candidate.source : undefined);
+      operationSignal().throwIfAborted();
+      const target = { ...candidate.target, id: inspected.identity.id, owner: inspected.identity.owner, repo: inspected.identity.repo, token: token || undefined };
+      const draft = { ...candidate.source, id: 'import-comparison', backups: [], tree: sourceManifest.tree } as unknown as TrackedRepo;
+      assertDestinationBranch(draft, target);
+      update({ status: 'ready', target, sourceSha: sourceManifest.latestCommitSha, commitSha: inspected.commitSha, missingBranch: inspected.missingBranch, diff: compareImportTrees(sourceManifest.tree, inspected.tree, !candidate.fullFork) });
+    } catch (error) { update({ status: 'error', error: (error as Error).message || '对比已取消' }); }
+  };
+
+  const prepareImport = async (url: string, branch: string | undefined, token: string) => {
+    const parsed = parseRepository(url);
+    const source = { owner: parsed.owner, repo: parsed.repo, url: `https://github.com/${parsed.owner}/${parsed.repo}`, branch: branch || parsed.linkedRef || 'main' };
+    if (!importCandidates(reposRef.current, source).length) return { choice: 'independent' as const, data: await githubClient.fetchRepo(url, branch, token) };
+    // Compare manifests before downloading file bytes; skipping an existing project
+    // must not require downloading it again.
+    const manifest = await githubClient.inspectRepo(url, branch, token);
+    const choice = await chooseImportBase(manifest, token);
+    operationSignal().throwIfAborted();
+    if (choice === 'skip') return { choice, data: undefined };
+    const selected = typeof choice === 'string' ? { ...source, branch: manifest.branch } : choice.candidate.source;
+    const sha = typeof choice === 'string' ? manifest.latestCommitSha : choice.comparison.sourceSha;
+    if (!sha) throw new Error('来源提交未完成校验，请重新对比');
+    const previous = reposRef.current.find(project => sameRepository(sourceOf(project), selected) && sourceOf(project).branch === selected.branch);
+    const cachedFiles = previous ? await localCache.getProjectFiles(previous.id, sha) : [];
+    const data = await githubClient.fetchRepo(selected.url, selected.branch, token || (typeof choice === 'string' ? undefined : choice.comparison.target?.token), { ref: sha, cachedFiles });
+    return { choice, data };
+  };
+
+  const importWithBase = (newRepo: TrackedRepo, choice: ImportChoice, batch = false): TrackedRepo => {
+    if (typeof choice === 'string') return newRepo;
+    const { candidate, comparison } = choice;
+    if (comparison.status !== 'ready' || !comparison.target) throw new Error('请完成项目对比后再选择同步基础');
+    const previous = reposRef.current.find(project => !project.origin && sameRepository(project, newRepo) && project.branch === newRepo.branch);
+    const target = comparison.target;
+    const next = { ...previous, ...newRepo, id: previous?.id || newRepo.id,
+      token: newRepo.token || previous?.token, checkInterval: previous?.checkInterval || newRepo.checkInterval,
+      tags: batch && previous ? previous.tags : newRepo.tags, latestRemoteCommit: undefined, lastUploadedToPrivateAt: undefined,
+      backups: previous ? (previous.latestCommitSha !== newRepo.latestCommitSha ? [archiveVersion(previous), ...previous.backups] : previous.backups) : [],
+      uploadTarget: target, branchTargets: { ...previous?.branchTargets, [newRepo.branch]: target }, branchUploadPending: comparison.missingBranch || false,
+      // No upload receipt is invented by a comparison, even if the files are identical.
+      remoteSnapshot: undefined,
+      savedCopies: [...(previous?.savedCopies || []), ...(previous?.remoteSnapshot ? [previous.remoteSnapshot] : [])],
+      privateRepoUrl: `https://github.com/${target.owner}/${target.repo}`,
+      forkScope: candidate.fullFork ? 'full' as const : target.kind === 'current' ? 'current' as const : undefined,
+      forkTarget: candidate.fullFork ? { id: target.id, owner: target.owner, repo: target.repo, branch: target.branch, htmlUrl: `https://github.com/${target.owner}/${target.repo}`, branches: candidate.branches?.length ? candidate.branches : [newRepo.branch] } : undefined,
+    };
+    assertDestinationBranch(next, target);
+    return next;
+  };
+
   // Add new repository link: Directly pull project into local memory/storage
   const handleBatchImport = async (retry = false) => {
+    if (importLock.current) return;
     const items = retry ? importResults.map(item => item.status === 'error' && item.url ? { ...item, status: 'pending' as const, message: undefined } : item) : parseImportLinks(batchLinks);
     if (!items.length) { setImportResults([]); setErrorMsg('请先填写至少一个仓库链接'); return; }
-    startOperation(); setErrorMsg(''); setImportResults([...items]);
+    importLock.current = true; startOperation(); setErrorMsg(''); setImportResults([...items]);
     const token = tokenInput.trim() || globalToken;
     for (let i = 0; i < items.length; i++) {
       if (items[i].status !== 'pending') continue;
@@ -1007,56 +1114,61 @@ export default config;
         const existing = reposRef.current.filter(item => !item.origin && item.owner.toLowerCase() === parsed.owner.toLowerCase() && item.repo.toLowerCase() === parsed.repo.toLowerCase());
         if (existing.length) {
           const meta = await githubClient.repository(parsed.owner, parsed.repo, token);
-          if (existing.some(item => item.branch === meta.defaultBranch)) {
+          if (existing.some(item => item.branch === meta.defaultBranch) && !importCandidates(reposRef.current, { ...parsed, url: items[i].url!, branch: meta.defaultBranch }).length) {
             items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${meta.defaultBranch} 已在项目列表中` }; setImportResults([...items]); continue;
           }
         }
-        const data = await githubClient.fetchRepo(items[i].url!, undefined, token);
+        const { choice, data } = await prepareImport(`https://github.com/${parsed.owner}/${parsed.repo}`, undefined, token);
         operationSignal().throwIfAborted();
+        if (!data) { items[i] = { ...items[i], status: 'skipped', message: '用户选择跳过此链接' }; setImportResults([...items]); continue; }
         const exists = reposRef.current.some(item => { const source = sourceOf(item); return source.owner.toLowerCase() === data.owner.toLowerCase() && source.repo.toLowerCase() === data.repo.toLowerCase() && source.branch === data.branch && !item.origin; });
-        if (exists) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
+        if (exists && choice === 'independent' && !importCandidates(reposRef.current, { ...data, url: items[i].url! }).length) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
         else {
-          const newRepo: TrackedRepo = { ...data, id: `repo-${crypto.randomUUID()}`, url: items[i].url!, token: tokenInput.trim() || undefined, remark: items[i].remark || '', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length };
+          const newRepo = importWithBase({ ...data, id: `repo-${crypto.randomUUID()}`, url: typeof choice === 'string' ? items[i].url! : choice.candidate.source.url, token: tokenInput.trim() || undefined, remark: items[i].remark || '', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length }, choice, true);
           // Keep file contents in IndexedDB only; never copy them into the project record.
           const { files, ...record } = newRepo as TrackedRepo & { files?: CachedFile[] };
           await localCache.saveProjectFiles(record.id, data.files, data.latestCommitSha);
-          operationSignal().throwIfAborted(); persistRepos([record, ...reposRef.current]);
+          operationSignal().throwIfAborted(); persistRepos([record, ...reposRef.current.filter(item => item.id !== record.id)]);
           if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
             try { (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${record.repo}`, JSON.stringify({ repo: record.repo, sha: record.latestCommitSha, files: data.files })); }
             catch { /* Durable browser cache is already saved; native export can be retried separately. */ }
           }
-          items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件，备注和描述可在项目设置中修改` };
+          items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${typeof choice !== 'string' ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
         }
         await transferCache.clear(data.latestCommitSha);
       } catch (error) { items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
       setImportResults([...items]);
     }
     for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'error', message: '操作已取消，尚未导入，可重试' };
-    setImportResults([...items]); setIsLoading(false); setCurrentView('projects');
+    setImportResults([...items]); setIsLoading(false); setCurrentView('projects'); importLock.current = false;
   };
 
   const handleAddRepo = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!repoUrl.trim()) return;
+    if (!repoUrl.trim() || importLock.current) return;
+    importLock.current = true;
     startOperation(); setErrorMsg(''); setLoadingText('正在获取完整项目…');
     try {
-      const data = await githubClient.fetchRepo(repoUrl.trim(), branchInput.trim() || undefined, tokenInput.trim() || globalToken);
-      const newRepo: TrackedRepo = {
-        id: `${data.owner}-${data.repo}-${Date.now()}`, url: repoUrl.trim(), owner: data.owner, repo: data.repo, branch: data.branch,
+      const { choice, data } = await prepareImport(repoUrl.trim(), branchInput.trim() || undefined, tokenInput.trim() || globalToken);
+      operationSignal().throwIfAborted();
+      if (!data) return;
+      const newRepo = importWithBase({
+        id: `${data.owner}-${data.repo}-${Date.now()}`, url: typeof choice === 'string' ? repoUrl.trim() : choice.candidate.source.url, owner: data.owner, repo: data.repo, branch: data.branch,
         token: tokenInput.trim() || undefined, remark: remarkInput.trim() || '未备注项目', description: descriptionInput.trim() || data.repoMeta.description,
         tags: tagsInput.split(',').map(t => t.trim()).filter(Boolean), checkInterval: 0, lastCheckedAt: new Date().toISOString(),
         latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate,
         lastSyncedAt: new Date().toISOString(), repoMeta: data.repoMeta, tree: data.tree, backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length,
-      };
+      }, choice);
       await localCache.saveProjectFiles(newRepo.id, data.files, data.latestCommitSha);
-      persistRepos([newRepo, ...reposRef.current]);
+      operationSignal().throwIfAborted(); persistRepos([newRepo, ...reposRef.current.filter(item => item.id !== newRepo.id)]);
       if (isApkEnvironment && (window as any).AndroidBridge?.saveProjectFolder) {
         (window as any).AndroidBridge.saveProjectFolder(`${apkDownloadDirectory}/${newRepo.repo}`, JSON.stringify({ repo: newRepo.repo, sha: newRepo.latestCommitSha, files: data.files }));
       }
       setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
-      alert(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。`);
+      await transferCache.clear(data.latestCommitSha);
+      alert(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
     } catch (error) { setErrorMsg((error as Error).message || '操作已取消'); }
-    finally { setIsLoading(false); }
+    finally { setIsLoading(false); importLock.current = false; }
   };
 
   // Open modal for uploading single project to user's private repo
@@ -3147,6 +3259,50 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
           </div>
         )}
       </main>
+
+      {importMatch && <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
+        <div role="dialog" aria-modal="true" aria-label="选择已有项目作为同步基础" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-6 shadow-xl flex flex-col gap-4">
+          <div className="flex flex-row justify-between items-start gap-3">
+            <h3 className="text-base font-bold font-serif text-[#2B2723]">发现已有上传或分叉项目</h3>
+            <button type="button" aria-label="取消本次导入" onClick={cancelGithubOperation} className="text-[#91887C] p-1"><X className="w-5 h-5" /></button>
+          </div>
+          <p className="text-xs text-[#7A7367] leading-relaxed break-words">已按项目列表中保存的来源关系匹配。请先对比再决定是否沿用；本次只保存本地项目和绑定，后续上传或分叉同步才会写入远端。也可以独立导入或跳过。</p>
+          <p className="text-xs text-[#474239] break-all">新链接：{importMatch.source.owner}/{importMatch.source.repo} · {importMatch.source.branch}<br />待导入提交：{importMatch.sha}</p>
+          <div className="flex flex-col gap-3">
+            {importMatch.candidates.map(candidate => {
+              const comparison = importMatch.comparisons[candidate.key];
+              const target = comparison?.target || candidate.target;
+              return <div key={candidate.key} className="border border-[#DFD8CE] rounded-xl bg-[#FAF8F5] p-3 flex flex-col gap-2 text-xs break-words">
+                <p className="font-semibold text-[#4D5E4A] break-all">{candidate.fullFork ? '完整分叉' : target.kind === 'current' ? '分支副本' : '上传仓库'}：{target.owner}/{target.repo}</p>
+                {candidate.remark && <p className="text-[#7A7367]">已有备注：{candidate.remark}</p>}
+                <p className="text-[#474239] break-all">原始来源：{candidate.source.owner}/{candidate.source.repo}</p>
+                <p className="text-[#474239] break-all">分支映射：{candidate.source.branch} → {target.branch}</p>
+                {comparison?.status === 'loading' && <p role="status" className="text-[#7A7367]">正在校验仓库身份并对比文件…</p>}
+                {comparison?.status === 'error' && <p role="alert" className="text-[#8C5D54]">无法沿用：{comparison.error}</p>}
+                {comparison?.status === 'ready' && <div className="flex flex-col gap-2 text-[#5D6F5A]">
+                  <p className="break-all">来源提交：{comparison.sourceSha}</p>
+                  <p className="break-all">目标提交：{comparison.commitSha || '目标分支尚不存在，后续上传时新建'}</p>
+                  <p role="status">相对目标：新增 {comparison.diff!.added.length} · 修改 {comparison.diff!.modified.length} · 删除 {comparison.diff!.removed.length}</p>
+                  {!candidate.fullFork && <p className="text-[#7A7367]">应用自动生成的 GITVAULT_METADATA.md 不计入差异；来源自带的同名文件仍会比较。</p>}
+                  {!comparison.diff!.added.length && !comparison.diff!.modified.length && !comparison.diff!.removed.length && <p>当前文件内容与文件模式一致。</p>}
+                  <p className="text-[#7A7367]">文件差异不影响同一来源的识别。沿用后上传会按来源快照覆盖该目标分支的文件，并保留提交历史。</p>
+                  {candidate.fullFork && <p className="text-[#7A7367]">此处对比当前分支；后续“分叉同步”会同步该分叉的全部上游分支。</p>}
+                  {comparison.diff!.added.length + comparison.diff!.modified.length + comparison.diff!.removed.length > 0 && <details><summary className="cursor-pointer">查看文件差异</summary><div className="max-h-40 overflow-y-auto mt-2 flex flex-col gap-1 break-all">{(['added', 'modified', 'removed'] as const).flatMap((kind, index) => comparison.diff![kind].map(path => <p key={`${kind}:${path}`}>{['新增', '修改', '删除'][index]} · {path}</p>))}</div></details>}
+                </div>}
+                <div className="grid grid-cols-2 gap-2 mt-1">
+                  <button type="button" disabled={comparison?.status === 'loading'} onClick={() => void compareImportBase(candidate)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-[#5D6F5A] disabled:opacity-40">{comparison?.status === 'ready' ? '重新对比' : '对比此项目'}</button>
+                  <button type="button" disabled={comparison?.status !== 'ready'} onClick={() => comparison?.status === 'ready' && importResolver.current?.({ candidate, comparison })} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl disabled:opacity-40">{candidate.fullFork ? '沿用分叉同步' : '沿用上传目标'}</button>
+                </div>
+              </div>;
+            })}
+          </div>
+          <div className="flex flex-row flex-wrap justify-end gap-2 border-t border-[#EDE7DF] pt-3">
+            <button type="button" onClick={cancelGithubOperation} className="px-3 py-2 text-xs text-[#8C5D54]">取消本次导入</button>
+            <button type="button" onClick={() => importResolver.current?.('skip')} className="px-3 py-2 text-xs border border-[#DFD8CE] rounded-xl text-[#554F45]">跳过此链接</button>
+            <button type="button" onClick={() => importResolver.current?.('independent')} className="px-3 py-2 text-xs bg-[#EFECE6] rounded-xl text-[#554F45]">独立导入，不关联</button>
+          </div>
+        </div>
+      </div>}
 
       {/* ================= MODAL 1: ADD / PULL REPO ================= */}
       {isAddModalOpen && (

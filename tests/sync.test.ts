@@ -6,6 +6,41 @@ import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, 
 import { localCache } from '../src/utils/localCache';
 import type { CachedFile } from '../src/utils/localCache';
 
+test('import comparison verifies immutable identity and pinned target tree without downloading or writing files', async () => {
+  handler = path => {
+    if (path === '/repos/me/renamed') return response({ id: 77, name: 'renamed', owner: { login: 'me' }, default_branch: 'main' });
+    if (path.endsWith('/commits/feature%2Fdemo')) return response({ sha: 'head', commit: { tree: { sha: 'tree' } } });
+    if (path.includes('/git/trees/tree')) return response({ tree: [{ path: 'a.txt', sha: 'blob', type: 'blob', mode: '100644' }] });
+    throw new Error(path);
+  };
+  const result = await githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'renamed', branch: 'feature/demo' }, 'token');
+  assert.equal(result.commitSha, 'head'); assert.equal(result.tree.length, 1);
+  assert.ok(calls.every(call => !call.init.method || call.init.method === 'GET'));
+  assert.ok(calls.every(call => !call.path.includes('/git/blobs/')));
+  await assert.rejects(githubClient.inspectImportTarget({ id: 88, owner: 'me', repo: 'renamed', branch: 'main' }, 'token'), /身份已变化/);
+});
+test('import comparison rejects a Fork with another upstream before reading its branch', async () => {
+  handler = () => response({ id: 77, fork: true, parent: { full_name: 'another/template' } });
+  await assert.rejects(githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'fork', branch: 'main' }, 'token', { owner: 'source', repo: 'template' }), /上游与来源不一致/);
+  assert.equal(calls.length, 1);
+});
+test('missing target branch is offered for future creation only after repository and branch access are verified', async () => {
+  handler = path => {
+    if (path === '/repos/me/project') return response({ id: 77, default_branch: 'main' });
+    if (path.includes('/commits/')) return response({ message: 'Not Found' }, 404);
+    if (path.includes('/branches?')) return response([{ name: 'main' }]);
+    throw new Error(path);
+  };
+  const result = await githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'project', branch: 'feature/demo' }, 'token');
+  assert.equal(result.missingBranch, true); assert.deepEqual(result.tree, []);
+  assert.ok(calls.every(call => !call.init.method || call.init.method === 'GET'));
+});
+test('import comparison preserves rate-limit errors and never treats them as a missing branch', async () => {
+  handler = path => path === '/repos/me/project' ? response({ id: 77 }) : response({ message: 'API rate limit exceeded' }, 403);
+  await assert.rejects(githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'project', branch: 'main' }, 'token'), /API rate limit exceeded/);
+  assert.equal(calls.length, 2);
+});
+
 const originalFetch = globalThis.fetch;
 const sha = (text: string | Buffer) => createHash('sha1').update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest('hex');
 const response = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });

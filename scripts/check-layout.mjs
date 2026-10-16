@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 // Runs against the production build with synthetic local records and no GitHub writes.
 const dist = resolve('dist');
@@ -15,8 +16,36 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
+const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
+// Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
+const importMock = `<script>
+if (new URLSearchParams(location.search).has('audit-import')) {
+  const fixture = ${JSON.stringify(fixture)};
+  const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
+  fixture.url = 'https://github.com/' + fixture.owner + '/' + fixture.repo;
+  fixture.uploadTarget = target;
+  localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
+  const sourceRoot = '/repos/' + fixture.owner + '/' + fixture.repo, targetRoot = '/repos/' + target.owner + '/' + target.repo;
+  const original = window.fetch;
+  window.fetch = async (input, init = {}) => {
+    const url = String(input), path = new URL(url, location.href).pathname;
+    if (!url.includes('api.github.com') && !url.includes('codeload.github.com')) return original(input, init);
+    if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
+    const reply = value => new Response(JSON.stringify(value), {headers:{'Content-Type':'application/json'}});
+    if (path === sourceRoot) return reply({id:42, default_branch:fixture.branch, owner:{login:fixture.owner}, name:fixture.repo, html_url:fixture.url});
+    if (path === targetRoot) return reply({...target, id:new URLSearchParams(location.search).get('audit-import')==='error'?99:77, owner:{login:target.owner}, name:target.repo});
+    if (path.startsWith(sourceRoot + '/commits/')) return reply({sha:'source-new', commit:{tree:{sha:'audit-source-tree'},message:'new',author:{}}});
+    if (path.startsWith(targetRoot + '/commits/')) return reply({sha:'target-old', commit:{tree:{sha:'audit-target-tree'},message:'old',author:{}}});
+    if (path.includes('/git/trees/audit-source-tree')) return reply({tree:[{...fixture.tree[0], sha:${JSON.stringify(mockBlob)}}]});
+    if (path.includes('/git/trees/audit-target-tree')) return reply({tree:[fixture.tree[0], {...fixture.tree[0], path:'removed/'.repeat(20)+'old.txt'}]});
+    if (path.includes('/git/blobs/')) return reply({encoding:'base64',content:'bmV3'});
+    if (path.includes('/zipball/') || url.includes('codeload.github.com')) throw new TypeError('Synthetic archive fallback');
+    return new Response(JSON.stringify({message:'Unexpected mock request'}),{status:404});
+  };
+}
+</script>`;
 const html = `<!doctype html><meta charset="utf-8"><title>GitVault layout audit</title><body><script>
 const fixture = ${JSON.stringify(fixture)};
 localStorage.clear();
@@ -53,10 +82,11 @@ function inspect(doc, width, scenario) {
 }
 (async () => {
   for (const width of widths) for (const scenario of scenarios) {
+    localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/'; }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : ''); }); await pause();
       const doc = frame.contentDocument;
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario)) {
         await click(doc,'仓库已有项目 (1)');
@@ -69,6 +99,22 @@ function inspect(doc, width, scenario) {
         if (scenario==='push') await click(doc,'上传指定仓库');
         if (scenario==='folders'||scenario==='storage') { await click(doc,'下载自选文件夹'); if(scenario==='storage') await click(doc,'本地存储与缓存'); }
         if (scenario==='metadata') await click(doc,'编辑备注与描述');
+      } else if(scenario.startsWith('import-')) {
+        await click(doc,'新建链接/拉取项目');
+        const fields = [...doc.querySelectorAll('input')];
+        const set = (field,value) => { Object.getOwnPropertyDescriptor(frame.contentWindow.HTMLInputElement.prototype,'value').set.call(field,value); field.dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true})); };
+        set(fields.find(field=>field.placeholder.startsWith('https://github.com/owner/repo')), fixture.owner+'/'+fixture.repo);
+        set(fields.find(field=>field.placeholder==='例如: 生产核心源码 / 模块A'), '对比项目长备注'.repeat(10)); await pause();
+        await click(doc,'确认拉取进入本地');
+        for(let tries=0;tries<100&&!doc.querySelector('[aria-label="选择已有项目作为同步基础"]');tries++) await pause();
+        if(!doc.querySelector('[aria-label="选择已有项目作为同步基础"]')) throw new Error('Import match dialog did not open');
+        if(scenario!=='import-match') {
+          await click(doc,'对比此项目');
+          for(let tries=0;tries<100&&doc.body.textContent.includes('正在校验仓库身份并对比文件');tries++) await pause();
+          if(scenario==='import-error'&&!doc.body.textContent.includes('身份已变化')) throw new Error('Expected identity comparison error');
+          if(scenario!=='import-error'&&!doc.body.textContent.includes('新增 0 · 修改 1 · 删除 1')) throw new Error('Expected file comparison counts');
+          if(scenario==='import-files') { const detail=[...doc.querySelectorAll('summary')].find(el=>el.textContent==='查看文件差异'); detail.click(); await pause(); }
+        }
       } else if(scenario==='add'||scenario==='import') {
         await click(doc,'新建链接/拉取项目'); if (scenario==='import') await click(doc,'批量导入链接');
       } else if(['settings','backup','apk'].includes(scenario)) {
@@ -91,7 +137,9 @@ const server = createServer(async (request, response) => {
     const file = resolve(dist, relative || 'index.html');
     if (file !== dist && !file.startsWith(dist + '/')) { response.writeHead(403).end(); return; }
     const type = { '.html':'text/html', '.js':'application/javascript', '.css':'text/css', '.svg':'image/svg+xml' }[extname(file)] || 'application/octet-stream';
-    response.setHeader('Content-Type', type); response.end(await readFile(file));
+    response.setHeader('Content-Type', type);
+    const content = await readFile(file);
+    response.end(extname(file) === '.html' ? content.toString().replace('<head>', '<head>' + importMock) : content);
   } catch { response.writeHead(404).end(); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));

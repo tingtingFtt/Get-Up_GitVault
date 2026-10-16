@@ -13,6 +13,53 @@ const originalFetch = globalThis.fetch;
 const sha = (s: string) => createHash('sha1').update(`blob ${Buffer.byteLength(s)}\0`).update(s).digest('hex');
 const file = (content: string) => ({ path: 'a.txt', content, isBase64: false, sha: sha(content), mode: '100644' });
 const entry = (content: string) => ({ path: 'a.txt', sha: sha(content), mode: '100644', type: 'blob', size: content.length });
+
+function importAssociationFixture(options: { changedId?: boolean; full?: boolean; delayedComparison?: boolean; missingBranch?: string } = {}) {
+  const base = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const path = String(url).replace('https://api.github.com', '');
+    if (path === '/repos/source/project' || path === '/repos/demo/other') {
+      requests.push({ path, payload: null });
+      return ok({ id: 42, name: 'project', owner: { login: 'source' }, default_branch: 'develop', html_url: 'https://github.com/source/project' });
+    }
+    if (path.includes('/repos/source/project/commits/') || path.includes('/repos/demo/other/commits/')) {
+      requests.push({ path, payload: null });
+      return ok({ sha: 'import-new', commit: { tree: { sha: 'import-tree' }, message: 'imported newest', author: {} } });
+    }
+    if (path === '/repos/destination/backup') {
+      requests.push({ path, payload: null });
+      return ok({ id: options.changedId ? 99 : 77, owner: { login: 'destination' }, name: 'backup', default_branch: 'main', html_url: 'https://github.com/destination/backup', ...(options.full ? { fork: true, parent: { full_name: 'source/project' } } : {}) });
+    }
+    if (path === '/repos/destination/backup/commits/release') {
+      requests.push({ path, payload: null });
+      if (options.delayedComparison) return new Promise<Response>((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason), { once: true }));
+      return ok({ sha: 'target-current', commit: { tree: { sha: 'compare-tree' } } });
+    }
+    if (options.missingBranch && path === '/repos/destination/backup/commits/' + encodeURIComponent(options.missingBranch)) return ok({ message: 'Not Found' }, 404);
+    if (options.missingBranch && path.startsWith('/repos/destination/backup/branches?')) return ok([{ name: 'main' }, { name: 'release' }]);
+    if (path.includes('/git/trees/import-tree')) { requests.push({ path, payload: null }); return ok({ tree: [entry('latest')] }); }
+    if (path.includes('/git/trees/compare-tree')) { requests.push({ path, payload: null }); return ok({ tree: [entry('old'), { ...entry('delete'), path: 'deleted.txt' }] }); }
+    if (path.includes('/git/blobs/')) {
+      const content = ['latest', 'old', 'delete'].find(value => path.endsWith(sha(value)));
+      if (content) { requests.push({ path, payload: null }); return ok({ encoding: 'base64', content: Buffer.from(content).toString('base64') }); }
+    }
+    return base(url, init);
+  };
+}
+const importDialog = () => document.querySelector('[aria-label="选择已有项目作为同步基础"]');
+async function beginMatchingImport(batch = false) {
+  await click('新建链接/拉取项目');
+  if (batch) {
+    await click('批量导入链接');
+    await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, '新备注  source/project\ndemo/other');
+    await click('开始批量导入');
+  } else {
+    await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo', 'source/project');
+    await input('例如: 生产核心源码 / 模块A', '新备注');
+    await click('确认拉取进入本地');
+  }
+  await waitFor(() => !!importDialog());
+}
 const repo = () => ({ id: 'tracked', url: 'https://github.com/source/project', owner: 'source', repo: 'project', branch: 'develop', token: 'fake-test-token', remark: 'test project', description: '', tags: ['默认'], checkInterval: 0, latestCommitSha: 'v2', commitMessage: 'new', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', lastSyncedAt: '2026-10-15T00:00:00Z', repoMeta: { htmlUrl: 'https://github.com/source/project' }, tree: [entry('new')], cachedFilesCount: 1, isCachePurged: false, backups: [{ id: 'old', versionNumber: 1, tag: 'v1', annotation: 'old version', commitSha: 'v1', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-14T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [entry('old')] }] });
 let root: Root;
 let alerts: string[];
@@ -55,6 +102,134 @@ beforeEach(async () => {
   await act(async () => { root.render(React.createElement(App)); });
 });
 afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; });
+
+test('matching link waits for a choice, compares target files, reuses its fixed name and preserves old history before later upload', async () => {
+  await reloadProject(boundProject()); importAssociationFixture();
+  const before = localStorage.getItem('gitvault_repos_v8');
+  await beginMatchingImport();
+  assert.equal(localStorage.getItem('gitvault_repos_v8'), before);
+  assert.ok(!requests.some(r => r.path.includes('/zipball/') || r.path.includes('/git/blobs/')));
+  assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
+  await click('对比此项目');
+  await waitFor(() => importDialog()?.textContent?.includes('新增 0 · 修改 1 · 删除 1') === true);
+  assert.ok(importDialog()?.textContent?.includes('develop → release'));
+  assert.ok(requests.every(r => r.payload === null));
+  await click('沿用上传目标'); await waitFor(() => !importDialog() && alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.length, 1); assert.equal(saved[0].id, 'tracked'); assert.equal(saved[0].uploadTarget.id, 77);
+  assert.equal(saved[0].uploadTarget.repo, 'backup'); assert.equal(saved[0].uploadTarget.branch, 'release');
+  assert.equal(saved[0].latestCommitSha, 'import-new'); assert.equal(saved[0].backups.length, 2);
+  assert.equal(saved[0].backups[0].commitSha, 'v2'); assert.equal(saved[0].remoteSnapshot, undefined);
+  assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
+  assert.equal((await localCache.getProjectFiles('tracked', 'import-new'))[0].content, 'latest');
+  await enterWorkbench(); await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
+  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.commitSha === 'uploaded');
+  assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
+});
+test('choosing independent import never inherits an upload or Fork binding or changes the existing project', async () => {
+  await reloadProject(boundProject()); importAssociationFixture();
+  const previous = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  await beginMatchingImport(); await click('独立导入，不关联'); await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.length, 2); assert.equal(saved[0].uploadTarget, undefined); assert.equal(saved[0].forkTarget, undefined);
+  assert.deepEqual(saved.find((project: any) => project.id === 'tracked'), previous);
+  assert.ok(requests.every(r => r.payload === null));
+});
+test('importing the destination URL can explicitly resume the original source instead of tracking the destination as its own upstream', async () => {
+  await reloadProject(boundProject()); importAssociationFixture();
+  await click('新建链接/拉取项目');
+  await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo', 'destination/backup');
+  await input('例如: 生产核心源码 / 模块A', '续用已有上传');
+  await input('留空自动识别（支持链接指定分支）', 'release');
+  await click('确认拉取进入本地'); await waitFor(() => !!importDialog());
+  await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
+  assert.ok(importDialog()?.textContent?.includes('原始来源：source/project'));
+  await click('沿用上传目标'); await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.length, 1); assert.equal(saved[0].url, 'https://github.com/source/project');
+  assert.equal(saved[0].owner, 'source'); assert.equal(saved[0].branch, 'develop');
+  assert.equal(saved[0].latestCommitSha, 'import-new'); assert.equal(saved[0].uploadTarget.branch, 'release');
+  assert.equal((await localCache.getProjectFiles('tracked', 'import-new'))[0].content, 'latest');
+  assert.ok(requests.every(r => r.payload === null));
+});
+test('importing another source branch reuses the destination repository but plans a matching new branch without overwriting the existing branch', async () => {
+  await reloadProject(boundProject()); importAssociationFixture({ missingBranch: 'feature/demo' });
+  await click('新建链接/拉取项目');
+  await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo', 'source/project');
+  await input('例如: 生产核心源码 / 模块A', '新分支');
+  await input('留空自动识别（支持链接指定分支）', 'feature/demo');
+  await click('确认拉取进入本地'); await waitFor(() => !!importDialog());
+  await click('对比此项目'); await waitFor(() => importDialog()?.textContent?.includes('后续上传时新建') === true);
+  await click('沿用上传目标'); await waitFor(() => alerts.length > 0);
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.length, 2);
+  const feature = saved.find((project: any) => project.branch === 'feature/demo');
+  assert.equal(feature.uploadTarget.repo, 'backup'); assert.equal(feature.uploadTarget.branch, 'feature/demo'); assert.equal(feature.branchUploadPending, true);
+  assert.equal(saved.find((project: any) => project.id === 'tracked').uploadTarget.branch, 'release');
+  assert.ok(requests.every(r => r.payload === null));
+});
+test('failed identity comparison cannot be accepted and skipping leaves all project records unchanged', async () => {
+  await reloadProject(boundProject()); importAssociationFixture({ changedId: true });
+  const previous = localStorage.getItem('gitvault_repos_v8');
+  await beginMatchingImport(); await click('对比此项目');
+  await waitFor(() => importDialog()?.textContent?.includes('身份已变化') === true);
+  assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
+  await click('跳过此链接'); await waitFor(() => !importDialog());
+  assert.equal(localStorage.getItem('gitvault_repos_v8'), previous);
+  assert.ok(!requests.some(r => r.path.endsWith('/commits/release')));
+  assert.ok(!requests.some(r => r.path.includes('/zipball/') || r.path.includes('/git/blobs/')));
+});
+test('batch import waits for each existing target decision, then continues the remaining links', async () => {
+  const existing = boundProject(); existing.tags = ['保留已有标签'];
+  await reloadProject(existing); importAssociationFixture();
+  await beginMatchingImport(true);
+  assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
+  await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
+  await click('沿用上传目标');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 0 · 失败 0');
+  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  assert.equal(saved.length, 2); assert.equal(saved.find((p: any) => p.id === 'tracked').remark, '新备注');
+  assert.deepEqual(saved.find((p: any) => p.id === 'tracked').tags, ['保留已有标签']);
+  assert.equal(saved.find((p: any) => p.owner === 'demo').remark, '');
+  assert.ok(requests.every(r => r.payload === null));
+});
+test('cancelling during comparison stops the batch and leaves both links retryable without stale bindings', async () => {
+  await reloadProject(boundProject()); importAssociationFixture({ delayedComparison: true });
+  const previous = localStorage.getItem('gitvault_repos_v8');
+  await beginMatchingImport(true); await click('对比此项目');
+  await waitFor(() => requests.some(r => r.path.endsWith('/commits/release')));
+  await click('取消本次导入');
+  await waitFor(() => !importDialog() && document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 0 · 失败 2');
+  assert.equal(localStorage.getItem('gitvault_repos_v8'), previous);
+  assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
+  importAssociationFixture(); await click('重试失败链接'); await waitFor(() => !!importDialog());
+  await click('跳过此链接');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 0');
+});
+test('native Fork reuse verifies the upstream and routes subsequent all-branch sync to that existing Fork', async () => {
+  const saved = boundProject(); saved.uploadTarget.kind = 'full'; saved.forkTarget = { ...saved.uploadTarget, htmlUrl: 'https://github.com/destination/backup', branches: ['develop', 'other'] };
+  await reloadProject(saved); importAssociationFixture({ full: true });
+  await beginMatchingImport(); await click('对比此项目');
+  await waitFor(() => buttons().some(b => b.textContent === '沿用分叉同步' && !b.disabled));
+  await click('沿用分叉同步'); await waitFor(() => alerts.length > 0);
+  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  assert.equal(updated.forkTarget.repo, 'backup'); assert.equal(updated.forkScope, 'full');
+  assert.deepEqual(updated.forkTarget.branches, ['develop', 'other']);
+  assert.ok(requests.every(r => r.payload === null));
+  let called = '';
+  const original = githubClient.syncAllForkBranches;
+  githubClient.syncAllForkBranches = async (owner, name) => { called = `${owner}/${name}`; return [{ branch: 'develop', success: true }]; };
+  try { await enterWorkbench(); await click('同步上游'); await waitFor(() => called !== ''); assert.equal(called, 'destination/backup'); }
+  finally { githubClient.syncAllForkBranches = original; }
+});
+test('comparison refuses a target branch already bound to another project even when the branch names match', async () => {
+  const unrelated = { ...boundProject(), id: 'unrelated', owner: 'unrelated', url: 'https://github.com/unrelated/project' };
+  await reloadProjects([boundProject(), unrelated]); importAssociationFixture();
+  await beginMatchingImport(); await click('对比此项目');
+  await waitFor(() => importDialog()?.textContent?.includes('unrelated/project') === true);
+  assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
+  await click('跳过此链接');
+});
 const buttons = () => [...document.querySelectorAll('button')];
 async function waitFor(check: () => boolean) {
   for (let i = 0; i < 100 && !check(); i++) await act(async () => { await new Promise(r => setTimeout(r, 10)); });

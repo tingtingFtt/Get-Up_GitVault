@@ -256,7 +256,24 @@ export const githubClient = {
   async repository(owner: string, repo: string, token?: string, expectedId?: number) {
     const meta = await json(root(owner, repo), token, { cache: 'no-store' });
     if (expectedId && meta.id !== expectedId) throw new Error('目标仓库身份已变化，已停止操作，请检查绑定，避免写入同名的新仓库');
-    return { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private };
+    return { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
+  },
+
+  async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string }) {
+    const identity = await githubClient.repository(target.owner, target.repo, token, target.id);
+    if (forkSource && identity.forkParent?.toLowerCase() !== `${forkSource.owner}/${forkSource.repo}`.toLowerCase()) throw new Error('目标分叉的上游与来源不一致，不能沿用此同步关系');
+    let commit;
+    try { commit = await json(`${root(identity.owner, identity.repo)}/commits/${encodeURIComponent(target.branch)}`, token, { cache: 'no-store' }); }
+    catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 404) throw error;
+      // A missing ref is safe to create later; an inaccessible repository is not.
+      await githubClient.repository(identity.owner, identity.repo, token, identity.id);
+      const branches = await githubClient.fetchBranches(identity.htmlUrl, token);
+      if (branches.includes(target.branch)) throw error;
+      return { identity, commitSha: undefined, tree: [] as RepoEntry[], missingBranch: true };
+    }
+    const tree = await getTree(identity.owner, identity.repo, commit.commit.tree.sha, token);
+    return { identity, commitSha: commit.sha as string, tree, missingBranch: false };
   },
 
   async renameRepository(target: { id?: number; owner: string; repo: string }, name: string, token: string) {
@@ -271,10 +288,11 @@ export const githubClient = {
   async inspectRepo(url: string, branch: string | undefined, token?: string, ref?: string) {
     const { owner, repo, linkedRef } = parseRepository(url);
     const meta = await json(root(owner, repo), token, { cache: 'no-store' });
-    const selected = ref || await resolveRef(owner, repo, linkedRef, branch, token) || meta.default_branch;
+    const selectedBranch = await resolveRef(owner, repo, linkedRef, branch, token) || meta.default_branch;
+    const selected = ref || selectedBranch;
     const commit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(selected)}`, token, { cache: 'no-store' });
     const tree = await getTree(owner, repo, commit.commit.tree.sha, token);
-    return { owner, repo, branch: branch || meta.default_branch, latestCommitSha: commit.sha as string, commitMessage: commit.commit.message as string, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date || new Date().toISOString(), tree, repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url } };
+    return { owner, repo, branch: selectedBranch as string, latestCommitSha: commit.sha as string, commitMessage: commit.commit.message as string, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date || new Date().toISOString(), tree, repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url } };
   },
 
   async listHistory(target: { id?: number; owner: string; repo: string; branch: string }, token: string, page = 1) {
