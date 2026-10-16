@@ -107,6 +107,7 @@ function inspect(doc, width, scenario) {
 }
 (async () => {
   for (const width of widths) for (const scenario of scenarios) {
+    document.documentElement.dataset.layoutProgress = encodeURIComponent(JSON.stringify({width,scenario,checks,failures}));
     localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
     localStorage.removeItem('gitvault_operation_logs_v1');
     localStorage.removeItem('gitvault_tasks_v1');
@@ -209,16 +210,21 @@ const server = createServer(async (request, response) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const profile = await mkdtemp(resolve(tmpdir(), 'gitvault-layout-'));
 try {
-  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=90000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
+  // Production request spacing is part of this audit; allow its synthetic
+  // network reads as well as UI transitions to complete across 294 fixtures.
+  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=240000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
   const output = await new Promise((resolve, reject) => {
     const child = spawn(chrome, args); let stdout = ''; let stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Layout audit timed out: ' + stderr.slice(-1500))); }, 90000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Layout audit timed out: ' + stderr.slice(-1500))); }, 120000);
     child.stdout.on('data', data => stdout += data); child.stderr.on('data', data => stderr += data);
     child.on('error', error => { clearTimeout(timer); reject(error); });
     child.on('close', code => { clearTimeout(timer); code ? reject(new Error(stderr.slice(-2000))) : resolve(stdout); });
   });
   const match = output.match(/data-layout-report="([^"]+)"/);
-  if (!match) throw new Error('Layout audit did not finish; no browser report was returned.');
+  if (!match) {
+    const partial = output.match(/data-layout-progress="([^"]+)"/);
+    throw new Error('Layout audit did not finish; last fixture: ' + (partial ? decodeURIComponent(partial[1]) : 'no browser progress'));
+  }
   const report = JSON.parse(decodeURIComponent(match[1]));
   console.log(JSON.stringify(report, null, 2));
   if (report.failures.length || report.checks !== widths.length * scenarios.length) process.exitCode = 1;
