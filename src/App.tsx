@@ -4546,6 +4546,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
             </div>
 
             <p className="text-xs text-[#7A7367]">首次保存会在当前账号创建私人记录仓库 {REGISTRY_REPO}，仅记录来源、固定目标和分支映射。同账号的其他设备填写 Token 后可识别已有项目。取消不会回滚已完成的提交。</p>
+            {isBatchUploading && <p role="status" className="text-xs text-[#7A7367] whitespace-pre-wrap break-words">{loadingText}</p>}
             {/* Progress list */}
             <div className="max-h-60 overflow-y-auto flex flex-col gap-2 pr-1 border border-[#E5DFD7] rounded-xl p-3 bg-[#FAF8F5]">
               {batchUploadStatusList.map(item => (

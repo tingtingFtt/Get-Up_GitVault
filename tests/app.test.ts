@@ -1,5 +1,5 @@
 import { dom } from './dom';
-import { test, beforeEach, afterEach } from 'node:test';
+import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import 'fake-indexeddb/auto';
@@ -10,6 +10,7 @@ import { beginGithubOperation, githubClient, githubApi, GitHubError } from '../s
 import App from '../src/App';
 import { appDialog } from '../src/utils/appDialog';
 import { checkpoint } from '../src/utils/taskJournal';
+import { immediateTransport } from './transportFixture';
 import { accountRegistry, createAccountRegistry, type AccountProject } from '../src/utils/accountRegistry';
 const registryMethods = { ...accountRegistry };
 
@@ -74,6 +75,7 @@ let rejectionStatus: number;
 let uploadedContents: string[];
 const ok = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 beforeEach(async () => {
+  immediateTransport();
   accountRegistry.candidates = async () => ({ login: 'destination', recorded: [], legacy: [] });
   accountRegistry.save = async () => ({} as any);
   accountRegistry.remove = async () => ({} as any);
@@ -114,7 +116,7 @@ beforeEach(async () => {
   root = createRoot(document.getElementById('root')!);
   await act(async () => { root.render(React.createElement(App)); });
 });
-afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); });
+afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); mock.restoreAll(); });
 
 test('reopening a saved task does not write remotely and a changed branch blocks retry', async () => {
   checkpoint({ kind: 'projects', action: 'update', items: [{ id: 'tracked', label: 'source/project', name: 'project', status: 'running', source: 'https://github.com/source/project', branch: 'other' }] });

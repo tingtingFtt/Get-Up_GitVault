@@ -1,10 +1,11 @@
-import { test, beforeEach, afterEach } from 'node:test';
+import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import 'fake-indexeddb/auto';
 import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, parseRepository, TargetRepositoryError } from '../src/utils/githubClient';
-import { localCache } from '../src/utils/localCache';
+import { localCache, uploadCache } from '../src/utils/localCache';
 import type { CachedFile } from '../src/utils/localCache';
+import { immediateTransport } from './transportFixture';
 
 test('import comparison verifies immutable identity and pinned target tree without downloading or writing files', async () => {
   handler = path => {
@@ -67,11 +68,12 @@ const file = (path: string, content: string): CachedFile => ({ path, content, is
 let calls: Array<{ path: string; init: RequestInit }>;
 let handler: (path: string, init: RequestInit) => Response | Promise<Response>;
 beforeEach(async () => {
+  immediateTransport();
   beginGithubOperation(); calls = [];
   await new Promise<void>((resolve, reject) => { const r = indexedDB.deleteDatabase('GitVault_Storage_v1'); r.onsuccess = () => resolve(); r.onerror = () => reject(r.error); });
   globalThis.fetch = async (url, init = {}) => { const path = String(url).replace('https://api.github.com', ''); calls.push({ path, init }); return handler(path, init); };
 });
-afterEach(() => { globalThis.fetch = originalFetch; });
+afterEach(() => { globalThis.fetch = originalFetch; mock.restoreAll(); });
 function source(files = [file('a.txt', 'hello')], branch = 'develop') {
   handler = (path) => {
     if (path === '/repos/demo/project') return response({ default_branch: branch, html_url: 'https://github.com/demo/project' });
@@ -115,6 +117,12 @@ test('archive exceptions try the alternate channel then verified blob fallback',
   assert.equal(result.files.length, 13);
   assert.ok(calls.some(c => c.path.includes('/zipball/source-a')));
   assert.ok(calls.some(c => c.path.includes('codeload.github.com')));
+});
+test('a rate-limited archive stops instead of generating more fallback download requests', async () => {
+  source(Array.from({ length: 13 }, (_, i) => file(`${i}.txt`, `content-${i}`))); const base = handler;
+  handler = (path, init) => path.includes('/zipball/') ? response({ message: 'secondary rate limit' }, 403) : base(path, init);
+  await assert.rejects(githubClient.fetchRepo('demo/project'), /secondary rate limit/);
+  assert.ok(!calls.some(call => call.path.includes('/git/blobs/') || call.path.includes('codeload.github.com')));
 });
 test('a corrupt blob never marks a project fully cached', async () => {
   source(); const base = handler;
@@ -189,6 +197,73 @@ test('uploads exact snapshot to the selected branch without force and verifies i
   const tree = JSON.parse(calls.find(c => c.path.endsWith('/git/trees'))!.init.body as string);
   assert.equal(tree.base_tree, undefined); assert.deepEqual(tree.tree.map((f: any) => f.path), ['a.txt']);
   assert.equal(JSON.parse(calls.find(c => c.init.method === 'PATCH')!.init.body as string).force, false);
+});
+test('an interrupted upload resumes acknowledged blobs from IndexedDB and verifies them before reuse', async () => {
+  destination(); const base = handler;
+  const files = [file('first.txt', 'first bytes'), file('second.txt', 'second bytes')];
+  const acknowledged = new Map<string, string>(); let interrupted = false;
+  handler = (path, init) => {
+    if (path === '/repos/me/backup') return response({ id: 77, default_branch: 'main' });
+    if (path.endsWith('/git/blobs') && init.method === 'POST') {
+      const payload = JSON.parse(String(init.body));
+      if (payload.content === 'second bytes' && !interrupted) { interrupted = true; throw new TypeError('connection interrupted'); }
+      acknowledged.set(sha(payload.content), payload.content);
+    }
+    if (path.includes('/git/blobs/')) {
+      const hash = path.split('/').pop()!;
+      return response({ sha: hash, content: Buffer.from(acknowledged.get(hash)!).toString('base64'), encoding: 'base64' });
+    }
+    return base(path, init);
+  };
+  await assert.rejects(githubClient.push('me', 'backup', 'release', 'token', files, 'sync'), /interrupted/);
+  assert.deepEqual([...await uploadCache.load(77)], [files[0].sha]);
+  // Reopening a task uses the persisted acknowledgements, not an in-memory list.
+  beginGithubOperation();
+  const result = await githubClient.push('me', 'backup', 'release', 'token', files, 'sync');
+  assert.equal(result.verified, true);
+  const firstWrites = calls.filter(call => call.path.endsWith('/git/blobs') && JSON.parse(String(call.init.body)).content === 'first bytes');
+  assert.equal(firstWrites.length, 1);
+  assert.ok(calls.some(call => call.path.endsWith('/git/blobs/' + files[0].sha)));
+  assert.ok(!calls.some(call => call.path.includes('/heads/main')));
+});
+test('upload acknowledgements are isolated by repository ID and missing server objects are uploaded again', async () => {
+  for (const id of [88, 77]) {
+    await uploadCache.save(77, sha('same'));
+    destination(); const base = handler, before = calls.length;
+    handler = (path, init) => path === '/repos/me/backup' ? response({ id, default_branch: 'main' })
+      : path.includes('/git/blobs/') ? response({ message: 'Not Found' }, 404) : base(path, init);
+    await githubClient.push('me', 'backup', 'release', 'token', [file('same.txt', 'same')], 'sync');
+    const current = calls.slice(before);
+    assert.equal(current.filter(call => call.path.includes('/git/blobs/')).length, id === 77 ? 1 : 0);
+    assert.equal(current.filter(call => call.path.endsWith('/git/blobs')).length, 1);
+  }
+});
+test('identical file contents within a snapshot create one blob and preserve every path', async () => {
+  destination(); await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'same'), file('b', 'same')], 'sync');
+  assert.equal(calls.filter(call => call.path.endsWith('/git/blobs')).length, 1);
+  const tree = JSON.parse(String(calls.find(call => call.path.endsWith('/git/trees'))!.init.body));
+  assert.deepEqual(tree.tree.map((entry: any) => entry.path), ['a', 'b']);
+});
+test('renaming a file reuses an object already present elsewhere in the target tree', async () => {
+  destination(); const base = handler;
+  handler = (path, init) => path.includes('/git/trees/old-tree') ? response({ tree: [{ ...file('old-name', 'same'), type: 'blob' }] }) : base(path, init);
+  await githubClient.push('me', 'backup', 'release', 'token', [file('new-name', 'same')], 'rename');
+  assert.ok(!calls.some(call => call.path.endsWith('/git/blobs')));
+});
+test('adding upload acknowledgements upgrades version 3 without deleting existing source files', async () => {
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.open('GitVault_Storage_v1', 3);
+    request.onupgradeneeded = () => request.result.createObjectStore('project_files', { keyPath: 'repoId' });
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result, tx = db.transaction('project_files', 'readwrite');
+      tx.objectStore('project_files').put({ repoId: 'legacy', files: [file('kept.txt', 'kept')] });
+      tx.oncomplete = () => { db.close(); resolve(); }; tx.onabort = () => reject(tx.error);
+    };
+  });
+  await uploadCache.save(77, sha('kept'));
+  assert.equal((await localCache.getProjectFiles('legacy'))[0].content, 'kept');
+  assert.deepEqual([...await uploadCache.load(77)], [sha('kept')]);
 });
 test('target branch race stops the upload instead of overwriting concurrent work', async () => {
   destination({ race: true });
@@ -434,6 +509,7 @@ test('all-branch synchronization replaces file snapshots and appends target hist
     if (path.startsWith('/repos/author/template/commits/')) return response({ sha: 'upstream-' + path.split('/').pop(), commit: { tree: { sha: 'source-tree' }, message: 'upstream', author: {} } });
     if (path.includes('/author/template/git/trees/')) return response({ tree: [{ path: 'a.txt', type: 'blob', mode: '100644', sha: sha('new'), size: 3 }] });
     if (path.includes('/author/template/git/blobs/')) return response({ encoding: 'base64', content: Buffer.from('new').toString('base64') });
+    if (path.includes('/me/mine/git/blobs/')) return response({ encoding: 'base64', content: Buffer.from('new').toString('base64'), sha: sha('new') });
     if (path.includes('/git/ref/heads/')) return response({ object: { sha: heads[decodeURIComponent(path.split('/heads/')[1])] } });
     if (path.includes('/git/commits/')) return response({ tree: { sha: path.includes('/old-') ? 'old-tree' : 'new-tree' } });
     if (path.includes('/git/trees/old-tree')) return response({ tree: [{ path: 'deleted.txt', type: 'blob', mode: '100644', sha: sha('remove') }] });

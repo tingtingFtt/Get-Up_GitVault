@@ -10,12 +10,13 @@ export interface CachedFile {
   mode?: string;
 }
 const DB_NAME = 'GitVault_Storage_v1';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const LEGACY = 'project_files';
 const SNAPSHOTS = 'snapshots';
 const CONTENTS = 'file_contents';
 const RECEIPTS = 'sync_receipts';
 const TRANSFERS = 'download_parts';
+const UPLOADS = 'uploaded_blobs';
 const snapshotId = (repoId: string, ref: string) => `${repoId}@${ref}`;
 interface Snapshot { id: string; repoId: string; ref: string; files: Omit<CachedFile, 'content'>[]; savedAt: string }
 
@@ -32,6 +33,7 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(CONTENTS)) db.createObjectStore(CONTENTS, { keyPath: 'sha' });
       if (!db.objectStoreNames.contains(TRANSFERS)) { const store = db.createObjectStore(TRANSFERS, { keyPath: 'id' }); store.createIndex('transfer', 'transfer'); store.createIndex('commitSha', 'commitSha'); }
       if (!db.objectStoreNames.contains(RECEIPTS)) db.createObjectStore(RECEIPTS, { keyPath: 'id' });
+      if (!db.objectStoreNames.contains(UPLOADS)) db.createObjectStore(UPLOADS, { keyPath: 'id' }).createIndex('repoId', 'repoId');
     };
     request.onsuccess = () => { clearTimeout(timer); const db = request.result; if (timedOut) { db.close(); return; } db.onversionchange = () => db.close(); resolve(db); };
     request.onerror = () => { clearTimeout(timer); reject(request.error); };
@@ -70,6 +72,26 @@ export const transferCache = {
       const tx = db.transaction(TRANSFERS, 'readwrite'); const done = completed(tx);
       const store = tx.objectStore(TRANSFERS);
       for (const item of await read<any[]>(store.index('commitSha').getAll(commitSha))) store.delete(item.id);
+      await done;
+    });
+  },
+};
+/** Server-acknowledged object IDs only; no source bytes or tokens. Recheck on reuse. */
+export const uploadCache = {
+  async load(repoId: number): Promise<Set<string>> {
+    return withDB(async db => {
+      const tx = db.transaction(UPLOADS, 'readwrite'), done = completed(tx);
+      const store = tx.objectStore(UPLOADS), entries = await read<any[]>(store.index('repoId').getAll(repoId));
+      const valid = entries.filter(item => item.savedAt > Date.now() - 7 * 86400000);
+      for (const item of entries) if (!valid.includes(item)) store.delete(item.id);
+      await done;
+      return new Set(valid.map(item => item.sha));
+    });
+  },
+  async save(repoId: number, sha: string): Promise<void> {
+    await withDB(async db => {
+      const tx = db.transaction(UPLOADS, 'readwrite'), done = completed(tx);
+      tx.objectStore(UPLOADS).put({ id: `${repoId}:${sha}`, repoId, sha, savedAt: Date.now() });
       await done;
     });
   },

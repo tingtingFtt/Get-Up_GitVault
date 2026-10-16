@@ -1,8 +1,10 @@
 import { gitBlobSha } from './gitFiles';
 export { gitBlobSha } from './gitFiles';
-import { transferCache } from './localCache';
+import { transferCache, uploadCache } from './localCache';
 import type { CachedFile } from './localCache';
 import type { TargetHealth, TargetIdentity } from './targetLifecycle';
+import { githubTransport, GitHubError } from './githubTransport';
+export { GitHubError } from './githubTransport';
 
 export interface RepoEntry {
   path: string;
@@ -33,9 +35,6 @@ function headers(token?: string, raw = false): Record<string, string> {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
 }
-export class GitHubError extends Error {
-  constructor(message: string, public status: number, public rateLimited = false) { super(message); }
-}
 export class TargetRepositoryError extends GitHubError {
   constructor(public health: TargetHealth, status: number) { super(health.message, status, health.status === 'limited'); }
 }
@@ -44,37 +43,11 @@ function targetHealthEvent(target: TargetIdentity, health: TargetHealth, checkId
   if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('gitvault-target-health', { detail: { target, health, identity, checkId } }));
 }
 
-// All requests have a deadline, including reading the response body. Mutations are never retried blindly.
+// Every operation, including account records and source blobs, uses one policy.
 async function request(path: string, token?: string, init: RequestInit = {}, signal = operation.signal, timeout = 45000): Promise<Response> {
-  signal.throwIfAborted();
-  const controller = new AbortController();
-  const abort = () => controller.abort(signal.reason);
-  signal.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(() => controller.abort(new DOMException('GitHub 请求超时，请重试', 'TimeoutError')), timeout);
-  try {
-    const response = await fetch(path.startsWith('https://') ? path : `https://api.github.com${path}`, {
-      ...init, headers: { ...headers(token), ...init.headers }, signal: controller.signal,
-    });
-    // Consume inside the deadline; callers can safely parse the buffered response.
-    const body = await response.arrayBuffer();
-    if (!response.ok) {
-      let message = new TextDecoder().decode(body);
-      try { message = JSON.parse(message).message || message; } catch { /* non-JSON error */ }
-      if (response.status === 403 || response.status === 429) {
-        const reset = response.headers.get('x-ratelimit-reset');
-        message += reset ? `；请求受限，可在 ${new Date(Number(reset) * 1000).toLocaleTimeString()} 后重试` : '；请检查访问权限或稍后重试';
-      }
-      throw new GitHubError(`GitHub (${response.status}): ${message.slice(0, 350)}`, response.status, response.status === 429 || response.headers.get('x-ratelimit-remaining') === '0' || !!response.headers.get('retry-after') || /rate limit|secondary limit/i.test(message));
-    }
-    return new Response(response.status === 204 ? null : body, { status: response.status, headers: response.headers });
-  } catch (error) {
-    if (signal.aborted) throw signal.reason;
-    if (controller.signal.aborted) throw controller.signal.reason;
-    throw error;
-  } finally {
-    clearTimeout(timer);
-    signal.removeEventListener('abort', abort);
-  }
+  return githubTransport.request(path.startsWith('https://') ? path : `https://api.github.com${path}`, {
+    ...init, headers: { ...headers(token), ...init.headers },
+  }, signal, timeout);
 }
 async function json(path: string, token?: string, init: RequestInit = {}, signal?: AbortSignal) {
   const response = await request(path, token, init, signal);
@@ -219,6 +192,7 @@ export const githubClient = {
           break;
         } catch (error) {
           if (signal.aborted) throw signal.reason;
+          if (error instanceof GitHubError && error.rateLimited) throw error;
           // Reuse verified entries even when an archive was only partially usable.
           done = files.size;
           progress('压缩包不可用，正在切换逐文件下载…', options);
@@ -368,15 +342,32 @@ export const githubClient = {
       for (const item of await getTree(targetOwner, targetRepo, commit.tree.sha, token)) existing.set(item.path, item);
     }
     let done = 0;
-    const treeItems = await mapConcurrent(allFiles, 4, async file => {
+    const checkpointId = meta.id || 0;
+    const checkpoints = typeof indexedDB !== 'undefined' && Number.isSafeInteger(checkpointId) && checkpointId > 0 ? uploadCache : undefined;
+    const acknowledged = checkpoints ? await checkpoints.load(checkpointId) : new Set<string>();
+    const verifiedBlobs = new Set([...existing.values()].filter(item => item.type === 'blob').map(item => item.sha));
+    const treeItems = await mapConcurrent(allFiles, 1, async file => {
+      signal.throwIfAborted();
       const bytes = file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content);
       const hash = await gitBlobSha(bytes);
       const old = existing.get(file.path);
       let sha = hash;
-      if (old?.sha !== hash) {
-        const blob = await json(`${base}/git/blobs`, token, body('POST', { content: file.content, encoding: file.isBase64 ? 'base64' : 'utf-8' }));
-        sha = blob.sha;
-        if (sha !== hash) throw new Error(`上传文件校验失败: ${file.path}`);
+      if (old?.sha !== hash && !verifiedBlobs.has(hash)) {
+        let reusable = false;
+        if (acknowledged.has(hash)) {
+          try {
+            const blob = await json(`${base}/git/blobs/${hash}`, token, { cache: 'no-store' }, signal);
+            const remote = bytesFromBase64(blob.content);
+            reusable = await gitBlobSha(remote) === hash;
+          } catch (error) { if (!(error instanceof GitHubError) || error.status !== 404) throw error; }
+        }
+        if (!reusable) {
+          const blob = await json(`${base}/git/blobs`, token, body('POST', { content: file.content, encoding: file.isBase64 ? 'base64' : 'utf-8' }), signal);
+          sha = blob.sha;
+          if (sha !== hash) throw new Error(`上传文件校验失败: ${file.path}`);
+          if (checkpoints) await checkpoints.save(checkpointId, hash);
+        }
+        verifiedBlobs.add(hash);
       }
       progress(`正在上传并校验 ${++done}/${allFiles.length}：${file.path}`);
       return { path: file.path, mode: file.mode || '100644', type: 'blob', sha };
