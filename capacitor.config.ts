@@ -4,6 +4,8 @@ const config: CapacitorConfig = {
   appId: 'com.gitvault.app',
   appName: 'GitVault',
   webDir: 'dist',
+  // Plugin arguments include credentials and source files. Keep them out of logcat.
+  loggingBehavior: 'none',
   server: { androidScheme: 'https', errorPath: 'webview-error.html' },
   android: { allowMixedContent: false, minWebViewVersion: 119 },
   // MainActivity owns the native content viewport, including keyboard insets.
