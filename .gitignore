@@ -7,3 +7,5 @@ playwright-report/
 test-results/
 *.jks
 *.keystore
+__pycache__/
+android-device-screenshots/

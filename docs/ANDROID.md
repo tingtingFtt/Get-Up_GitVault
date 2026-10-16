@@ -42,6 +42,10 @@ GitHub Actions 的 **Build Android APK** 在相关 main 变更后自动运行，
 - 系统文件／目录选择器仍由 Android 展示，不伪造授权。返回键优先关闭当前应用弹窗，再回项目列表／首页；运行中的任务先询问取消，退出前检查安全存储。
 - 不锁定方向；软键盘出现时根据可见视口限制弹窗高度，Android 原生处理系统栏与屏幕缺口。
 
+系统栏避让放在原生内容父容器：状态栏／刘海占用顶部和侧边区域，底部使用导航栏与键盘高度的较大值，再把已处理的 Insets 消费掉。不能只设置 WebView padding，否则 HTML 的固定导航、顶栏和弹窗仍可能绘制在系统栏下方。Android 16 模拟器测试直接检查 WebView 屏幕坐标、横竖屏与键盘区域，并保存截图。
+
+启动器和启动画面使用顶栏同款灰绿渐变、白色衬线 GV 标识。源文件在 `assets/gitvault-icon.svg`，文字已转为路径；安装 Inkscape 后运行 `python scripts/generate-android-icons.py` 可生成各密度 PNG 与 Android 自适应图标。网页布局和顶栏样式不受影响。
+
 ## 缓存、目录与下载
 
 源码缓存仍使用应用 WebView 内的 IndexedDB；快照、绑定、任务队列和日志也保留在本设备。Android 应用不是本地 git clone，远端历史仍由 GitHub 保存。
