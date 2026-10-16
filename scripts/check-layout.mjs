@@ -16,7 +16,7 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
@@ -29,7 +29,9 @@ if (new URLSearchParams(location.search).has('audit-batch')) {
     if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
     if (url.pathname === '/user') return new Response(JSON.stringify({login:'audit-account'}),{status:200});
     if (url.pathname === '/user/repos') {
-      if (new URLSearchParams(location.search).get('audit-batch')==='error') return new Response(JSON.stringify({message:'API rate limit exceeded '+ 'long-failure-reason-'.repeat(30)}),{status:403});
+      const state = new URLSearchParams(location.search).get('audit-batch');
+      if (state==='error') return new Response(JSON.stringify({message:'Resource not accessible '+ 'long-failure-reason-'.repeat(30)}),{status:403});
+      if (state==='limited') return new Response(JSON.stringify({message:'You have exceeded a secondary rate limit'}),{status:403,headers:{'Retry-After':'120'}});
       return new Promise((resolve,reject)=>init.signal.addEventListener('abort',()=>reject(init.signal.reason),{once:true}));
     }
     return new Response(JSON.stringify({message:'Not Found'}),{status:404});
@@ -109,6 +111,8 @@ function inspect(doc, width, scenario) {
     localStorage.removeItem('gitvault_operation_logs_v1');
     localStorage.removeItem('gitvault_tasks_v1');
     localStorage.removeItem('gitvault_global_token');
+    // Each iframe is an independent layout fixture; production cooldowns survive reloads.
+    for (const key of ['gitvault_github_cooldown_v1','gitvault_github_writes_v1','gitvault_github_last_write_v1']) localStorage.removeItem(key);
     if(scenario==='task-recovery')localStorage.setItem('gitvault_tasks_v1',JSON.stringify([{kind:'projects',action:'sync',updatedAt:'2026-10-16',items:[{id:fixture.id,label:fixture.remark,name:fixture.repo,status:'running',branch:fixture.branch,source:fixture.url}]}]));
     if (scenario === 'operation-logs-error') localStorage.setItem('gitvault_operation_logs_v1',JSON.stringify([{id:'audit-log',time:'2026-10-16T00:00:00Z',action:'批量分叉同步',status:'error',httpStatus:422,project:'owner/'+ 'long-project-'.repeat(20),branch:fixture.branch,target:'destination/'+ 'long-target-'.repeat(20),stage:'核对账号记录',message:'Update is not a fast forward；'+'很长的失败原因'.repeat(50)}]));
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
@@ -179,7 +183,8 @@ function inspect(doc, width, scenario) {
         if(prompt){Object.getOwnPropertyDescriptor(frame.contentWindow.HTMLInputElement.prototype,'value').set.call(prompt,'audit-token');prompt.dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true}));await pause();prompt.form.requestSubmit();await pause();}
         if(doc.querySelector('[data-app-dialog=confirm]'))await click(doc,'保留源码');
         if(scenario==='batch-upload-cancelled') await click(doc,'取消剩余上传');
-        if(scenario==='batch-upload-error') { for(let tries=0;tries<100&&!doc.body.textContent.includes('API rate limit exceeded');tries++) await pause(); if(!doc.body.textContent.includes('API rate limit exceeded')) throw new Error('Expected visible bulk failure'); }
+        if(scenario==='batch-upload-error') { for(let tries=0;tries<100&&!doc.body.textContent.includes('Resource not accessible');tries++) await pause(); if(!doc.body.textContent.includes('Resource not accessible')) throw new Error('Expected visible bulk failure'); }
+        if(scenario==='batch-upload-limited') { for(let tries=0;tries<100&&!doc.body.textContent.includes('GitHub 请求已暂停');tries++) await pause(); if(!doc.body.textContent.includes('GitHub 请求已暂停')) throw new Error('Expected visible bulk cooldown'); }
       }
       inspect(doc,width,scenario);
     } catch(error) { failures.push({width,scenario,issue:error.message}); }
