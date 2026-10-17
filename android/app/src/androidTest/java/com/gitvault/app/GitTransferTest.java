@@ -14,6 +14,18 @@ import org.eclipse.jgit.transport.RefSpec;
 
 @RunWith(AndroidJUnit4.class)
 public class GitTransferTest {
+    @Test public void repositoryIdsSurviveRealJsonAndCapacitorPluginCall()throws Exception {
+        for(long id:new long[]{42L,2147483647L,2147483648L,9007199254740991L}){
+            JSObject data=new JSObject("{\"expectedRepoId\":"+id+"}");
+            PluginCall call=new PluginCall(null,"GitVaultGit","test","transfer",data);
+            if(id<=Integer.MAX_VALUE){assertTrue(data.opt("expectedRepoId") instanceof Integer);assertEquals(Long.valueOf(0L),call.getLong("expectedRepoId",0L));}
+            assertEquals(id,GitVaultGitPlugin.readRepositoryId(call));
+        }
+        for(String json:new String[]{"{}","{\"expectedRepoId\":null}","{\"expectedRepoId\":\"42\"}","{\"expectedRepoId\":0}","{\"expectedRepoId\":-1}","{\"expectedRepoId\":1.5}","{\"expectedRepoId\":9007199254740992}"}){
+            try{GitVaultGitPlugin.readRepositoryId(new PluginCall(null,"GitVaultGit","test","transfer",new JSObject(json)));fail("Invalid repository ID must be rejected");}
+            catch(java.io.IOException expected){assertTrue(expected.getMessage().contains("仓库 ID"));}
+        }
+    }
     private JSObject file(String path,String content,String mode){JSObject file=new JSObject();file.put("path",path);file.put("content",content);file.put("mode",mode);return file;}
     @Test public void nativeGitPreservesBytesModesBranchAndHistory()throws Exception{
         File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-test-"+System.nanoTime());

@@ -227,6 +227,23 @@ test('legacy provenance is reused during a batch instead of querying every Fork 
   await registry.candidates(source,'token');await registry.candidates({...source,repo:'different',repositoryId:123},'token');
   assert.equal(parents,1);assert.equal(branches,1);assert.equal(files,1);
 });
+test('a managed marker without matching provenance never associates an unrelated repository',async()=>{
+  for(const metadata of [undefined,'https://github.com/someone/different','https://github.com/upstream/source']){
+    const f=fixture({owned:[{id:78,name:'unrelated-name',owner:{login:'me'},description:'[GitVault 托管]'}]});
+    const api=async(path:string,...args:any[])=>{
+      if(path.startsWith('/repos/me/unrelated-name/branches?'))return [{name:'main'}];
+      if(path.includes('GITVAULT_METADATA.md')){
+        if(!metadata)throw new GitHubError('missing',404);
+        return {encoding:'base64',size:100,content:Buffer.from(metadata).toString('base64')};
+      }
+      return f.api(path,...args);
+    };
+    const registry=createAccountRegistry(api);
+    assert.equal((await registry.candidates(source,'token')).legacy.length,metadata==='https://github.com/upstream/source'?1:0);
+    assert.equal((await registry.candidates({...source,repo:'another',repositoryId:123},'token')).legacy.length,0);
+    assert.ok(f.requests.every(request=>request.method==='GET'));
+  }
+});
 test('a switch lease preserves the old target until verified completion and rejects stale or competing moves',async()=>{
   const f=fixture();await f.registry.save(project(),'token');
   const target={owner:'me',repo:'new-copy'};

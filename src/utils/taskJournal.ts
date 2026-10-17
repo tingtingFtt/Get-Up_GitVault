@@ -28,6 +28,6 @@ export function forgetTask(kind: TaskKind) {
   window.dispatchEvent(new CustomEvent('gitvault-tasks-changed'));
 }
 export function interruptedTask(task: SavedTask): SavedTask {
-  return { ...task, items: task.items.map(item => ['running','creating','uploading','downloading','releasing','pending'].includes(item.status) ? { ...item, status: task.kind === 'import' ? 'error' : 'cancelled' } : { ...item }) };
+  return { ...task, items: task.items.map(item => ['running','creating','uploading','downloading','releasing','pending'].includes(item.status) ? { ...item, status: 'cancelled' } : { ...item }) };
 }
 export const hasUnfinished = (task: SavedTask) => task.items.some(item => !['success','skipped'].includes(item.status));

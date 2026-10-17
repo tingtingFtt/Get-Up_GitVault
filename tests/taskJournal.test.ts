@@ -21,6 +21,12 @@ test('completed queue slots do not erase another unfinished task', () => {
   assert.equal(readTasks().filter(hasUnfinished).length, 1);
   forgetTask('upload'); assert.equal(readTasks()[0].kind, 'import');
 });
+test('interrupted imports retain cancellations for retry without counting them as failures',()=>{
+  checkpoint({kind:'import',items:[{url:'https://github.com/a/b',status:'success'},{url:'https://github.com/a/c',status:'downloading'},{url:'https://github.com/a/d',status:'pending'}]});
+  const restored=interruptedTask(readTasks()[0]);
+  assert.deepEqual(restored.items.map(item=>item.status),['success','cancelled','cancelled']);
+  assert.ok(hasUnfinished(restored));
+});
 test('invalid journal data is not silently replaced by an empty task', () => {
   localStorage.setItem('gitvault_tasks_v1', '{broken');
   assert.throws(readTasks);

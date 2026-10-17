@@ -355,7 +355,7 @@ test('importing the destination URL can explicitly resume the original source in
   await input('留空自动识别（支持链接指定分支）', 'release');
   await click('确认拉取进入本地'); await waitFor(() => !!importDialog());
   await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
-  assert.ok(importDialog()?.textContent?.includes('原始来源：source/project'));
+  assert.ok(importDialog()?.textContent?.includes('本次导入来源：source/project'));
   await click('沿用上传目标'); await waitFor(() => alerts.length > 0);
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   assert.equal(saved.length, 1); assert.equal(saved[0].url, 'https://github.com/source/project');
@@ -399,12 +399,37 @@ test('batch import waits for each existing target decision, then continues the r
   assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
   await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
   await click('沿用上传目标');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 0 · 失败 0');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 0 · 失败 0 · 取消 0');
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   assert.equal(saved.length, 2); assert.equal(saved.find((p: any) => p.id === 'tracked').remark, '新备注');
   assert.deepEqual(saved.find((p: any) => p.id === 'tracked').tags, ['保留已有标签']);
   assert.equal(saved.find((p: any) => p.owner === 'demo').remark, '');
   assert.ok(requests.every(r => r.payload === null));
+});
+test('cancelling a single import is a neutral status without URL or Token advice and can restart',async()=>{
+  await reloadProject(boundProject());importAssociationFixture();
+  const before=withoutTargetHealth(localStorage.getItem('gitvault_repos_v8'));
+  await beginMatchingImport();await click('取消本次导入');
+  await waitFor(()=>!importDialog()&&!!document.body.textContent?.includes('导入已取消'));
+  assert.ok(!document.body.textContent?.includes('拉取项目失败提示：'));
+  assert.ok(!document.body.textContent?.includes('支持格式：'));
+  assert.ok(!document.body.textContent?.includes('signal is aborted'));
+  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')),before);
+  assert.equal(JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!)[0].status,'cancelled');
+  await click('确认拉取进入本地');await waitFor(()=>!!importDialog());
+  await click('跳过此链接');await waitFor(()=>!importDialog());
+  assert.ok(requests.every(request=>request.payload===null));
+});
+test('a raw WebView AbortError is classified as cancellation even without an aborted global controller',async()=>{
+  mock.method(githubClient,'fetchRepo',async()=>{throw new DOMException('signal is aborted without reason','AbortError');});
+  await click('新建链接/拉取项目');
+  await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','demo/new-source');
+  await input('例如: 生产核心源码 / 模块A','取消测试');
+  await click('确认拉取进入本地');
+  await waitFor(()=>!!document.body.textContent?.includes('导入已取消'));
+  assert.ok(!document.body.textContent?.includes('拉取项目失败提示：'));
+  assert.ok(!document.body.textContent?.includes('支持格式：'));
+  assert.equal(JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!)[0].status,'cancelled');
 });
 test('cancelling during comparison stops the batch and leaves both links retryable without stale bindings', async () => {
   await reloadProject(boundProject()); importAssociationFixture({ delayedComparison: true });
@@ -412,12 +437,12 @@ test('cancelling during comparison stops the batch and leaves both links retryab
   await beginMatchingImport(true); await click('对比此项目');
   await waitFor(() => requests.some(r => r.path.endsWith('/commits/release')));
   await click('取消本次导入');
-  await waitFor(() => !importDialog() && document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 0 · 失败 2');
+  await waitFor(() => !importDialog() && document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 0 · 失败 0 · 取消 2');
   assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')), withoutTargetHealth(previous));
   assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
-  importAssociationFixture(); await click('重试失败链接'); await waitFor(() => !!importDialog());
+  importAssociationFixture(); await click('重试未完成链接'); await waitFor(() => !!importDialog());
   await click('跳过此链接');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 0');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 0 · 取消 0');
 });
 test('native Fork reuse verifies the upstream and routes subsequent all-branch sync to that existing Fork', async () => {
   const saved = boundProject(); saved.uploadTarget.kind = 'full'; saved.forkTarget = { ...saved.uploadTarget, htmlUrl: 'https://github.com/destination/backup', branches: ['develop', 'other'] };
@@ -933,7 +958,7 @@ test('batch import needs only links, uses repository default branches, skips dup
   await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, '带 空格的备注  https://github.com/demo/one/tree/feature\ndemo/two\nDEMO/one.git\nhttps://example.com/demo/bad');
   assert.ok(!document.querySelector('input[placeholder="例如: 生产核心源码 / 模块A"]'));
   await click('开始批量导入');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 2');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 2 · 取消 0');
   let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   const imported = saved.find((item: any) => item.owner === 'demo');
   assert.equal(imported.branch, 'master'); assert.equal(imported.remark, '带 空格的备注'); assert.equal(imported.files, undefined);
@@ -941,14 +966,14 @@ test('batch import needs only links, uses repository default branches, skips dup
   assert.ok(!requests.some(r => r.path.includes('/commits/feature')));
   const oneReads = requests.filter(r => r.path === '/repos/demo/one').length;
   failed = false; await click('重试失败链接');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 1 · 失败 1');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 1 · 失败 1 · 取消 0');
   saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 2);
   assert.equal(saved.find((item: any) => item.repo === 'two').remark, '');
   assert.equal(requests.filter(r => r.path === '/repos/demo/one').length, oneReads);
   const previousReads = requests.filter(r => r.path.includes('/commits/')).length;
   await click('开始批量导入');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 3 · 失败 1');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 3 · 失败 1 · 取消 0');
   assert.equal(requests.filter(r => r.path.includes('/commits/')).length, previousReads);
 });
 
@@ -966,11 +991,11 @@ test('cancelling a batch keeps completed projects and leaves remaining links ava
   await setField(document.querySelector<HTMLTextAreaElement>('[aria-label="批量仓库链接"]')!, 'demo/one\ndemo/two\ndemo/three');
   await click('开始批量导入'); await waitFor(() => requests.some(r => r.path === '/repos/demo/two'));
   await click('取消');
-  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 0 · 失败 2');
+  await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 0 · 失败 0 · 取消 2');
   const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 1);
   assert.ok(!requests.some(r => r.path === '/repos/demo/three'));
-  assert.ok(buttons().some(b => b.textContent === '重试失败链接'));
+  assert.ok(buttons().some(b => b.textContent === '重试未完成链接'));
 });
 
 test('workbench metadata can be edited without pulling files or altering branch bindings', async () => {

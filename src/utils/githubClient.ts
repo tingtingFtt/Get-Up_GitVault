@@ -23,7 +23,11 @@ export interface TransferOptions {
 
 let operation = new AbortController();
 export function beginGithubOperation() { operation = new AbortController(); }
-export function cancelGithubOperation() { operation.abort(); }
+export function cancelGithubOperation() { operation.abort(new DOMException('操作已取消，可重试未完成项', 'AbortError')); }
+export function isOperationCancelled(error: unknown, signal: AbortSignal) {
+  const reason = error as { name?: string; code?: string } | null;
+  return signal.aborted || reason?.name === 'AbortError' || reason?.code === 'CANCELLED';
+}
 export function operationSignal() { return operation.signal; }
 function progress(message: string, options?: TransferOptions) {
   options?.onProgress?.(message);

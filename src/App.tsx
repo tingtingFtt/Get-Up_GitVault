@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 const RepoHeatmap = React.lazy(() => import('./components/RepoHeatmap'));
 import { localCache, transferCache, CachedFile } from './utils/localCache';
-import { githubApi, githubClient, beginGithubOperation, cancelGithubOperation, operationSignal, parseRepository, gitBlobSha, GitHubError, TargetRepositoryError } from './utils/githubClient';
+import { githubApi, githubClient, beginGithubOperation, cancelGithubOperation, isOperationCancelled, operationSignal, parseRepository, gitBlobSha, GitHubError, TargetRepositoryError } from './utils/githubClient';
 import { safeFetchJson } from './utils/api';
 import { sourceOf, pullSourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
@@ -380,6 +380,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [importCancelled, setImportCancelled] = useState(false);
   const [importMatch, setImportMatch] = useState<{ source: ProjectSource; sha: string; tree: RepoTreeItem[]; candidates: ImportCandidate[]; token: string; comparisons: Record<string, ImportComparison> } | null>(null);
   const importResolver = useRef<((choice: ImportChoice) => void) | null>(null);
   const importSession = useRef(0);
@@ -1641,16 +1642,17 @@ export default config;
   // Add new repository link: Directly pull project into local memory/storage
   const handleBatchImport = async (retry = false) => {
     if (importLock.current || (!retry && !await confirmNewTask('import'))) return;
-    const items = retry ? importResults.map(item => item.status === 'error' && item.url ? { ...item, status: 'pending' as const, message: undefined } : item) : parseImportLinks(batchLinks);
+    const items = retry ? importResults.map(item => (item.status === 'error' || item.status === 'cancelled') && item.url ? { ...item, status: 'pending' as const, message: undefined } : item) : parseImportLinks(batchLinks);
     if (!items.length) { setImportResults([]); setErrorMsg('请先填写至少一个仓库链接'); return; }
     const publishImportResults = (items: ImportLink[]) => { checkpoint({ kind: 'import', items }); setImportResults([...items]); };
     try { checkpoint({ kind: 'import', items }); } catch (error) { appDialog.notify('任务保存失败：' + (error as Error).message); return; }
-    importLock.current = true; startOperation(); setErrorMsg(''); publishImportResults(items);
+    importLock.current = true; startOperation(); setErrorMsg(''); setImportCancelled(false); publishImportResults(items);
+    const signal = operationSignal();
     const token = tokenInput.trim() || globalToken;
     try {
     for (let i = 0; i < items.length; i++) {
       if (items[i].status !== 'pending') continue;
-      if (operationSignal().aborted) break;
+      if (signal.aborted) break;
       items[i] = { ...items[i], status: 'downloading', message: '正在拉取默认分支…' }; publishImportResults(items);
       try {
         const parsed = parseRepository(items[i].url!);
@@ -1680,10 +1682,16 @@ export default config;
           items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${typeof choice !== 'string' ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
         }
         await transferCache.clear(data.latestCommitSha);
-      } catch (error) { logOperation('批量导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, `${items[i].url || ''}：${(error as Error).message}`, '拉取与账号识别', error); items[i] = { ...items[i], status: 'error', message: (error as Error).message || '操作已取消' }; }
+      } catch (error) {
+        const cancelled = isOperationCancelled(error, signal);
+        const message = cancelled ? '已取消导入，可重试；已完成的项目保留' : (error as Error).message || '导入失败';
+        logOperation('批量导入', cancelled ? 'cancelled' : 'error', undefined, `${items[i].url || ''}：${message}`, '拉取与账号识别', error);
+        items[i] = { ...items[i], status: cancelled ? 'cancelled' : 'error', message };
+        if (cancelled) break;
+      }
       publishImportResults(items);
     }
-    for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'error', message: '操作已取消，尚未导入，可重试' };
+    for (let i = 0; i < items.length; i++) if (items[i].status === 'pending' || items[i].status === 'downloading') items[i] = { ...items[i], status: 'cancelled', message: '已取消，尚未导入，可重试' };
     publishImportResults(items); setCurrentView('projects');
     } catch (error) { appDialog.notify('批量导入未完成：' + (error as Error).message); }
     finally { setIsLoading(false); importLock.current = false; }
@@ -1693,7 +1701,8 @@ export default config;
     e.preventDefault();
     if (!repoUrl.trim() || importLock.current) return;
     importLock.current = true;
-    startOperation(); setErrorMsg(''); setLoadingText('正在获取完整项目…');
+    startOperation(); setErrorMsg(''); setImportCancelled(false); setLoadingText('正在获取完整项目…');
+    const signal = operationSignal();
     try {
       const { choice, data } = await prepareImport(repoUrl.trim(), branchInput.trim() || undefined, tokenInput.trim() || globalToken);
       operationSignal().throwIfAborted();
@@ -1715,7 +1724,12 @@ export default config;
       setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
       await transferCache.clear(data.latestCommitSha);
       appDialog.notify(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
-    } catch (error) { logOperation('导入', operationSignal().aborted ? 'cancelled' : 'error', undefined, (error as Error).message, '拉取与账号识别', error); setErrorMsg((error as Error).message || '操作已取消'); }
+    } catch (error) {
+      const cancelled = isOperationCancelled(error, signal);
+      const message = cancelled ? '已取消导入；已完成的项目保留，可重新拉取。' : (error as Error).message || '导入失败';
+      logOperation('导入', cancelled ? 'cancelled' : 'error', undefined, message, '拉取与账号识别', error);
+      setImportCancelled(cancelled); setErrorMsg(message);
+    }
     finally { setIsLoading(false); importLock.current = false; }
   };
 
@@ -2121,7 +2135,8 @@ export default config;
     (task.kind === 'projects' ? projectTaskContext : uploadTaskContext).current = task.items;
     if (task.kind === 'import') {
       setImportMode('batch'); setBatchLinks(task.items.filter(item => item.url).map(item => `${item.remark || ''} ${item.url}`).join('\n'));
-      setImportResults(task.items.map(item => ({ input: item.url || '无效链接，请重新导入', url: item.url, remark: item.remark, status: item.status as ImportLink['status'], message: item.status === 'error' ? '上次未完成；可重试，远端写入会先核验' : undefined })));
+      setErrorMsg(''); setImportCancelled(false);
+      setImportResults(task.items.map(item => ({ input: item.url || '无效链接，请重新导入', url: item.url, remark: item.remark, status: item.status as ImportLink['status'], message: item.status === 'error' || item.status === 'cancelled' ? '上次未完成；可重试，远端写入会先核验' : undefined })));
       setIsAddModalOpen(true);
     } else if (task.kind === 'release') {
       const repo = reposRef.current.find(repo => repo.id === task.projectId);
@@ -4087,7 +4102,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               return <div key={candidate.key} className="border border-[#DFD8CE] rounded-xl bg-[#FAF8F5] p-3 flex flex-col gap-2 text-xs break-words">
                 <p className="font-semibold text-[#4D5E4A] break-all">{candidate.fullFork ? '完整分叉' : target.kind === 'current' ? '分支副本' : '上传仓库'}：{target.owner}/{target.repo}</p>
                 {candidate.remark && <p className="text-[#7A7367]">已有备注：{candidate.remark}</p>}
-                <p className="text-[#474239] break-all">原始来源：{candidate.source.owner}/{candidate.source.repo}</p>
+                <p className="text-[#474239] break-all">本次导入来源：{candidate.source.owner}/{candidate.source.repo}</p>
                 <p className="text-[#474239] break-all">分支映射：{candidate.source.branch} → {target.branch}</p>
                 <label className="text-[#7A7367]">已有仓库目标分支<input aria-label={`比较目标分支 ${candidate.target.repo}`} value={candidate.target.branch} readOnly={candidate.accountRecord?.state==='active'&&!!candidate.accountRecord.bindings[candidate.source.branch]} onChange={event=>setImportMatch(match=>match?{...match,candidates:match.candidates.map(item=>item.key===candidate.key?{...item,target:{...item.target,branch:event.target.value}}:item),comparisons:{...match.comparisons,[candidate.key]:{status:'error',error:'分支已修改，请重新对比'}}}:match)} className="w-full mt-1 p-2 bg-white border border-[#DFD8CE] rounded-lg" /></label>
                 {comparison?.status === 'loading' && <p role="status" className="text-[#7A7367]">正在校验仓库身份并对比文件…</p>}
@@ -4143,25 +4158,25 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               <label className="text-xs text-[#474239]">GitHub Token（可选，留空使用全局设置）<input type="password" aria-label="批量导入 Token" value={tokenInput} onChange={e => setTokenInput(e.target.value)} className="mt-1 w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-4 py-2.5 text-xs text-[#2E2B27]" /></label>
               {errorMsg && <p role="alert" className="text-xs text-[#8C5D54]">{errorMsg}</p>}
               {importResults.length > 0 && <div className="max-h-48 overflow-y-auto flex flex-col gap-2">
-                <p role="status" className="text-xs text-[#5D6F5A]">成功 {importResults.filter(item => item.status === 'success').length} · 跳过 {importResults.filter(item => item.status === 'skipped').length} · 失败 {importResults.filter(item => item.status === 'error').length}</p>
+                <p role="status" className="text-xs text-[#5D6F5A]">成功 {importResults.filter(item => item.status === 'success').length} · 跳过 {importResults.filter(item => item.status === 'skipped').length} · 失败 {importResults.filter(item => item.status === 'error').length} · 取消 {importResults.filter(item => item.status === 'cancelled').length}</p>
                 {importResults.map((item, i) => <div key={i} className="bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl p-2 text-xs break-all"><span className="font-mono">{item.input}</span><p className={item.status === 'error' ? 'text-[#8C5D54]' : 'text-[#5D6F5A]'}>{item.message || '等待中'}</p></div>)}
               </div>}
               <div className="flex flex-row flex-wrap justify-end gap-3 pt-3 border-t border-[#EDE7DF]">
                 <button type="button" onClick={() => setIsAddModalOpen(false)} className="px-4 py-2 bg-[#EFECE6] text-[#554F45] rounded-xl text-xs">关闭</button>
-                {importResults.some(item => item.status === 'error' && item.url) && <button type="button" onClick={() => handleBatchImport(true)} className="px-3 py-2 text-xs text-[#5D6F5A]">重试失败链接</button>}
+                {importResults.some(item => (item.status === 'error' || item.status === 'cancelled') && item.url) && <button type="button" onClick={() => handleBatchImport(true)} className="px-3 py-2 text-xs text-[#5D6F5A]">{importResults.some(item => item.status === 'cancelled') ? '重试未完成链接' : '重试失败链接'}</button>}
                 <button type="submit" className="px-5 py-2.5 bg-gradient-to-r from-[#7E937F] to-[#8E9F8B] text-white rounded-xl text-xs font-semibold">开始批量导入</button>
               </div>
             </form> : (
             <form onSubmit={handleAddRepo} className="flex flex-col gap-4">
               {errorMsg && (
-                <div className="bg-[#B6847A]/15 border border-[#B6847A]/30 text-[#8C5D54] p-3 rounded-xl text-xs flex flex-row items-start gap-2 overflow-hidden max-w-full">
+                <div role={importCancelled ? 'status' : 'alert'} className={`${importCancelled ? 'bg-[#8E9F8B]/15 border-[#8E9F8B]/30 text-[#5D6F5A]' : 'bg-[#B6847A]/15 border-[#B6847A]/30 text-[#8C5D54]'} border p-3 rounded-xl text-xs flex flex-row items-start gap-2 overflow-hidden max-w-full`}>
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <div className="flex flex-col gap-1 w-full overflow-hidden">
-                    <span className="font-semibold">拉取项目失败提示：</span>
+                    <span className="font-semibold">{importCancelled ? '导入已取消' : '拉取项目失败提示：'}</span>
                     <span className="break-all whitespace-pre-wrap">{errorMsg}</span>
-                    <span className="text-[11px] text-[#7A7367] mt-0.5 leading-relaxed break-words">
+                    {!importCancelled && <span className="text-[11px] text-[#7A7367] mt-0.5 leading-relaxed break-words">
                       支持格式：1. 完整链接（如 https://github.com/owner/repo 或带 .git 的完整地址）；2. 简写（如 owner/repo）；3. 带有分支的链接。若为私有仓库请填写 Token。
-                    </span>
+                    </span>}
                   </div>
                 </div>
               )}

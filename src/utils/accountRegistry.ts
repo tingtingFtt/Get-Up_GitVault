@@ -287,7 +287,8 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
           }
           provenance = { at: Date.now(), sources }; provenanceCache.set(key, provenance);
         }
-        match = (!provenance.sources.length && !!repo.description?.includes('[GitVault 托管]')) || provenance.sources.some(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
+        // A generic managed marker says nothing about which upstream was saved.
+        match = provenance.sources.some(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
       }
       if (match) legacy.push({ source, target: { id: repo.id, owner: repo.owner.login, repo: repo.name }, kind: full ? 'full' : 'upload', state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' });
     }

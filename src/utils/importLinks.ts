@@ -4,7 +4,7 @@ export interface ImportLink {
   input: string;
   url?: string;
   remark?: string;
-  status: 'pending' | 'downloading' | 'success' | 'skipped' | 'error';
+  status: 'pending' | 'downloading' | 'success' | 'skipped' | 'error' | 'cancelled';
   message?: string;
 }
 

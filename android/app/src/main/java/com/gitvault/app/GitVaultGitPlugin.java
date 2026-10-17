@@ -31,7 +31,8 @@ public class GitVaultGitPlugin extends Plugin {
                 String owner=call.getString("owner",""),name=call.getString("repo",""),action=call.getString("action","");
                 if(!owner.matches("[A-Za-z0-9_.-]+")||!name.matches("[A-Za-z0-9_.-]+")||!Arrays.asList("fetch","push").contains(action))throw new IOException("Git 仓库参数无效");
                 AtomicBoolean stop=cancelled.get(id); check(stop);
-                verifyIdentity(owner,name,call.getLong("expectedRepoId",0L),token,stop);
+                long expectedRepoId=readRepositoryId(call);
+                verifyIdentity(owner,name,expectedRepoId,token,stop);
                 folder=new File(getContext().getCacheDir(),"git-"+UUID.randomUUID());
                 try(Git git=Git.init().setBare(true).setDirectory(folder).call()) {
                     git.getRepository().getConfig().setString("gc",null,"auto","0");
@@ -61,14 +62,14 @@ public class GitVaultGitPlugin extends Plugin {
                                 if(parent!=null&&walk.parseCommit(parent).getTree().equals(tree))commit=parent;
                                 else { CommitBuilder builder=new CommitBuilder();builder.setTreeId(tree);if(parent!=null)builder.setParentId(parent);PersonIdent author=new PersonIdent("GitVault","gitvault@users.noreply.github.com");builder.setAuthor(author);builder.setCommitter(author);builder.setMessage(call.getString("message","Sync project snapshot via GitVault"));commit=insert.insert(builder);insert.flush(); }
                             }
-                            verifyIdentity(owner,name,call.getLong("expectedRepoId",0L),token,stop);check(stop);
+                            verifyIdentity(owner,name,expectedRepoId,token,stop);check(stop);
                             Exception failure=null;
                             if(!commit.equals(parent)) try {
                                 Iterable<PushResult> pushed=git.push().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setRefSpecs(new RefSpec(commit.name()+":refs/heads/"+branch)).setProgressMonitor(monitor).call();
                                 for(PushResult pushedResult:pushed)for(RemoteRefUpdate update:pushedResult.getRemoteUpdates())if(update.getStatus()!=RemoteRefUpdate.Status.OK&&update.getStatus()!=RemoteRefUpdate.Status.UP_TO_DATE)throw new IOException("Git 推送拒绝："+update.getStatus());
                             }catch(Exception exception){failure=exception;}
                             String actual=remoteHead(remote,branch,credentials);check(stop);
-                            if(actual.equals(commit.name())) {result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",call.getLong("expectedRepoId",0L));result.put("verified",true);break;}
+                            if(actual.equals(commit.name())) {result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",expectedRepoId);result.put("verified",true);break;}
                             if(call.getBoolean("rebaseOnConflict",false)&&!actual.equals(parent==null?"":parent.name())&&attempt<2)continue;
                             if(failure!=null)throw failure;throw new IOException("目标分支在推送期间变化；本地文件保留，不会强推");
                         }
@@ -82,8 +83,17 @@ public class GitVaultGitPlugin extends Plugin {
     }
     private void progress(String id,String message){JSObject value=new JSObject();value.put("id",id);value.put("message","原生 Git："+message);notifyListeners("progress",value);}
     private static void check(AtomicBoolean stop)throws IOException{if(stop.get()||Thread.currentThread().isInterrupted())throw new IOException("Git 任务已取消，本地文件保留");}
+    static long readRepositoryId(PluginCall call)throws IOException {
+        // Capacitor getLong only accepts Long; JSON also represents valid IDs as Integer.
+        Object value=call.getData().opt("expectedRepoId");
+        if(value instanceof Number){
+            double number=((Number)value).doubleValue();
+            if(Double.isFinite(number)&&number>0&&number<=9007199254740991d&&number==Math.rint(number))return ((Number)value).longValue();
+        }
+        throw new IOException("仓库 ID 缺失或无效，请重新获取仓库信息");
+    }
     private void verifyIdentity(String owner,String name,long expected,String token,AtomicBoolean stop)throws Exception {
-        if(expected<=0)throw new IOException("缺少固定仓库 ID");
+        if(expected<=0)throw new IOException("仓库 ID 无效，请重新获取仓库信息");
         for(int attempt=0;;attempt++){
             check(stop);HttpURLConnection connection=(HttpURLConnection)new URL("https://api.github.com/repos/"+owner+"/"+name).openConnection();connection.setConnectTimeout(15000);connection.setReadTimeout(15000);connection.setInstanceFollowRedirects(false);connection.setRequestProperty("Accept","application/vnd.github+json");if(!token.isEmpty())connection.setRequestProperty("Authorization","Bearer "+token);
             try {int status=connection.getResponseCode();String text=readText(status<400?connection.getInputStream():connection.getErrorStream(),1024*1024);
