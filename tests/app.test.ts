@@ -1448,3 +1448,15 @@ test('HTTP primary branch switching reads the fixed repository, registers the br
  server.repositories.get('my-primary')!.refs.set('feature/demo','other-v');const oldHead=server.repositories.get('my-primary')!.refs.get('develop');const before=server.sent.length;await enterWorkbench();await switchBranch('feature/demo');
  assert.equal(storedProjects()[0].primarySource.branch,'feature/demo');assert.equal(storedProjects()[0].uploadTarget.branch,'feature/demo');assert.equal(storedProjects()[0].remoteSnapshot.sourceSha,'other-v');assert.equal(server.document().projects[0].bindings['feature/demo'].branch,'feature/demo');assert.equal(server.repositories.get('my-primary')!.refs.get('develop'),oldHead);assert.ok(!server.sent.slice(before).some(request=>request.method==='PATCH'||request.path.startsWith('/repos/source/project/commits/')));
 });
+
+test('manual cache cleanup preserves files while a preview or transfer is reading them',async()=>{
+  await enterWorkbench();let finish!:(value:any)=>void;
+  mock.method(localCache,'getProjectFile',()=>new Promise(resolve=>{finish=resolve;}));
+  const row=[...document.querySelectorAll('span')].find(node=>node.textContent==='a.txt')!;assert.ok(row);
+  await act(async()=>{row.parentElement!.dispatchEvent(new MouseEvent('click',{bubbles:true}));});await waitFor(()=>!!finish);
+  await click('精简缓存');
+  assert.ok(alerts.some(message=>message.includes('请先完成或取消正在进行的任务')));
+  assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');
+  assert.equal(storedProjects()[0].isCachePurged,false);
+  await act(async()=>{finish(file('new'));});
+});

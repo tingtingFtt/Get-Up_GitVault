@@ -2131,8 +2131,13 @@ export default config;
     finally { setIsLoading(false); }
   };
 
+  const cacheOperationBlocked = () => {
+    if(isLoading||fileLoading||isForking||switchBusy||batchTaskLock.current||batchUploadLock.current||importLock.current||releaseLock.current){appDialog.notify('请先完成或取消正在进行的任务，再清理缓存或删除项目。');return true;}
+    return false;
+  };
   const handleDeleteRepo = async (repoId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    if(cacheOperationBlocked())return;
     if (!(await appDialog.confirm('确定移除该项目的本地记录和缓存？远程仓库不会删除。'))) return;
     try {
       await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true});
@@ -2269,6 +2274,7 @@ export default config;
 
   // Batch Delete Projects
   const handleBatchDeleteProjects = async () => {
+    if(cacheOperationBlocked())return;
     if (!selectedProjectIds.length || !(await appDialog.confirm('删除所选项目的本地记录和缓存？远程仓库不会删除。'))) return;
     try {
       for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true}); persistRepos(reposRef.current.filter(r => r.id !== id)); }
@@ -2361,6 +2367,7 @@ export default config;
 
   // Batch Purge Local Cache for selected projects
   const handleBatchPurgeCache = async () => {
+    if(cacheOperationBlocked())return;
     if (!selectedProjectIds.length || !(await appDialog.confirm('清理所选项目的本地源码和软件管理的目录文件？项目快照和 GitHub 历史会保留。'))) return;
     try {
       for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true}); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
@@ -2469,7 +2476,7 @@ export default config;
 
   // Purge local cache for single backup
   const handlePurgeBackupCache = async (backupId: string, e?: React.MouseEvent) => {
-    e?.stopPropagation(); if (!activeRepo) return;
+    e?.stopPropagation(); if(cacheOperationBlocked()||!activeRepo)return;
     const backup = activeRepo.backups.find(b => b.id === backupId);
     if (!backup || !(await appDialog.confirm('清理此版本的本地源码？版本快照会保留。'))) return;
     try {
@@ -2480,7 +2487,7 @@ export default config;
 
   // Purge local cache for the active project
   const handlePurgeProjectCache = async (repoId: string, e?: React.MouseEvent) => {
-    e?.stopPropagation(); if (!(await appDialog.confirm('清理该项目的本地源码及软件管理目录内的文件？项目快照、仓库绑定和 GitHub 历史会保留。'))) return;
+    e?.stopPropagation(); if(cacheOperationBlocked())return; if (!(await appDialog.confirm('清理该项目的本地源码及软件管理目录内的文件？项目快照、仓库绑定和 GitHub 历史会保留。'))) return;
     try {
       await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true});
       patchRepo(repoId, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === repoId)?.backups || []).map(b => ({ ...b, isCachePurged: true })) });
