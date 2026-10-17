@@ -52,10 +52,17 @@ final class ManagedFolderStore {
     }
     private DocumentFile versionDir(JSONObject value,boolean create)throws Exception{return walk(root(value.getString("root")),value.getString("relative"),create);}
     private DocumentFile filesDir(JSONObject value,boolean create)throws Exception{DocumentFile version=versionDir(value,create);return version==null?null:walk(version,"files",create);}
+    private DocumentFile createFile(DocumentFile directory,String name)throws IOException{
+        // A registered MIME type can append an extension (including another .bin).
+        DocumentFile file=directory.createFile("application/x-gitvault-source",name);
+        if(file==null)throw new IOException("无法创建项目文件："+name);
+        if(!name.equals(file.getName())&&(!file.renameTo(name)||!name.equals(file.getName())))throw new IOException("目录提供者未保留原始文件名："+name);
+        return file;
+    }
     private DocumentFile file(JSONObject value,String path,boolean create)throws Exception{
         ExportPath.validate(path);DocumentFile folder=filesDir(value,create);if(folder==null)return null;
         int slash=path.lastIndexOf('/');if(slash>=0){folder=walk(folder,path.substring(0,slash),create);if(folder==null)return null;}
-        String name=path.substring(slash+1);DocumentFile doc=folder.findFile(name);if(doc==null&&create)doc=folder.createFile("application/octet-stream",name);if(doc!=null&&!doc.isFile())throw new IOException("文件路径被目录占用："+path);return doc;
+        String name=path.substring(slash+1);DocumentFile doc=folder.findFile(name);if(doc==null&&create)doc=createFile(folder,name);if(doc!=null&&!doc.isFile())throw new IOException("文件路径被目录占用："+path);return doc;
     }
     private InputStream input(DocumentFile doc)throws IOException{InputStream stream=context.getContentResolver().openInputStream(doc.getUri());if(stream==null)throw new IOException("无法读取项目文件");return stream;}
     private OutputStream output(DocumentFile doc)throws IOException{OutputStream stream=context.getContentResolver().openOutputStream(doc.getUri(),"wt");if(stream==null)throw new IOException("无法写入项目文件");return stream;}
@@ -97,7 +104,7 @@ final class ManagedFolderStore {
     JSObject finish(String id)throws Exception{
         synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录任务不存在");JSONObject files=value.getJSONObject("files");JSONArray expected=value.getJSONArray("expected");if(files.length()!=expected.length())throw new IOException("项目文件尚未完整写入，未发布新快照");for(int i=0;i<expected.length();i++){JSONObject entry=expected.getJSONObject(i),actual=files.optJSONObject(entry.getString("path"));if(actual==null||!actual.getString("sha").equals(entry.getString("sha"))||!actual.getString("mode").equals(entry.getString("mode")))throw new IOException("目录快照清单不一致");}
             JSObject checked=describe(id,true,null);if(checked.optBoolean("dirty")||checked.optBoolean("missing"))throw new IOException("目录文件已变化或缺失，未发布新快照");
-            DocumentFile version=versionDir(value,false);DocumentFile marker=version.findFile(".gitvault-snapshot.json");if(marker==null)marker=version.createFile("application/json",".gitvault-snapshot.json");if(marker==null)throw new IOException("无法写入目录快照标识");try(OutputStream output=output(marker)){JSONObject publicMeta=new JSONObject();publicMeta.put("app","GitVault");publicMeta.put("version",id);publicMeta.put("ref",value.getString("ref"));publicMeta.put("files",expected);output.write(publicMeta.toString().getBytes(StandardCharsets.UTF_8));}value.put("state","ready");save(value);return describe(id,false,null);
+            DocumentFile version=versionDir(value,false);DocumentFile marker=version.findFile(".gitvault-snapshot.json");if(marker==null)marker=createFile(version,".gitvault-snapshot.json");if(marker==null)throw new IOException("无法写入目录快照标识");try(OutputStream output=output(marker)){JSONObject publicMeta=new JSONObject();publicMeta.put("app","GitVault");publicMeta.put("version",id);publicMeta.put("ref",value.getString("ref"));publicMeta.put("files",expected);output.write(publicMeta.toString().getBytes(StandardCharsets.UTF_8));}value.put("state","ready");save(value);return describe(id,false,null);
         }
     }
     JSObject fetch(String id,Repository repository,JSArray expected,AtomicBoolean stop,Progress progress)throws Exception{
@@ -140,10 +147,10 @@ final class ManagedFolderStore {
     JSObject cleanTemporary(boolean force)throws Exception{synchronized(LOCK){int count=0;JSONArray ids=new JSONArray();for(JSONObject value:all())if(value.getJSONObject("owners").length()==0){erase(value,force);ids.put(value.getString("id"));count++;}JSObject result=new JSObject();result.put("versions",count);result.put("ids",ids);return result;}}
     JSObject exportFiles(String uri,String prefix,JSArray entries,JSONObject project)throws Exception{
         synchronized(LOCK){DocumentFile destination=walk(root(uri),prefix,true);for(int i=0;i<entries.length();i++){
-            JSONObject entry=entries.getJSONObject(i),ref=entry.getJSONObject("nativeRef");String path=entry.getString("path");ExportPath.validate(path);DocumentFile folder=walk(destination,"files",true);int slash=path.lastIndexOf('/');if(slash>=0)folder=walk(folder,path.substring(0,slash),true);DocumentFile target=folder.createFile("application/octet-stream",path.substring(slash+1));if(target==null)throw new IOException("无法创建导出文件："+path);
+            JSONObject entry=entries.getJSONObject(i),ref=entry.getJSONObject("nativeRef");String path=entry.getString("path");ExportPath.validate(path);DocumentFile folder=walk(destination,"files",true);int slash=path.lastIndexOf('/');if(slash>=0)folder=walk(folder,path.substring(0,slash),true);DocumentFile target=createFile(folder,path.substring(slash+1));if(target==null)throw new IOException("无法创建导出文件："+path);
             long size=entry.getLong("size"),count=0;MessageDigest hash=MessageDigest.getInstance("SHA-1");hash.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));try(InputStream input=open(ref.getString("version"),ref.getString("path"));OutputStream output=output(target)){byte[] bytes=new byte[65536];int n;while((n=input.read(bytes))!=-1){output.write(bytes,0,n);hash.update(bytes,0,n);count+=n;}}
             if(count!=size||!hex(hash.digest()).equals(entry.getString("sha")))throw new IOException("目录文件在导出期间变化："+path);
-        }DocumentFile marker=destination.createFile("application/json",".gitvault-export.json");if(marker==null)throw new IOException("无法写入导出完成标识");JSONObject receipt=new JSONObject(project.toString());receipt.put("files",entries);receipt.put("completedAt",System.currentTimeMillis());try(OutputStream output=output(marker)){output.write(receipt.toString().getBytes(StandardCharsets.UTF_8));}JSObject result=new JSObject();result.put("location",prefix);return result;}
+        }DocumentFile marker=createFile(destination,".gitvault-export.json");if(marker==null)throw new IOException("无法写入导出完成标识");JSONObject receipt=new JSONObject(project.toString());receipt.put("files",entries);receipt.put("completedAt",System.currentTimeMillis());try(OutputStream output=output(marker)){output.write(receipt.toString().getBytes(StandardCharsets.UTF_8));}JSObject result=new JSObject();result.put("location",prefix);return result;}
     }
     JSObject status(String root)throws Exception{synchronized(LOCK){root(root);JSObject result=new JSObject();result.put("root",root);result.put("versions",all().size());result.put("availableBytes",new android.os.StatFs(android.os.Environment.getDataDirectory().getAbsolutePath()).getAvailableBytes());return result;}}
 }
