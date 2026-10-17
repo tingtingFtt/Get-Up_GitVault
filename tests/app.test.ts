@@ -883,6 +883,9 @@ function branchFixtures() {
 }
 async function switchBranch(branch: string) {
   await setField(document.querySelector<HTMLInputElement | HTMLSelectElement>('[aria-label="工作台分支"]')!, branch);
+  // Saving primarySource precedes the upload's account receipt/finally. Wait
+  // for the actual control to become usable instead of clicking it while busy.
+  await waitFor(() => buttons().some(button => button.textContent === '切换并重新拉取' && !button.disabled));
   await click('切换并重新拉取');
   await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].branch === branch || !!document.querySelector('[role=alert]'));
 }
