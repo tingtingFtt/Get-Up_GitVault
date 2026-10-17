@@ -148,6 +148,7 @@ public class GitVaultNativePlugin extends Plugin {
         return new JSObject();
     });}
     @PluginMethod public void folderCopy(PluginCall call){folderTask(call,store->{org.json.JSONObject source=call.getObject("nativeRef");if(source==null)throw new java.io.IOException("文件引用缺失");try(InputStream input=store.open(source.getString("version"),source.getString("path"))){store.write(call.getString("version",""),call.getString("path",""),call.getData().getLong("size"),call.getString("sha",""),call.getString("mode","100644"),input,null);}return new JSObject();});}
+    @PluginMethod public void folderExport(PluginCall call){folderTask(call,store->store.exportFiles(call.getString("directory",""),call.getString("prefix",""),call.getArray("files",new com.getcapacitor.JSArray()),call.getObject("project",new JSObject())));}
     @PluginMethod public void folderArchive(PluginCall call){io.execute(()->{String id=UUID.randomUUID().toString();File archive=null;try{
         String name=call.getString("name","project.zip");ExportPath.validate(name);if(name.contains("/"))throw new java.io.IOException("导出名称无效");File dir=new File(getContext().getCacheDir(),"exports");dir.mkdirs();archive=new File(dir,id);ManagedFolderStore store=new ManagedFolderStore(getContext());com.getcapacitor.JSArray files=call.getArray("files",new com.getcapacitor.JSArray());
         try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(new FileOutputStream(archive))){for(int i=0;i<files.length();i++){

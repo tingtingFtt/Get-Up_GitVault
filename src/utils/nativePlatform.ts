@@ -1,4 +1,4 @@
-import {hydrateFile} from './nativeFolder';
+import {hydrateFile,folderBridge} from './nativeFolder';
 import { Capacitor } from '@capacitor/core';
 import { androidPlugin } from './androidPlugin';
 import type { CachedFile } from './localCache';
@@ -39,6 +39,11 @@ function bytesToBase64(bytes: Uint8Array) {
 export async function exportProjectDirectory(directory: string, project: { owner: string; repo: string; branch: string; latestCommitSha: string }, files: CachedFile[], signal?: AbortSignal) {
   if (!hasNativeFiles()) throw new Error('当前安装包没有可用的 Android 文件插件');
   if (!directory.startsWith('content://')) throw new Error('请先通过系统选择器授权导出目录');
+  if(files.length&&files.every(file=>file.nativeRef)){
+    signal?.throwIfAborted();
+    const prefix='GitVault-exports/'+[project.owner,project.repo,project.branch,project.latestCommitSha+'-'+crypto.randomUUID().slice(0,8)].map(safeSegment).join('/');
+    await folderBridge.export({directory,prefix,project:{owner:project.owner,repo:project.repo,branch:project.branch,latestCommitSha:project.latestCommitSha},files:files.map(({path,sha,size,mode,nativeRef})=>({path,sha,size,mode,nativeRef}))});signal?.throwIfAborted();return;
+  }
   const prefix = [project.owner, project.repo, project.branch, project.latestCommitSha].map(safeSegment).join('/');
   for (const handle of files) {
     const file=await hydrateFile(handle);

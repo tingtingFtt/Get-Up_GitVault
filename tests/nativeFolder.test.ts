@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {Capacitor} from '@capacitor/core';
 import {folderBridge,hydrateFile,saveFolderArchive} from '../src/utils/nativeFolder';
-import {androidPlugin} from '../src/utils/androidPlugin';
+import {exportProjectDirectory} from '../src/utils/nativePlatform';
 import {nativeGitBridge,nativeGitTransfer} from '../src/utils/nativeGit';
 import {localCache,type CachedFile} from '../src/utils/localCache';
 import {githubClient,beginGithubOperation} from '../src/utils/githubClient';
@@ -71,4 +71,11 @@ test('GitHub native folder imports publish verified references and never create 
  mock.method(nativeGitBridge,'transfer',async(value:any)=>{assert.equal(value.folderVersion,'version');return{folder:true,chunked:true,streamed:true,commitSha:commit,treeSha:tree,files:[{...nativeFile({...entry,content:'',isBase64:true}),encoding:'base64'}]};});
  mock.method(nativeGitBridge,'readChunk',async()=>assert.fail('Body reads must remain native'));
  const result=await githubClient.fetchRepo('a/b');await localCache.saveProjectFiles('project',result.files,commit);assert.equal(result.branch,'dev');assert.equal(result.files.nativeSnapshot?.version,'version');assert.equal((await readStore('file_contents')).length,0);assert.equal((await readStore('download_parts')).length,0);
+});
+
+test('explicit directory exports use native streams without hydrating or transmitting project credentials',async()=>{
+ enable();const file=nativeFile({path:'huge.bin',content:'',isBase64:true,sha:'a'.repeat(40),size:512*1024*1024,mode:'100755'});
+ let exported=false;mock.method(folderBridge,'export',async(value:any)=>{assert.equal(value.files[0].size,file.size);assert.equal(value.files[0].content,undefined);assert.ok(value.prefix.startsWith('GitVault-exports/'));assert.equal(value.project.token,undefined);exported=true;});
+ mock.method(folderBridge,'read',async()=>assert.fail('Export bytes must stay native'));
+ await exportProjectDirectory('content://test/tree/root',{owner:'a',repo:'b',branch:'dev',latestCommitSha:'c'.repeat(40),token:'must-not-export'} as any,[file]);assert.ok(exported);
 });

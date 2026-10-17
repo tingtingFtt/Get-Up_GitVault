@@ -4,7 +4,7 @@ import {appDialog} from './appDialog';
 import {gitBlobSha} from './gitFiles';
 import type {CachedFile} from './localCache';
 export const folderBridge={
- file:(value:any)=>androidPlugin.folderFile(value),status:(value:any)=>androidPlugin.folderStatus(value),begin:(value:any)=>androidPlugin.folderBegin(value),list:(value:any)=>androidPlugin.folderList(value),read:(value:any)=>androidPlugin.folderRead(value),put:(value:any)=>androidPlugin.folderPut(value),copy:(value:any)=>androidPlugin.folderCopy(value),finish:(value:any)=>androidPlugin.folderFinish(value),attach:(value:any)=>androidPlugin.folderAttach(value),clear:(value:any)=>androidPlugin.folderClear(value),cleanTemporary:(value:any)=>androidPlugin.folderCleanTemporary(value),archive:(value:any)=>androidPlugin.folderArchive(value),
+ export:(value:any)=>androidPlugin.folderExport(value),file:(value:any)=>androidPlugin.folderFile(value),status:(value:any)=>androidPlugin.folderStatus(value),begin:(value:any)=>androidPlugin.folderBegin(value),list:(value:any)=>androidPlugin.folderList(value),read:(value:any)=>androidPlugin.folderRead(value),put:(value:any)=>androidPlugin.folderPut(value),copy:(value:any)=>androidPlugin.folderCopy(value),finish:(value:any)=>androidPlugin.folderFinish(value),attach:(value:any)=>androidPlugin.folderAttach(value),clear:(value:any)=>androidPlugin.folderClear(value),cleanTemporary:(value:any)=>androidPlugin.folderCleanTemporary(value),archive:(value:any)=>androidPlugin.folderArchive(value),
 };
 export const folderRoot=()=>typeof localStorage==='undefined'?'':localStorage.getItem('gitvault_apk_download_dir')||'';
 export const hasFolderApi=()=>Capacitor.isNativePlatform()&&Capacitor.getPlatform()==='android'&&Capacitor.isPluginAvailable('GitVaultNative');

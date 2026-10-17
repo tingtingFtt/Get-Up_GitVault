@@ -41,7 +41,7 @@ public class ManagedFolderStoreTest {
             expected=new JSArray();expected.put(entry("b",second));String next=f.begin("new",expected).getString("id");
             try{f.store.finish(next);fail("Incomplete candidate must not publish");}catch(IOException correct){assertTrue(f.content(old,"目录/a").exists());}
             f.store.write(next,"b",second.length,hash(second),"100644",new ByteArrayInputStream(second),null);f.store.finish(next);f.store.attach(next,"owner","new",false);
-            assertTrue(f.store.describe(old,false,null).getBoolean("missing"));assertTrue(f.content(next,"b").exists());f.store.clear("owner","new",false);assertTrue(f.store.describe(next,false,null).getBoolean("missing"));assertTrue(unrelated.exists());
+            assertTrue(f.store.describe(old,false,null).getBoolean("missing"));assertTrue(f.content(next,"b").exists());f.store.exportFiles("content://test/tree/root","exports/copy",new JSArray(f.store.describe(next,false,null).getJSONArray("files").toString()),new JSONObject());f.store.clear("owner","new",false);assertTrue(new File(f.root,"exports/copy/files/b").exists());assertTrue(f.store.describe(next,false,null).getBoolean("missing"));assertTrue(unrelated.exists());
         }
     }
     @Test public void changedFilesRequireExplicitChoiceAndAutoCleanupOnlyAcceptsVerifiedUploadBytes()throws Exception{

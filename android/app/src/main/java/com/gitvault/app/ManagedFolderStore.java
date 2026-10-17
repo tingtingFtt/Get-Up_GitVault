@@ -137,5 +137,12 @@ final class ManagedFolderStore {
         }
     }
     JSObject cleanTemporary(boolean force)throws Exception{synchronized(LOCK){int count=0;JSONArray ids=new JSONArray();for(JSONObject value:all())if(value.getJSONObject("owners").length()==0){erase(value,force);ids.put(value.getString("id"));count++;}JSObject result=new JSObject();result.put("versions",count);result.put("ids",ids);return result;}}
+    JSObject exportFiles(String uri,String prefix,JSArray entries,JSONObject project)throws Exception{
+        synchronized(LOCK){DocumentFile destination=walk(root(uri),prefix,true);for(int i=0;i<entries.length();i++){
+            JSONObject entry=entries.getJSONObject(i),ref=entry.getJSONObject("nativeRef");String path=entry.getString("path");ExportPath.validate(path);DocumentFile folder=walk(destination,"files",true);int slash=path.lastIndexOf('/');if(slash>=0)folder=walk(folder,path.substring(0,slash),true);DocumentFile target=folder.createFile("application/octet-stream",path.substring(slash+1));if(target==null)throw new IOException("无法创建导出文件："+path);
+            long size=entry.getLong("size"),count=0;MessageDigest hash=MessageDigest.getInstance("SHA-1");hash.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));try(InputStream input=open(ref.getString("version"),ref.getString("path"));OutputStream output=output(target)){byte[] bytes=new byte[65536];int n;while((n=input.read(bytes))!=-1){output.write(bytes,0,n);hash.update(bytes,0,n);count+=n;}}
+            if(count!=size||!hex(hash.digest()).equals(entry.getString("sha")))throw new IOException("目录文件在导出期间变化："+path);
+        }DocumentFile marker=destination.createFile("application/json",".gitvault-export.json");if(marker==null)throw new IOException("无法写入导出完成标识");JSONObject receipt=new JSONObject(project.toString());receipt.put("files",entries);receipt.put("completedAt",System.currentTimeMillis());try(OutputStream output=output(marker)){output.write(receipt.toString().getBytes(StandardCharsets.UTF_8));}JSObject result=new JSObject();result.put("location",prefix);return result;}
+    }
     JSObject status(String root)throws Exception{synchronized(LOCK){root(root);JSObject result=new JSObject();result.put("root",root);result.put("versions",all().size());result.put("availableBytes",new android.os.StatFs(android.os.Environment.getDataDirectory().getAbsolutePath()).getAvailableBytes());return result;}}
 }
