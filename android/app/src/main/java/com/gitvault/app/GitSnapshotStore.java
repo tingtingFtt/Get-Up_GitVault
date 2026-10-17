@@ -85,6 +85,15 @@ final class GitSnapshotStore implements Closeable {
         }
         return writeTree(repository,entries);
     }
+    void appendStream(String path,String sha,String mode,long size,InputStream input)throws Exception{
+        check();ExportPath.validate(path);if(uploaded.containsKey(path))throw new IOException("上传文件重复");
+        for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能上传 Git 内部路径");
+        int bits=Integer.parseInt(mode,8);if(bits!=0100644&&bits!=0100755&&bits!=0120000)throw new IOException("文件模式无效");
+        ObjectId blob;try(ObjectInserter insert=repository.newObjectInserter()){blob=insert.insert(Constants.OBJ_BLOB,size,new FilterInputStream(input){@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();return super.read(bytes,offset,length);}});insert.flush();}
+        if(input.read()!=-1)throw new IOException("目录文件大小在上传期间变化，未推送："+path);
+        if(!blob.name().equals(sha))throw new IOException("目录文件在上传期间变化，未推送："+path);
+        DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(bits));entry.setObjectId(blob);uploaded.put(path,entry);
+    }
     static ObjectId writeTree(Repository repository,List<DirCacheEntry> entries)throws IOException{
         entries.sort((a,b)->{byte[] x=a.getRawPath(),y=b.getRawPath();for(int i=0;i<Math.min(x.length,y.length);i++)if(x[i]!=y[i])return (x[i]&255)-(y[i]&255);return x.length-y.length;});
         DirCache cache=DirCache.newInCore();DirCacheBuilder builder=cache.builder();for(DirCacheEntry entry:entries)builder.add(entry);builder.finish();

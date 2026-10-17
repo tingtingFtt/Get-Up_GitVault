@@ -2,7 +2,7 @@ import type { RepoEntry } from './githubClient';
 
 export interface ProjectSource { owner: string; repo: string; url: string; branch: string; repositoryId?: number }
 export interface UploadTarget { private?: boolean; id?: number; owner: string; repo: string; branch: string; purgeAfterUpload: boolean; token?: string; kind?: 'upload' | 'current' | 'full' }
-export interface RemoteSnapshot { repoId?: number; owner: string; repo: string; branch: string; commitSha: string; sourceSha: string; htmlUrl: string }
+export interface RemoteSnapshot { localFiles?: RepoEntry[]; repoId?: number; owner: string; repo: string; branch: string; commitSha: string; sourceSha: string; htmlUrl: string }
 export interface BackupVersion {
   branch?: string;
   remoteSnapshot?: RemoteSnapshot;

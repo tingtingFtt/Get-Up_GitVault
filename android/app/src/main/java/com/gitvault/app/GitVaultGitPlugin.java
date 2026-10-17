@@ -38,6 +38,7 @@ public class GitVaultGitPlugin extends Plugin {
     @PluginMethod public void prepareUpload(PluginCall call){String id=call.getString("id","");if(id.isEmpty()||cancelled.putIfAbsent(id,new AtomicBoolean())!=null){call.reject("Git 任务 ID 无效");return;}io.execute(()->{try{createSession(id,call);call.resolve();}catch(Exception error){releaseSession(id);call.reject(error.getMessage());}});}
     @PluginMethod public void readChunk(PluginCall call){chunkCall(call,false);}
     @PluginMethod public void appendChunk(PluginCall call){chunkCall(call,true);}
+    @PluginMethod public void appendDocument(PluginCall call){String id=call.getString("id","");io.execute(()->{try{Staged staged=sessions.get(id);if(staged==null)throw new IOException("Git 上传任务已结束");org.json.JSONObject ref=call.getObject("nativeRef");if(ref==null)throw new IOException("目录引用缺失");try(InputStream input=new ManagedFolderStore(getContext()).open(ref.getString("version"),ref.getString("path"))){staged.store.appendStream(call.getString("path",""),call.getString("sha",""),call.getString("mode","100644"),call.getData().getLong("size"),input);}call.resolve();}catch(Exception error){call.reject(error.getMessage(),"GIT_TRANSFER");}});}
     private void chunkCall(PluginCall call,boolean upload){String id=call.getString("id","");io.execute(()->{try{Staged staged=sessions.get(id);if(staged==null)throw new IOException("Git 临时任务已结束，请重试");if(upload){staged.store.append(call.getData());call.resolve();}else call.resolve(staged.store.readChunk(call.getString("path",""),call.getData().getLong("offset")));}catch(Exception error){call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}});}
     @PluginMethod public void release(PluginCall call){String id=call.getString("id","");io.execute(()->{releaseSession(id);call.resolve();});}
     @PluginMethod public void cancel(PluginCall call) { String id=call.getString("id","");if(!id.isEmpty())cancelled.computeIfAbsent(id,key->new AtomicBoolean()).set(true);call.resolve(); }
@@ -61,7 +62,12 @@ public class GitVaultGitPlugin extends Plugin {
                     if(action.equals("fetch")) {
                         String ref=call.getString("ref","");if(!ref.matches("[a-f0-9]{40}"))throw new IOException("拉取必须固定完整提交 SHA");
                         git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec(ref+":refs/gitvault/source")).setProgressMonitor(monitor).call();
-                        check(stop);result=staged.store.describe(ref);retain=true;
+                        check(stop);result=staged.store.describe(ref);
+                        String folderVersion=call.getString("folderVersion","");
+                        if(!folderVersion.isEmpty()){
+                            JSObject stored=new ManagedFolderStore(getContext()).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->progress(id,message));
+                            result.put("files",stored.getJSONArray("files"));result.put("folder",true);result.put("folderVersion",folderVersion);result.put("streamed",true);
+                        }else retain=true;
                     } else {
                         String branch=call.getString("branch","");if(!Repository.isValidRefName("refs/heads/"+branch))throw new IOException("Git 分支名称无效");
                         ObjectId tree=staged.store.writeTree(call.getArray("files",new JSArray()));

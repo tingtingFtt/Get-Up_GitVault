@@ -1,3 +1,4 @@
+import {usesNativeFolder, beginFolder, putFolderFile, folderBridge, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, type FolderFiles} from './nativeFolder';
 import { gitBlobSha, gitTreeSha } from './gitFiles';
 export { gitBlobSha } from './gitFiles';
 import { transferCache, uploadCache } from './localCache';
@@ -158,32 +159,38 @@ export const githubClient = {
     // ZIPs do not include submodule contents. Never claim those projects are completely cached.
     if (tree.some(item => item.type === 'commit')) throw new Error('项目包含 Git 子模块，需要单独获取子模块内容；本次未标记为完整下载');
     const entries = tree.filter(item => item.type === 'blob');
+    const folder = usesNativeFolder() ? await beginFolder(JSON.stringify([meta.id || `${owner}/${repo}`, branch || (linkedRef ? ref : meta.default_branch)]), commit.sha, repo, entries) : undefined;
     const checkpoint = typeof window !== 'undefined' && typeof indexedDB !== 'undefined' ? transferCache : undefined;
     const transfer = `${owner}/${repo}@${commit.sha}`;
-    const resumed = checkpoint ? await checkpoint.load(transfer) : [];
+    const resumed = folder ? folder.files as CachedFile[] : checkpoint ? await checkpoint.load(transfer) : [];
     const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
     const files = new Map<string, CachedFile>();
     let pendingParts: CachedFile[] = [], pendingBytes = 0, saving = Promise.resolve();
     const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
-    const savePart = async (file: CachedFile) => { if (!checkpoint) return; pendingParts.push(file); pendingBytes += file.size || file.content.length; if (pendingBytes >= 4 * 1024 * 1024 || pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
-    let done = 0;
+    const savePart = async (file: CachedFile) => { if (folder) return; if (!checkpoint) return; pendingParts.push(file); pendingBytes += file.size || file.content.length; if (pendingBytes >= 4 * 1024 * 1024 || pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
+    const storeFile = async (file:CachedFile) => {
+      if(!file.isBase64&&file.content.startsWith('version https://git-lfs.github.com/spec/v1'))throw new Error('项目包含 Git LFS 指针，未标记完整下载');
+      const saved=folder&&file.nativeRef?.version!==folder.id?await putFolderFile(folder.id,file,signal):file;
+      await savePart(saved);files.set(file.path,saved);
+    };
+    let done = 0, nativeFolderFinished=false;
     const missing: RepoEntry[] = [];
     for (const entry of entries) {
       const old = previous.get(entry.path);
-      if (old?.sha === entry.sha) { files.set(entry.path, { ...old, mode: entry.mode }); done++; }
+      if (old?.sha === entry.sha) { await storeFile({ ...old, mode: entry.mode }); done++; }
       else missing.push(entry);
     }
     if (gitServiceConfig().mode !== 'rest' && missing.length) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
       const expected = new Map(entries.map(entry => [entry.path, entry]));
-      const acceptFile = async (remote: { path: string; sha: string; mode: string; encoding: string; content: string }) => {
+      const acceptFile = async (remote: { path: string; sha: string; mode: string; encoding: string; content: string; nativeRef?: CachedFile['nativeRef'];size?:number }) => {
         signal.throwIfAborted(); const entry = expected.get(remote.path);
         if (!entry || remote.sha !== entry.sha || remote.mode !== entry.mode || remote.encoding !== 'base64') throw new Error('Git 文件清单校验失败，本地原版本已保留');
-        const file = await cachedFile(entry, bytesFromBase64(remote.content)); await savePart(file); files.set(entry.path, file);
+        const file = remote.nativeRef ? {...remote,isBase64:true} : await cachedFile(entry, bytesFromBase64(remote.content)); await storeFile(file);
       };
       let result;
-      try { result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha, totalBytes: entries.reduce((n, entry) => n + (entry.size || 0), 0) }, token || '', signal, { onFile: acceptFile, paths: missing.map(entry => entry.path) }); }
+      try { result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha, folderVersion: folder?.id, totalBytes: entries.reduce((n, entry) => n + (entry.size || 0), 0) }, token || '', signal, { onFile: acceptFile, paths: missing.map(entry => entry.path) }); }
       finally { await flushParts(); }
       if (result.commitSha !== commit.sha || result.treeSha !== commit.commit.tree.sha || !Array.isArray(result.files) || result.files.length !== entries.length) throw new Error('Git 拉取结果与选定快照不一致，本地原版本已保留');
       const received = new Set<string>();
@@ -195,7 +202,7 @@ export const githubClient = {
         if (!result.streamed) await acceptFile(remote);
         else if (files.get(entry.path)?.sha !== entry.sha) throw new Error('Git 文件分块未完整接收，本地原版本已保留');
       }
-      done = files.size;
+      done = files.size;nativeFolderFinished=!!result.folder;
     }
     // A large initial import is cheaper as one archive; each downloaded blob is still verified.
     // Browser archive redirects can fail CORS, so each channel has its own catch/deadline.
@@ -217,8 +224,7 @@ export const githubClient = {
             if (!item) throw new Error(`压缩包缺少文件: ${entry.path}`);
             const bytes = await item.async('uint8array');
             const file = await cachedFile(entry, bytes);
-            await savePart(file);
-            files.set(entry.path, file);
+            await storeFile(file);
             progress(`正在校验并解压 ${++done}/${entries.length}：${entry.path}`, options);
             if (done % 25 === 0) await new Promise(resolve => setTimeout(resolve, 0));
           }
@@ -238,8 +244,7 @@ export const githubClient = {
       const data = await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal);
       const bytes = bytesFromBase64(data.content);
       const file = await cachedFile(entry, bytes);
-      await savePart(file);
-      files.set(entry.path, file);
+      await storeFile(file);
       progress(`正在下载并校验 ${++done}/${entries.length}：${entry.path}`, options);
     }); } finally { await flushParts(); }
     if (files.size !== entries.length) throw new Error('文件下载不完整，已保留原版本，请重试');
@@ -247,11 +252,14 @@ export const githubClient = {
     const lfsPointers = [...files.values()].filter(f => !f.isBase64 && f.content.startsWith('version https://git-lfs.github.com/spec/v1')).map(f => f.path);
     if (lfsPointers.length) throw new Error(`项目包含 Git LFS 文件（${lfsPointers.slice(0, 3).join('、')}），当前无法完整保存其大文件内容`);
     progress(`文件已校验 ${files.size}/${entries.length}，正在保存缓存…`, options);
+    if(folder&&!nativeFolderFinished)await folderBridge.finish({version:folder.id});
+    const completedFiles=entries.map(e=>files.get(e.path)!) as FolderFiles;
+    if(folder)completedFiles.nativeSnapshot={version:folder.id,dirty:false};
     return {
       owner, repo, repositoryId: meta.id as number | undefined, branch: branch || (linkedRef ? ref : meta.default_branch), latestCommitSha: commit.sha,
       commitMessage: commit.commit.message, commitAuthor: commit.commit.author?.name || 'Unknown', commitDate: commit.commit.author?.date,
       repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url },
-      tree, files: entries.map(e => files.get(e.path)!), cachedFilesCount: files.size, isFullyCached: true,
+      tree, files: completedFiles, cachedFilesCount: files.size, isFullyCached: true,
     };
   },
 
@@ -355,6 +363,7 @@ export const githubClient = {
 
   async push(targetOwner: string, targetRepo: string, targetBranch: string, token: string, files: CachedFile[], commitMessage: string, description?: string, remark?: string, originalSourceUrl?: string, options: { rebaseOnConflict?: boolean; expectedRepoId?: number } = {}) {
     const signal = operation.signal;
+    await confirmFolderUpload(files);
     const base = root(targetOwner, targetRepo);
     const identity = await githubClient.repository(targetOwner, targetRepo, token, options.expectedRepoId, signal);
     const meta = { id: identity.id, default_branch: identity.defaultBranch };
@@ -365,6 +374,7 @@ export const githubClient = {
     let parent = '';
     try { parent = await readHead(); }
     catch (error) { if (!(error instanceof GitHubError) || error.status !== 404 && error.status !== 409) throw error; }
+    const localFiles=hasLocalFolderChanges(files)?files.map(({path,sha,mode,size})=>({path,sha:sha!,mode:mode||'100644',size,type:'blob' as const})):undefined;
     const allFiles = [...files];
     if (description || remark || originalSourceUrl) {
       // Preserve a source project file with this name rather than silently overwriting it.
@@ -381,7 +391,7 @@ export const githubClient = {
       const prepared: CachedFile[] = [];
       for (const file of allFiles) {
         signal.throwIfAborted();
-        prepared.push({ ...file, sha: await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) });
+        prepared.push({ ...file, sha: file.nativeRef ? file.sha : await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) });
       }
       const result = await gitServiceTransfer('push', { owner: identity.owner, repo: identity.repo, expectedRepoId: identity.id, branch, files: prepared, message: commitMessage, rebaseOnConflict: !!options.rebaseOnConflict }, token, signal);
       if (!result.verified || result.repoId !== identity.id || result.branch !== branch || !/^[a-f0-9]{40}$/.test(result.commitSha) || !/^[a-f0-9]{40}$/.test(result.treeSha)) throw new Error('Git 推送回执无效，本地缓存已保留');
@@ -389,7 +399,7 @@ export const githubClient = {
       const tree = await getTree(targetOwner, targetRepo, result.treeSha, token, signal);
       const blobs = tree.filter(item => item.type === 'blob'), expected = new Map(prepared.map(file => [file.path, file]));
       if (committed.tree.sha !== result.treeSha || blobs.length !== prepared.length || tree.some(item => item.type === 'commit') || blobs.some(item => item.sha !== expected.get(item.path)?.sha || item.mode !== (expected.get(item.path)?.mode || '100644')) || await readHead() !== result.commitSha) throw new Error('Git 推送后的文件或分支校验失败，本地缓存已保留，请检查目标最新提交');
-      return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: identity.id, commitSha: result.commitSha as string, treeSha: result.treeSha as string, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
+      return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: identity.id, commitSha: result.commitSha as string, treeSha: result.treeSha as string, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length, ...(localFiles?{localFiles}:{}) };
     }
     let parentTree = '';
     const existing = new Map<string, RepoEntry>();
@@ -418,6 +428,7 @@ export const githubClient = {
     const expectedFiles: Array<{path:string;mode:string;sha:string}> = [];
     const treeItems = await mapConcurrent(allFiles, 1, async file => {
       signal.throwIfAborted();
+      file=await hydrateFile(file);
       const bytes = file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content);
       const hash = await gitBlobSha(bytes);
       expectedFiles.push({path:file.path,mode:file.mode || '100644',sha:hash});
@@ -488,7 +499,7 @@ export const githubClient = {
         const verifiedHead = await readHead();
         const verifiedCommit = await json(`${base}/git/commits/${commit.sha}`, token, {}, signal);
         if (verifiedCommit.tree.sha !== treeSha) throw new Error('上传后的远程版本验证未通过；本地文件已保留，请重新检查');
-        if (verifiedHead === commit.sha) return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: meta.id as number | undefined, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length };
+        if (verifiedHead === commit.sha) return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: meta.id as number | undefined, commitSha: commit.sha, treeSha, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length, ...(localFiles?{localFiles}:{}) };
         // Do not replay after our commit landed and another writer subsequently changed it.
         throw new Error('上传后的分支已被其他提交修改，验证未通过；本地文件已保留，请重新检查');
       }

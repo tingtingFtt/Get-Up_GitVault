@@ -1,4 +1,6 @@
-import { Capacitor, registerPlugin } from '@capacitor/core';
+import {hydrateFile} from './nativeFolder';
+import { Capacitor } from '@capacitor/core';
+import { androidPlugin } from './androidPlugin';
 import type { CachedFile } from './localCache';
 
 interface GitVaultNative {
@@ -11,7 +13,7 @@ interface GitVaultNative {
   finishDownload(options: { id: string }): Promise<void>;
   abortDownload(options: { id: string }): Promise<void>;
 }
-const plugin = registerPlugin<GitVaultNative>('GitVaultNative');
+const plugin = androidPlugin as unknown as GitVaultNative;
 export const nativeBridge: GitVaultNative = {
   readVault: () => plugin.readVault(),
   writeVault: options => plugin.writeVault(options),
@@ -38,7 +40,8 @@ export async function exportProjectDirectory(directory: string, project: { owner
   if (!hasNativeFiles()) throw new Error('当前安装包没有可用的 Android 文件插件');
   if (!directory.startsWith('content://')) throw new Error('请先通过系统选择器授权导出目录');
   const prefix = [project.owner, project.repo, project.branch, project.latestCommitSha].map(safeSegment).join('/');
-  for (const file of files) {
+  for (const handle of files) {
+    const file=await hydrateFile(handle);
     signal?.throwIfAborted(); safeRelativePath(file.path);
     const data = file.isBase64 ? file.content.replace(/\s/g, '') : bytesToBase64(new TextEncoder().encode(file.content));
     await nativeBridge.writeDocument({ directory, path: `${prefix}/files/${file.path}`, data });

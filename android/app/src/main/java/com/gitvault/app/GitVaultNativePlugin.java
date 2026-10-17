@@ -36,11 +36,13 @@ import javax.crypto.spec.GCMParameterSpec;
 public class GitVaultNativePlugin extends Plugin {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private static final String KEY = "gitvault.credentials.v1";
+    private final Map<String, File> folderParts = new ConcurrentHashMap<>();
     private final Map<String, File> downloads = new ConcurrentHashMap<>();
     private final Map<String, String> names = new ConcurrentHashMap<>();
     private final Map<String, String> mimes = new ConcurrentHashMap<>();
 
     @Override public void load() {
+        File partial = new File(getContext().getCacheDir(), "folder-parts");File[] parts=partial.listFiles();if(parts!=null)for(File file:parts)file.delete();
         File folder = new File(getContext().getCacheDir(), "exports");
         File[] stale = folder.listFiles();
         if (stale != null) for (File file : stale) file.delete();
@@ -125,6 +127,36 @@ public class GitVaultNativePlugin extends Plugin {
             } catch (Exception exception) { call.reject("导出文件未完成：" + exception.getMessage(), exception); }
         });
     }
+    private interface FolderTask { JSObject run(ManagedFolderStore store)throws Exception; }
+    private void folderTask(PluginCall call,FolderTask task){io.execute(()->{try{call.resolve(task.run(new ManagedFolderStore(getContext())));}catch(Exception error){call.reject(error.getMessage(),error instanceof ManagedFolderStore.Changed?"LOCAL_CHANGES":"FOLDER_STORAGE");}});}
+    @PluginMethod public void folderStatus(PluginCall call){folderTask(call,store->store.status(call.getString("root","")));}
+    @PluginMethod public void folderBegin(PluginCall call){folderTask(call,store->store.begin(call.getString("root",""),call.getString("key",""),call.getString("ref",""),call.getString("label","project"),call.getArray("files",new com.getcapacitor.JSArray()),call.getBoolean("allowChanged",false)));}
+    @PluginMethod public void folderList(PluginCall call){folderTask(call,store->store.describe(call.getString("version",""),call.getBoolean("scan",false),null));}
+    @PluginMethod public void folderFile(PluginCall call){folderTask(call,store->store.describeFile(call.getString("version",""),call.getString("path","")));}
+    @PluginMethod public void folderRead(PluginCall call){folderTask(call,store->store.readChunk(call.getString("version",""),call.getString("path",""),call.getData().getLong("offset")));}
+    @PluginMethod public void folderFinish(PluginCall call){folderTask(call,store->store.finish(call.getString("version","")));}
+    @PluginMethod public void folderAttach(PluginCall call){folderTask(call,store->store.attach(call.getString("version",""),call.getString("owner",""),call.getString("ref",""),call.getBoolean("history",false)));}
+    private JSObject cleanParts(JSObject result)throws Exception{org.json.JSONArray ids=result.getJSONArray("ids");for(String key:new java.util.ArrayList<>(folderParts.keySet()))for(int i=0;i<ids.length();i++)if(key.startsWith(ids.getString(i)+":")){File part=folderParts.remove(key);if(part!=null&&!part.delete()&&part.exists())throw new java.io.IOException("临时分块清理失败");}return result;}
+    @PluginMethod public void folderClear(PluginCall call){folderTask(call,store->cleanParts(store.clear(call.getString("owner",""),call.getString("ref",""),call.getBoolean("force",false),call.getArray("verifiedFiles"))));}
+    @PluginMethod public void folderCleanTemporary(PluginCall call){folderTask(call,store->cleanParts(store.cleanTemporary(call.getBoolean("force",false))));}
+    @PluginMethod public void folderPut(PluginCall call){folderTask(call,store->{
+        String version=call.getString("version",""),path=call.getString("path",""),key=version+":"+path;long offset=call.getData().getLong("offset");String encoded=call.getString("data","");
+        if(encoded.length()>524288)throw new java.io.IOException("文件分块过大");byte[] bytes=Base64.decode(encoded,Base64.DEFAULT);if(bytes.length>ManagedFolderStore.CHUNK)throw new java.io.IOException("文件分块过大");
+        File part=folderParts.get(key);if(offset==0){if(part!=null)part.delete();File dir=new File(getContext().getCacheDir(),"folder-parts");dir.mkdirs();part=File.createTempFile("part-",".bin",dir);folderParts.put(key,part);}
+        if(part==null||part.length()!=offset)throw new java.io.IOException("文件分块顺序无效");try(OutputStream output=new FileOutputStream(part,true)){output.write(bytes);}
+        if(call.getBoolean("done",false)){try(InputStream input=new java.io.FileInputStream(part)){store.write(version,path,part.length(),call.getString("sha",""),call.getString("mode","100644"),input,null);}finally{part.delete();folderParts.remove(key);}}
+        return new JSObject();
+    });}
+    @PluginMethod public void folderCopy(PluginCall call){folderTask(call,store->{org.json.JSONObject source=call.getObject("nativeRef");if(source==null)throw new java.io.IOException("文件引用缺失");try(InputStream input=store.open(source.getString("version"),source.getString("path"))){store.write(call.getString("version",""),call.getString("path",""),call.getData().getLong("size"),call.getString("sha",""),call.getString("mode","100644"),input,null);}return new JSObject();});}
+    @PluginMethod public void folderArchive(PluginCall call){io.execute(()->{String id=UUID.randomUUID().toString();File archive=null;try{
+        String name=call.getString("name","project.zip");ExportPath.validate(name);if(name.contains("/"))throw new java.io.IOException("导出名称无效");File dir=new File(getContext().getCacheDir(),"exports");dir.mkdirs();archive=new File(dir,id);ManagedFolderStore store=new ManagedFolderStore(getContext());com.getcapacitor.JSArray files=call.getArray("files",new com.getcapacitor.JSArray());
+        try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(new FileOutputStream(archive))){for(int i=0;i<files.length();i++){
+            org.json.JSONObject item=files.getJSONObject(i),ref=item.optJSONObject("nativeRef");String path=item.getString("path");ExportPath.validate(path);zip.putNextEntry(new java.util.zip.ZipEntry(path));
+            if(ref!=null){long size=item.getLong("size"),count=0;java.security.MessageDigest hash=java.security.MessageDigest.getInstance("SHA-1");hash.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));try(InputStream input=store.open(ref.getString("version"),ref.getString("path"))){byte[] buffer=new byte[65536];int n;while((n=input.read(buffer))!=-1){zip.write(buffer,0,n);hash.update(buffer,0,n);count+=n;}}StringBuilder digest=new StringBuilder();for(byte value:hash.digest())digest.append(String.format(java.util.Locale.ROOT,"%02x",value&255));if(count!=size||!digest.toString().equals(item.getString("sha")))throw new java.io.IOException("目录文件在归档期间变化："+path);
+            }else{String text=item.getString("content");if(text.length()>1024*1024)throw new java.io.IOException("归档附加说明过大");zip.write(item.optBoolean("isBase64")?Base64.decode(text,Base64.DEFAULT):text.getBytes(StandardCharsets.UTF_8));}
+            zip.closeEntry();}}
+        downloads.put(id,archive);names.put(id,name);mimes.put(id,"application/zip");JSObject result=new JSObject();result.put("id",id);call.resolve(result);
+    }catch(Exception error){if(archive!=null)archive.delete();call.reject("目录归档失败："+error.getMessage());}});}
     @PluginMethod public void beginDownload(PluginCall call) {
         try {
             String name = call.getString("name", "export.bin"); ExportPath.validate(name);

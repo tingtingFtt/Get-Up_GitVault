@@ -1,11 +1,12 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import type { PluginListenerHandle } from '@capacitor/core';
 import type { CachedFile } from './localCache';
-export interface NativeGitFile { path: string; sha: string; mode: string; size?: number; encoding: 'base64'; content: string }
+export interface NativeGitFile { path: string; sha: string; mode: string; size?: number; encoding: 'base64'; content: string; nativeRef?: CachedFile['nativeRef'] }
 export interface NativeFetchOptions { onFile?: (file: NativeGitFile) => Promise<void>; paths?: string[] }
 interface NativeGit {
  transfer(options: Record<string, unknown>): Promise<any>;
  prepareUpload(options: Record<string, unknown>): Promise<void>;
+ appendDocument(options: Record<string, unknown>): Promise<void>;
  appendChunk(options: Record<string, unknown>): Promise<void>;
  readChunk(options: Record<string, unknown>): Promise<{offset:number;bytes:number;done:boolean;content:string}>;
  release(options: {id:string}): Promise<void>;
@@ -15,6 +16,7 @@ interface NativeGit {
 const plugin=registerPlugin<NativeGit>('GitVaultGit');
 export const nativeGitBridge: NativeGit={
  transfer:options=>plugin.transfer(options),prepareUpload:options=>plugin.prepareUpload(options),
+ appendDocument:options=>plugin.appendDocument(options),
  appendChunk:options=>plugin.appendChunk(options),readChunk:options=>plugin.readChunk(options),release:options=>plugin.release(options),
  cancel:options=>plugin.cancel(options),addListener:(name,listener)=>plugin.addListener(name,listener)
 };
@@ -24,7 +26,7 @@ const encodedChunkSize=NATIVE_CHUNK_BYTES/3*4;
 const base64Size=(text:string)=>text.length/4*3-(text.endsWith('==')?2:text.endsWith('=')?1:0);
 function encode(bytes:Uint8Array){let text='';for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(text);}
 const report=(message:string)=>window.dispatchEvent(new CustomEvent('gitvault-progress',{detail:message}));
-export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:string;repo:string;expectedRepoId:number;ref?:string;branch?:string;files?:CachedFile[];message?:string;rebaseOnConflict?:boolean;totalBytes?:number},token:string,signal:AbortSignal,options:NativeFetchOptions={}){
+export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:string;repo:string;expectedRepoId:number;ref?:string;branch?:string;files?:CachedFile[];message?:string;rebaseOnConflict?:boolean;totalBytes?:number;folderVersion?:string},token:string,signal:AbortSignal,options:NativeFetchOptions={}){
  if(!hasNativeGit())throw new Error('当前安装包不含原生 Git，请更新 APK 或选择 REST');
  signal.throwIfAborted();const id=crypto.randomUUID();
  let rejectAbort!: (reason: unknown)=>void;
@@ -41,7 +43,9 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
    await nativeGitBridge.prepareUpload({id,totalBytes});signal.throwIfAborted();
    for(const file of files){
     const metadata={id,path:file.path,sha:file.sha,mode:file.mode||'100644'};
-    if(file.isBase64){
+    if(file.nativeRef){
+     await nativeGitBridge.appendDocument({...metadata,nativeRef:file.nativeRef,size:file.size});
+    }else if(file.isBase64){
      const text=file.content.replace(/\s/g,'');let offset=0;
      for(let at=0;at<text.length||at===0;at+=encodedChunkSize){
       signal.throwIfAborted();const content=text.slice(at,at+encodedChunkSize);
@@ -59,6 +63,10 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
   }
   const result=await nativeGitBridge.transfer({...identity,action,id,token});signal.throwIfAborted();
   if(!result.chunked||!Array.isArray(result.files))throw new Error('原生 Git 分块协议不匹配，请更新 APK');
+  if(result.folder){
+   if(options.onFile)for(const file of result.files){signal.throwIfAborted();await options.onFile(file);}
+   return {...result,streamed:!!options.onFile};
+  }
   const wanted=options.paths?new Set(options.paths):undefined,received:NativeGitFile[]=[];
   let completed=0;
   for(const file of result.files as NativeGitFile[]){
