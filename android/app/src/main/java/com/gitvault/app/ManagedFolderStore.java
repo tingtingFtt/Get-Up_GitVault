@@ -64,6 +64,31 @@ final class ManagedFolderStore {
         int slash=path.lastIndexOf('/');if(slash>=0){folder=walk(folder,path.substring(0,slash),create);if(folder==null)return null;}
         String name=path.substring(slash+1);DocumentFile doc=folder.findFile(name);if(doc==null&&create)doc=createFile(folder,name);if(doc!=null&&!doc.isFile())throw new IOException("文件路径被目录占用："+path);return doc;
     }
+    /** Per-task directory listings: never retain provider handles across tasks. */
+    private final class FolderAccess {
+        final DocumentFile directory;
+        final Map<String,Map<String,DocumentFile>> children=new HashMap<>();
+        FolderAccess(JSONObject value,boolean create)throws Exception{directory=filesDir(value,create);if(directory==null)throw new IOException("项目目录已移动或删除");}
+        Map<String,DocumentFile> children(DocumentFile dir)throws IOException{
+            String key=dir.getUri().toString();Map<String,DocumentFile> found=children.get(key);
+            if(found==null){found=new HashMap<>();for(DocumentFile child:dir.listFiles()){String name=child.getName();if(name==null||found.put(name,child)!=null)throw new IOException("目录提供者返回重复或无效文件名");}children.put(key,found);}return found;
+        }
+        DocumentFile file(String path,boolean create)throws Exception{
+            ExportPath.validate(path);String[] segments=path.split("/");DocumentFile dir=directory;
+            for(int i=0;i<segments.length;i++){
+                String name=segments[i];Map<String,DocumentFile> entries=children(dir);DocumentFile next=entries.get(name);boolean last=i==segments.length-1;
+                if(next==null&&create){next=last?createFile(dir,name):dir.createDirectory(name);if(next==null)throw new IOException("无法创建目录："+name);entries.put(name,next);}
+                if(next==null)return null;if(last){if(!next.isFile())throw new IOException("文件路径被目录占用："+path);return next;}
+                if(!next.isDirectory())throw new IOException("目录被同名文件占用："+name);dir=next;
+            }return null;
+        }
+    }
+    final class ReadBatch implements Closeable {
+        private final Map<String,FolderAccess> versions=new HashMap<>();
+        InputStream open(JSONObject ref)throws Exception{synchronized(LOCK){String id=ref.getString("version");FolderAccess access=versions.get(id);if(access==null){JSONObject value=load(id);if(value==null)throw new IOException("目录快照已清理");access=new FolderAccess(value,false);versions.put(id,access);}DocumentFile doc=access.file(ref.getString("path"),false);if(doc==null)throw new IOException("本地文件已移动或删除："+ref.getString("path"));return input(doc);}}
+        public void close(){versions.clear();}
+    }
+    ReadBatch readBatch(){return new ReadBatch();}
     private InputStream input(DocumentFile doc)throws IOException{InputStream stream=context.getContentResolver().openInputStream(doc.getUri());if(stream==null)throw new IOException("无法读取项目文件");return stream;}
     private OutputStream output(DocumentFile doc)throws IOException{OutputStream stream=context.getContentResolver().openOutputStream(doc.getUri(),"wt");if(stream==null)throw new IOException("无法写入项目文件");return stream;}
     private static void check(AtomicBoolean stop)throws IOException{if(stop!=null&&(stop.get()||Thread.currentThread().isInterrupted()))throw new IOException("目录任务已取消，已完成的文件保留");}
@@ -94,7 +119,10 @@ final class ManagedFolderStore {
     }
     private void checkpoint(JSONObject value,JSONObject entry)throws Exception{try(FileOutputStream stream=new FileOutputStream(new File(registry,value.getString("id")+".journal"),true)){stream.write((entry.toString()+"\n").getBytes(StandardCharsets.UTF_8));}value.getJSONObject("files").put(entry.getString("path"),entry);}
     void write(String id,String path,long size,String sha,String mode,InputStream stream,AtomicBoolean stop)throws Exception{
-        synchronized(LOCK){JSONObject value=load(id);if(value==null||!value.getString("state").equals("staging"))throw new IOException("目录下载任务已结束");DocumentFile target=file(value,path,true);if(target==null)throw new IOException("无法创建项目文件："+path);
+        write(id,path,size,sha,mode,stream,stop,null);
+    }
+    private void write(String id,String path,long size,String sha,String mode,InputStream stream,AtomicBoolean stop,FolderAccess access)throws Exception{
+        synchronized(LOCK){JSONObject value=load(id);if(value==null||!value.getString("state").equals("staging"))throw new IOException("目录下载任务已结束");DocumentFile target=access==null?file(value,path,true):access.file(path,true);if(target==null)throw new IOException("无法创建项目文件："+path);
             MessageDigest digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));long count=0;
             try(OutputStream output=output(target)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);output.write(buffer,0,n);digest.update(buffer,0,n);count+=n;}}
             if(count!=size||!hex(digest.digest()).equals(sha)){target.delete();throw new IOException("项目文件校验失败："+path);}
@@ -102,17 +130,22 @@ final class ManagedFolderStore {
         }
     }
     JSObject finish(String id)throws Exception{
+        return finish(id,null);
+    }
+    private JSObject finish(String id,AtomicBoolean stop)throws Exception{
         synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录任务不存在");JSONObject files=value.getJSONObject("files");JSONArray expected=value.getJSONArray("expected");if(files.length()!=expected.length())throw new IOException("项目文件尚未完整写入，未发布新快照");for(int i=0;i<expected.length();i++){JSONObject entry=expected.getJSONObject(i),actual=files.optJSONObject(entry.getString("path"));if(actual==null||!actual.getString("sha").equals(entry.getString("sha"))||!actual.getString("mode").equals(entry.getString("mode")))throw new IOException("目录快照清单不一致");}
-            JSObject checked=describe(id,true,null);if(checked.optBoolean("dirty")||checked.optBoolean("missing"))throw new IOException("目录文件已变化或缺失，未发布新快照");
+            check(stop);JSObject checked=describe(id,true,stop);if(checked.optBoolean("dirty")||checked.optBoolean("missing"))throw new IOException("目录文件已变化或缺失，未发布新快照");check(stop);
             DocumentFile version=versionDir(value,false);DocumentFile marker=version.findFile(".gitvault-snapshot.json");if(marker==null)marker=createFile(version,".gitvault-snapshot.json");if(marker==null)throw new IOException("无法写入目录快照标识");try(OutputStream output=output(marker)){JSONObject publicMeta=new JSONObject();publicMeta.put("app","GitVault");publicMeta.put("version",id);publicMeta.put("ref",value.getString("ref"));publicMeta.put("files",expected);output.write(publicMeta.toString().getBytes(StandardCharsets.UTF_8));}value.put("state","ready");save(value);return describe(id,false,null);
         }
     }
     JSObject fetch(String id,Repository repository,JSArray expected,AtomicBoolean stop,Progress progress)throws Exception{
-        synchronized(LOCK){JSONObject value=load(id);JSONObject done=value.getJSONObject("files");int completed=0;
-            for(int i=0;i<expected.length();i++){check(stop);JSONObject entry=expected.getJSONObject(i);String path=entry.getString("path");DocumentFile existing=file(value,path,false);JSONObject previous=done.optJSONObject(path);
-                if(previous==null||existing==null||!existing.exists()||!hash(existing,stop).equals(entry.getString("sha"))){ObjectLoader loader=repository.open(ObjectId.fromString(entry.getString("sha")));try(InputStream stream=loader.openStream()){write(id,path,loader.getSize(),entry.getString("sha"),entry.getString("mode"),stream,stop);}}
+        synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录任务不存在");JSONObject done=value.getJSONObject("files");FolderAccess access=new FolderAccess(value,true);int completed=0;
+            for(int i=0;i<expected.length();i++){check(stop);JSONObject entry=expected.getJSONObject(i);String path=entry.getString("path");DocumentFile existing=access.file(path,false);JSONObject previous=done.optJSONObject(path);
+                // Resume entries were verified by begin(); finish() still verifies
+                // every on-disk file before publishing this candidate.
+                if(previous==null||existing==null||!previous.getString("sha").equals(entry.getString("sha"))||!previous.getString("mode").equals(entry.getString("mode"))){ObjectLoader loader=repository.open(ObjectId.fromString(entry.getString("sha")));try(InputStream stream=loader.openStream()){write(id,path,loader.getSize(),entry.getString("sha"),entry.getString("mode"),stream,stop,access);}}
                 progress.update("目录写入并校验 "+(++completed)+"/"+expected.length()+"："+path);
-            }return finish(id);
+            }progress.update("正在验证目录中的完整快照…");return finish(id,stop);
         }
     }
     InputStream open(String id,String path)throws Exception{synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录快照已清理");DocumentFile doc=file(value,path,false);if(doc==null||!doc.exists())throw new IOException("本地文件已移动或删除："+path);return input(doc);}}

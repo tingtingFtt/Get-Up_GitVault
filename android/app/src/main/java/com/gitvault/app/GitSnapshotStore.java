@@ -86,10 +86,24 @@ final class GitSnapshotStore implements Closeable {
         return writeTree(repository,entries);
     }
     void appendStream(String path,String sha,String mode,long size,InputStream input)throws Exception{
+        try(ObjectInserter insert=repository.newObjectInserter()){appendStream(path,sha,mode,size,input,insert);insert.flush();}
+    }
+    void appendDocuments(JSArray files,ManagedFolderStore.ReadBatch reader,ManagedFolderStore.Progress progress)throws Exception{
+        if(files.length()>256)throw new IOException("上传清单批次过大");
+        try(ObjectInserter insert=repository.newObjectInserter()){
+            for(int i=0;i<files.length();i++){
+                check();JSONObject file=files.getJSONObject(i);
+                try(InputStream input=reader.open(file.getJSONObject("nativeRef"))){appendStream(file.getString("path"),file.getString("sha"),file.getString("mode"),file.getLong("size"),input,insert);}
+                progress.update("读取、校验并暂存 "+(i+1)+"/"+files.length());
+            }insert.flush();
+        }
+    }
+    private void appendStream(String path,String sha,String mode,long size,InputStream input,ObjectInserter insert)throws Exception{
         check();ExportPath.validate(path);if(uploaded.containsKey(path))throw new IOException("上传文件重复");
         for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能上传 Git 内部路径");
         int bits=Integer.parseInt(mode,8);if(bits!=0100644&&bits!=0100755&&bits!=0120000)throw new IOException("文件模式无效");
-        ObjectId blob;try(ObjectInserter insert=repository.newObjectInserter()){blob=insert.insert(Constants.OBJ_BLOB,size,new FilterInputStream(input){@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();return super.read(bytes,offset,length);}});insert.flush();}
+        if(size<0||!sha.matches("[a-f0-9]{40}"))throw new IOException("目录文件大小或哈希无效");
+        ObjectId blob=insert.insert(Constants.OBJ_BLOB,size,new FilterInputStream(input){@Override public int read()throws IOException{check();return super.read();}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();return super.read(bytes,offset,length);}});
         if(input.read()!=-1)throw new IOException("目录文件大小在上传期间变化，未推送："+path);
         if(!blob.name().equals(sha))throw new IOException("目录文件在上传期间变化，未推送："+path);
         DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(bits));entry.setObjectId(blob);uploaded.put(path,entry);

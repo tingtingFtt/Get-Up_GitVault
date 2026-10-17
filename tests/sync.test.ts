@@ -162,13 +162,23 @@ test('cancel aborts an active fetch and no completion is reported', async () => 
   const pending = githubClient.fetchRepo('demo/project');
   cancelGithubOperation(); await assert.rejects(pending, { name: 'AbortError' });
 });
-test('large REST snapshots bypass whole-archive buffering while preserving every file',async()=>{
-  const files=Array.from({length:13},(_,i)=>file(`asset-${i}.bin`,`asset-${i}`));
-  source(files);
-  const base=handler;
-  handler=(path,init)=>path.includes('/git/trees/')?response({tree:files.map(value=>({path:value.path,sha:value.sha,mode:value.mode,type:'blob',size:3*1024*1024}))}):base(path,init);
+test('large REST snapshots stream archives above 32 MiB without per-file downloads',async()=>{
+  const {zipSync}=await import('fflate');
+  const files=Array.from({length:17},(_,i)=>file(`asset-${i}.txt`,String(i).padStart(2,'0')+'x'.repeat(2*1024*1024)));
+  source(files);const base=handler;
+  const archive=zipSync(Object.fromEntries(files.map(value=>['root/'+value.path,Buffer.from(value.content)])),{level:1});let reads=0;
+  handler=(path,init)=>{
+    if(path.includes('/zipball/')){let offset=0;const stream=new ReadableStream({pull(controller){reads++;if(offset===archive.length){controller.close();return;}const next=Math.min(offset+733,archive.length);controller.enqueue(archive.slice(offset,next));offset=next;}});const reply=new Response(stream);Object.defineProperty(reply,'arrayBuffer',{value:()=>assert.fail('Archive must never be fully buffered')});return reply;}
+    return base(path,init);
+  };
   const result=await githubClient.fetchRepo('demo/project');
-  assert.equal(result.files.length,13);assert.ok(!calls.some(call=>call.path.includes('/zipball/')));
+  assert.equal(result.files.length,17);assert.ok(reads>10);assert.ok(calls.some(call=>call.path.includes('/zipball/')));assert.ok(!calls.some(call=>call.path.includes('/git/blobs/')));
+  assert.deepEqual(result.files.map(f=>f.sha),files.map(f=>f.sha));
+});
+test('identical blob contents at different paths are downloaded only once',async()=>{
+  const files=[file('a','same'),file('dir/b','same'),file('other','different')];source(files);
+  const result=await githubClient.fetchRepo('demo/project');assert.equal(result.files.length,3);assert.equal(calls.filter(call=>call.path.includes('/git/blobs/')).length,2);
+  calls=[];const reused=await githubClient.fetchRepo('demo/project',undefined,undefined,{cachedFiles:[file('renamed','same')]});assert.equal(reused.files.length,3);assert.equal(calls.filter(call=>call.path.includes('/git/blobs/')).length,1);
 });
 test('quota failure after a content batch never publishes a partial replacement snapshot',async()=>{
   await localCache.saveProjectFiles('quota-project',[file('old.txt','old')],'old');
@@ -594,4 +604,23 @@ test('text snapshots larger than one batch keep combining files and checkpoint v
  const expected=await gitTreeSha(files.map(f=>({path:f.path,sha:f.sha!,mode:f.mode!})));destination();const base=handler;
  handler=async(path,init)=>{if(path==='/repos/me/backup')return response({id:77,default_branch:'main'});if(path.endsWith('/git/trees')){const payload=JSON.parse(String(init.body));return response({sha:await gitTreeSha(await Promise.all(payload.tree.map(async(f:any)=>({path:f.path,mode:f.mode,sha:f.sha||await gitBlobSha(new TextEncoder().encode(f.content))}))))});}if(path.endsWith('/git/commits/new-commit'))return response({tree:{sha:expected}});return base(path,init);};
  const result=await githubClient.push('me','backup','release','token',files,'large text');assert.equal(result.verified,true);assert.equal(calls.filter(c=>c.path.endsWith('/git/trees')).length,2);assert.equal(calls.filter(c=>c.path.endsWith('/git/blobs')).length,0);assert.ok((await uploadCache.load(77)).size>=17);
+});
+
+test('unchanged uploads verify the fixed branch without any remote mutation',async()=>{
+ destination();const base=handler;const files=[file('a.txt','same')];
+ handler=(path,init)=>path.includes('/git/trees/old-tree')?response({tree:files.map(value=>({...value,type:'blob'}))}):base(path,init);
+ const result=await githubClient.push('me','backup','release','token',files,'repeat');assert.ok(result.verified);assert.equal(result.commitSha,'parent');assert.equal(result.uploadedFilesCount,0);assert.ok(calls.every(call=>!call.init.method||call.init.method==='GET'));
+});
+
+test('an incomplete archive retains verified files and REST downloads only missing paths',async()=>{
+ const {zipSync}=await import('fflate');const files=Array.from({length:13},(_,i)=>file(`${i}.txt`,`content-${i}`));source(files);const base=handler;
+ const zip=zipSync({'root/0.txt':Buffer.from(files[0].content)});
+ handler=(path,init)=>path.includes('/zipball/')?new Response(zip):base(path,init);
+ const result=await githubClient.fetchRepo('demo/project',undefined,'token');assert.equal(result.files.length,13);assert.equal(calls.filter(call=>call.path.includes('/git/blobs/')).length,12);assert.ok(!calls.some(call=>call.path.endsWith('/git/blobs/'+files[0].sha)));
+});
+test('first uploads combine medium UTF-8 files into a verified tree instead of separate blob writes',async()=>{
+ const {gitTreeSha}=await import('../src/utils/gitFiles');const files=[file('medium.txt','x'.repeat(256*1024)),file('a','a'),file('b','b'),file('c','c')];
+ const treeSha=await gitTreeSha(files.map(f=>({path:f.path,mode:f.mode!,sha:f.sha!})));destination();const base=handler;
+ handler=(path,init)=>path.endsWith('/git/trees')?response({sha:treeSha}):path.endsWith('/git/commits/new-commit')?response({tree:{sha:treeSha}}):base(path,init);
+ const result=await githubClient.push('me','backup','release','token',files,'first');assert.ok(result.verified);assert.equal(calls.filter(call=>call.path.endsWith('/git/blobs')).length,0);assert.equal(calls.filter(call=>call.path.endsWith('/git/trees')).length,1);
 });

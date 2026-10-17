@@ -41,6 +41,21 @@ test('corrupt native chunks fail before accepting a file and still release stagi
  nativeGitBridge.readChunk=async()=>({offset:1,bytes:4,done:true,content:'dGVzdA=='});
  await assert.rejects(nativeGitTransfer('fetch',{owner:'a',repo:'b',expectedRepoId:1},'',new AbortController().signal,{onFile:async()=>{assert.fail('Corrupt chunks must not be accepted');}}),/分块校验失败/);assert.ok(released);
 });
+test('folder uploads send bounded metadata batches across mixed file types and stop before transfer on a failed batch',async()=>{
+ Capacitor.isNativePlatform=()=>true;Capacitor.getPlatform=()=> 'android';Capacitor.isPluginAvailable=()=>true;
+ const file=(i:number)=>({path:`dir/${i}.bin`,sha:'a'.repeat(40),content:'',isBase64:true,size:1024*1024,mode:'100644',nativeRef:{version:'version',path:`dir/${i}.bin`}});
+ const files=[...Array.from({length:600},(_,i)=>file(i)),{path:'metadata.txt',sha:'b'.repeat(40),content:'meta',isBase64:false},file(600)];
+ const batches:number[]=[];let chunks=0,transfers=0,releases=0;
+ nativeGitBridge.addListener=async()=>({remove:async()=>{}});nativeGitBridge.prepareUpload=async()=>{};nativeGitBridge.release=async()=>{releases++;};
+ nativeGitBridge.appendDocuments=async value=>{const batch=value.files as any[];batches.push(batch.length);assert.ok(batch.length<=256);assert.ok(batch.every(file=>!('content' in file)&&file.nativeRef));};
+ nativeGitBridge.appendDocument=async()=>assert.fail('Per-file bridge calls must not be used');
+ nativeGitBridge.appendChunk=async()=>{chunks++;};nativeGitBridge.transfer=async()=>{transfers++;return{verified:true};};
+ await nativeGitTransfer('push',{owner:'me',repo:'repo',expectedRepoId:1,files},'',new AbortController().signal);
+ assert.deepEqual(batches,[256,256,88,1]);assert.equal(chunks,1);assert.equal(transfers,1);assert.equal(releases,1);
+ nativeGitBridge.appendDocuments=async()=>{throw new Error('文件变化');};
+ await assert.rejects(nativeGitTransfer('push',{owner:'me',repo:'repo',expectedRepoId:1,files},'',new AbortController().signal),/文件变化/);
+ assert.equal(transfers,1);assert.equal(releases,2);
+});
 test('native Git cancellation returns immediately, tells the plugin to stop, and removes progress listeners',async()=>{
  Capacitor.isNativePlatform=()=>true;Capacitor.getPlatform=()=> 'android';Capacitor.isPluginAvailable=()=>true;
  let started=false,id='',cancelled='',removed=false,finish!:(value:unknown)=>void;

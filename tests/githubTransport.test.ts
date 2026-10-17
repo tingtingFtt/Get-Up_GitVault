@@ -19,6 +19,30 @@ function fixture(options: Parameters<typeof createGithubTransport>[0] = {}) {
   return { transport, clock, request, calls, waits, sleeps, handle: (value: typeof handler) => { handler = value; } };
 }
 
+test('streamed downloads share rate-limit cooldown and do not consume rejected response bodies as archives', async () => {
+  const f = fixture();let calls = 0, consumers = 0;
+  f.handle(async () => ++calls === 1 ? ok({ message: 'secondary rate limit' }, 403, { 'retry-after': '2' }) : new Response(new Uint8Array([1, 2, 3])));
+  const result = await f.transport.stream('https://api.github.com/archive', {}, new AbortController().signal, async response => { consumers++; return [...new Uint8Array(await response.arrayBuffer())]; });
+  assert.deepEqual(result, [1, 2, 3]);assert.equal(consumers, 1);assert.equal(f.calls[1].at - f.calls[0].at, 2000);
+});
+test('streamed downloads retain read slots until their consumers finish', async () => {
+  const f = fixture({ requestInterval: 0 });let started = 0;const finish: Array<() => void> = [];
+  const first = Array.from({ length: 3 }, () => f.transport.stream('https://api.github.com/archive', {}, new AbortController().signal, async () => { started++; await new Promise<void>(resolve => finish.push(resolve)); }));
+  while (started < 3) await new Promise(resolve => setImmediate(resolve));
+  const controller = new AbortController(), queued = f.transport.stream('https://api.github.com/archive', {}, controller.signal, async () => assert.fail('Cancelled queued download must never start'));
+  controller.abort();await assert.rejects(queued, { name: 'AbortError' });assert.equal(f.calls.length, 3);
+  finish.forEach(resolve => resolve());await Promise.all(first);
+});
+test('stream idle deadlines reset on activity and abort stalled consumers with a timeout reason', async () => {
+  const f = fixture({ requestInterval: 0 });let controlled: AbortSignal | undefined;
+  const result = await f.transport.stream('https://api.github.com/archive', {}, new AbortController().signal, async (_response, touch, signal) => {
+    controlled = signal;for (let i = 0; i < 4; i++) { await new Promise(resolve => setTimeout(resolve, 70));touch(); }return 'complete';
+  }, 200);
+  assert.equal(result, 'complete');assert.equal(controlled?.aborted, false);
+  await assert.rejects(f.transport.stream('https://api.github.com/archive', {}, new AbortController().signal, async (_response, _touch, signal) => { controlled = signal; return new Promise(() => {}); }, 30), { name: 'TimeoutError' });
+  assert.equal(controlled?.aborted, true);
+});
+
 test('all mutation types share one queue with at least 1.1 seconds between completed writes', async () => {
   const f = fixture(); let active = 0, maximum = 0;
   f.handle(async () => { maximum = Math.max(maximum, ++active); await Promise.resolve(); active--; return ok(); });

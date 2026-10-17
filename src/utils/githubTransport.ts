@@ -108,16 +108,19 @@ export function createGithubTransport(options: TransportOptions = {}) {
     finally { readers--; for (const wake of readWaiters) wake(); }
   };
   // The network deadline starts after queue/cooldown waits, not before them.
-  const fetchOnce = async (url: string, init: RequestInit, signal: AbortSignal, timeout: number, attempt: number) => {
+  const fetchOnce = async <T>(url: string, init: RequestInit, signal: AbortSignal, timeout: number, attempt: number, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idle: boolean) => {
     signal.throwIfAborted();
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
     signal.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new DOMException('GitHub 请求超时，请重试', 'TimeoutError')), timeout);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let closed = false;
+    const touch = () => { if (closed || controller.signal.aborted) return; clearTimeout(timer); timer = setTimeout(() => controller.abort(new DOMException('GitHub 请求超时，请重试', 'TimeoutError')), timeout); };
+    touch();
     try {
       const response = await fetch(url, { ...init, signal: controller.signal });
-      const bytes = await response.arrayBuffer();
       if (!response.ok) {
+        const bytes = await response.arrayBuffer();
         let message = new TextDecoder().decode(bytes);
         try { message = JSON.parse(message).message || message; } catch { /* GitHub can return a non-JSON gateway error. */ }
         const limited = [403, 429].includes(response.status) && (response.status === 429 || response.headers.get('x-ratelimit-remaining') === '0' || response.headers.has('retry-after') || /rate limit|secondary limit/i.test(message));
@@ -133,20 +136,23 @@ export function createGithubTransport(options: TransportOptions = {}) {
         }
         throw new GitHubError(`GitHub (${response.status}): ${message.slice(0, 450)}`, response.status, limited, retryAt);
       }
-      return new Response(response.status === 204 ? null : bytes, { status: response.status, headers: response.headers });
+      if (idle) touch();
+      // Keep the queue slot, cancellation and idle deadline until the streamed
+      // consumer has finished; never buffer an archive in the transport.
+      const result = await abortable(consume(response, idle ? touch : () => {}, controller.signal), controller.signal);
+      controller.signal.throwIfAborted();return result;
     } catch (error) {
       if (signal.aborted) throw signal.reason;
       if (controller.signal.aborted) throw controller.signal.reason;
       throw error;
-    } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
+    } finally { closed = true; clearTimeout(timer); signal.removeEventListener('abort', abort); }
   };
-  return {
-    async request(url: string, init: RequestInit, signal: AbortSignal, timeout = 45000): Promise<Response> {
+  const executeRequest = async <T>(url: string, init: RequestInit, signal: AbortSignal, timeout: number, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idle=false): Promise<T> => {
       const write = !['GET', 'HEAD', 'OPTIONS'].includes((init.method || 'GET').toUpperCase());
       const execute = async () => {
         for (let attempt = 0; ; attempt++) {
           await admit(write, signal);
-          try { return await fetchOnce(url, init, signal, timeout, attempt); }
+          try { return await fetchOnce(url, init, signal, timeout, attempt, consume, idle); }
           catch (error) {
             signal.throwIfAborted();
             if (!(error instanceof GitHubError) || !error.rateLimited) throw error;
@@ -169,6 +175,14 @@ export function createGithubTransport(options: TransportOptions = {}) {
       });
       writeTail = settled;
       return abortable(pending, signal);
+    };
+  return {
+    request(url: string, init: RequestInit, signal: AbortSignal, timeout = 45000): Promise<Response> {
+      return executeRequest(url, init, signal, timeout, async response => new Response(response.status === 204 ? null : await response.arrayBuffer(), { status: response.status, headers: response.headers }));
+    },
+    stream<T>(url: string, init: RequestInit, signal: AbortSignal, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idleTimeout = 60000): Promise<T> {
+      if (!['GET', 'HEAD'].includes((init.method || 'GET').toUpperCase())) throw new Error('流式接口仅用于下载');
+      return executeRequest(url, init, signal, idleTimeout, consume, true);
     },
   };
 }

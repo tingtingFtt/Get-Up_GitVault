@@ -7,6 +7,7 @@ import type { TargetHealth, TargetIdentity } from './targetLifecycle';
 import { githubTransport, GitHubError } from './githubTransport';
 export { GitHubError } from './githubTransport';
 import { gitServiceConfig, gitServiceTransfer } from './gitService';
+import { measureTransfer } from './transferMetrics';
 
 export interface RepoEntry {
   path: string;
@@ -116,6 +117,7 @@ function base64FromBytes(bytes: Uint8Array) {
 }
 
 async function cachedFile(entry: RepoEntry, bytes: Uint8Array): Promise<CachedFile> {
+  if (entry.size !== undefined && bytes.length !== entry.size) throw new Error(`文件大小校验失败: ${entry.path}`);
   if (await gitBlobSha(bytes) !== entry.sha) throw new Error(`文件校验失败: ${entry.path}`);
   let content: string;
   let isBase64 = false;
@@ -151,6 +153,7 @@ export const githubClient = {
   async fetchRepo(url: string, branch?: string, token?: string, options: TransferOptions = {}) {
     const signal = options.signal || operation.signal;
     const { owner, repo, linkedRef } = parseRepository(url);
+    return measureTransfer({action:'拉取',project:`${owner}/${repo}`,branch,mode:gitServiceConfig().mode,signal}, async trace => {
     progress('正在识别仓库和分支…', options);
     const meta = await json(root(owner, repo), token, {}, signal);
     const ref = options.ref || await resolveRef(owner, repo, linkedRef, branch, token, signal) || meta.default_branch;
@@ -159,11 +162,13 @@ export const githubClient = {
     // ZIPs do not include submodule contents. Never claim those projects are completely cached.
     if (tree.some(item => item.type === 'commit')) throw new Error('项目包含 Git 子模块，需要单独获取子模块内容；本次未标记为完整下载');
     const entries = tree.filter(item => item.type === 'blob');
+    trace.branch(branch || (linkedRef ? ref : meta.default_branch));trace.phase('准备本地目录与恢复进度');
     const folder = usesNativeFolder() ? await beginFolder(JSON.stringify([meta.id || `${owner}/${repo}`, branch || (linkedRef ? ref : meta.default_branch)]), commit.sha, repo, entries) : undefined;
     const checkpoint = typeof window !== 'undefined' && typeof indexedDB !== 'undefined' ? transferCache : undefined;
     const transfer = `${owner}/${repo}@${commit.sha}`;
     const resumed = folder ? folder.files as CachedFile[] : checkpoint ? await checkpoint.load(transfer) : [];
     const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
+    const previousBlobs = new Map([...previous.values()].filter(file => !file.nativeRef).map(file => [file.sha, file]));
     const files = new Map<string, CachedFile>();
     let pendingParts: CachedFile[] = [], pendingBytes = 0, saving = Promise.resolve();
     const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
@@ -176,10 +181,11 @@ export const githubClient = {
     let done = 0, nativeFolderFinished=false;
     const missing: RepoEntry[] = [];
     for (const entry of entries) {
-      const old = previous.get(entry.path);
-      if (old?.sha === entry.sha) { await storeFile({ ...old, mode: entry.mode }); done++; }
+      const old = previous.get(entry.path)?.sha === entry.sha ? previous.get(entry.path) : previousBlobs.get(entry.sha);
+      if (old?.sha === entry.sha) { await storeFile({ ...old, path: entry.path, mode: entry.mode }); done++; }
       else missing.push(entry);
     }
+    trace.phase('获取、校验并保存文件（含排队等待）');
     if (gitServiceConfig().mode !== 'rest' && missing.length) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
@@ -192,6 +198,7 @@ export const githubClient = {
       let result;
       try { result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha, folderVersion: folder?.id, totalBytes: entries.reduce((n, entry) => n + (entry.size || 0), 0) }, token || '', signal, { onFile: acceptFile, paths: missing.map(entry => entry.path) }); }
       finally { await flushParts(); }
+      trace.native(result.timings);
       if (result.commitSha !== commit.sha || result.treeSha !== commit.commit.tree.sha || !Array.isArray(result.files) || result.files.length !== entries.length) throw new Error('Git 拉取结果与选定快照不一致，本地原版本已保留');
       const received = new Set<string>();
       for (const remote of result.files) {
@@ -204,53 +211,51 @@ export const githubClient = {
       }
       done = files.size;nativeFolderFinished=!!result.folder;
     }
-    // A large initial import is cheaper as one archive; each downloaded blob is still verified.
-    // Browser archive redirects can fail CORS, so each channel has its own catch/deadline.
+    // Stream large initial snapshots too: keep neither the complete ZIP nor
+    // all inflated bytes alongside the cached source bodies in memory.
     const remainingBytes = missing.reduce((sum, entry) => sum + (entry.size || 0), 0);
-    if (missing.length > 12 && remainingBytes <= 32 * 1024 * 1024 && files.size !== entries.length) {
+    if (missing.length > 12 && files.size !== entries.length) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
+      const { readArchive } = await import('./archiveDownload');
       for (const archiveUrl of archiveUrls) {
         signal.throwIfAborted();
         try {
-          progress(`正在下载完整压缩包（${entries.length} 个文件）…`, options);
-          const response = await request(archiveUrl, token, {}, signal, 30000);
-          const { default: JSZip } = await import('jszip');
-          const zip = await JSZip.loadAsync(await response.arrayBuffer());
-          const prefix = Object.keys(zip.files)[0]?.split('/')[0] + '/';
-          for (const entry of missing) {
-            signal.throwIfAborted();
-            const item = zip.file(prefix + entry.path);
-            if (!item) throw new Error(`压缩包缺少文件: ${entry.path}`);
-            const bytes = await item.async('uint8array');
-            const file = await cachedFile(entry, bytes);
-            await storeFile(file);
-            progress(`正在校验并解压 ${++done}/${entries.length}：${entry.path}`, options);
-            if (done % 25 === 0) await new Promise(resolve => setTimeout(resolve, 0));
-          }
+          progress(`正在流式下载压缩包（${entries.length} 个文件）…`, options);
+          let lastReport = 0;
+          await githubTransport.stream(archiveUrl, { headers: headers(token) }, signal, (response, touch, downloadSignal) =>
+            readArchive(response, missing.filter(entry => !files.has(entry.path)), downloadSignal, async (entry, bytes) => {
+              const file = await cachedFile(entry, bytes); await storeFile(file); done++;
+              if (Date.now() - lastReport >= 200 || done === entries.length) { lastReport = Date.now(); progress(`正在解压、校验并保存 ${done}/${entries.length}：${entry.path}`, options); }
+            }, bytes => { if (Date.now() - lastReport >= 500) { lastReport = Date.now(); progress(`正在接收压缩包 ${(bytes / 1024 / 1024).toFixed(1)} MiB · 已保存 ${done}/${entries.length}`, options); } }, touch));
           break;
         } catch (error) {
           await flushParts();
           if (signal.aborted) throw signal.reason;
           if (error instanceof GitHubError && error.rateLimited) throw error;
-          // Reuse verified entries even when an archive was only partially usable.
           done = files.size;
-          progress('压缩包不可用，正在切换逐文件下载…', options);
+          progress('压缩包不可用，保留已验证文件并补齐缺失内容…', options);
+          if (files.size === entries.length) break;
         }
       }
     }
-    try { await mapConcurrent(missing.filter(e => !files.has(e.path)), remainingBytes > 32 * 1024 * 1024 ? 2 : 5, async entry => {
+    // Identical Git blobs at different paths need one download and one hash.
+    const blobs = new Map<string, RepoEntry[]>();
+    for (const entry of missing) if (!files.has(entry.path)) { const aliases = blobs.get(entry.sha); if (aliases) aliases.push(entry); else blobs.set(entry.sha, [entry]); }
+    const reusableBlobs = new Map([...files.values()].filter(file => !file.nativeRef).map(file => [file.sha, file]));
+    try { await mapConcurrent([...blobs.values()], remainingBytes > 32 * 1024 * 1024 ? 2 : 3, async aliases => {
       signal.throwIfAborted();
-      const data = await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal);
-      const bytes = bytesFromBase64(data.content);
-      const file = await cachedFile(entry, bytes);
-      await storeFile(file);
-      progress(`正在下载并校验 ${++done}/${entries.length}：${entry.path}`, options);
+      const entry = aliases[0];
+      const reused = reusableBlobs.get(entry.sha);
+      const file = reused || await cachedFile(entry, bytesFromBase64((await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal)).content));
+      for (const alias of aliases) { if (alias.size !== undefined && alias.size !== file.size) throw new Error('相同内容的文件大小不一致：' + alias.path); await storeFile({ ...file, path: alias.path, mode: alias.mode }); done++; }
+      progress(`正在下载并校验 ${done}/${entries.length}：${entry.path}`, options);
     }); } finally { await flushParts(); }
     if (files.size !== entries.length) throw new Error('文件下载不完整，已保留原版本，请重试');
     // LFS pointer files are project files, but not the binary objects they reference.
     const lfsPointers = [...files.values()].filter(f => !f.isBase64 && f.content.startsWith('version https://git-lfs.github.com/spec/v1')).map(f => f.path);
     if (lfsPointers.length) throw new Error(`项目包含 Git LFS 文件（${lfsPointers.slice(0, 3).join('、')}），当前无法完整保存其大文件内容`);
+    trace.phase('验证完整快照');
     progress(`文件已校验 ${files.size}/${entries.length}，正在保存缓存…`, options);
     if(folder&&!nativeFolderFinished)await folderBridge.finish({version:folder.id});
     const completedFiles=entries.map(e=>files.get(e.path)!) as FolderFiles;
@@ -261,6 +266,7 @@ export const githubClient = {
       repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url },
       tree, files: completedFiles, cachedFilesCount: files.size, isFullyCached: true,
     };
+    });
   },
 
   async getFile(owner: string, repo: string, path: string, token?: string, ref?: string) {
@@ -363,17 +369,20 @@ export const githubClient = {
 
   async push(targetOwner: string, targetRepo: string, targetBranch: string, token: string, files: CachedFile[], commitMessage: string, description?: string, remark?: string, originalSourceUrl?: string, options: { rebaseOnConflict?: boolean; expectedRepoId?: number } = {}) {
     const signal = operation.signal;
+    return measureTransfer({action:'上传',project:`${targetOwner}/${targetRepo}`,branch:targetBranch,target:`${targetOwner}/${targetRepo}:${targetBranch}`,mode:gitServiceConfig().mode,signal}, async trace => {
     await confirmFolderUpload(files);
     const base = root(targetOwner, targetRepo);
     const identity = await githubClient.repository(targetOwner, targetRepo, token, options.expectedRepoId, signal);
     const meta = { id: identity.id, default_branch: identity.defaultBranch };
     const branch = targetBranch || meta.default_branch || 'main';
+    trace.branch(branch);
     const refUrl = `${base}/git/ref/heads/${refPath(branch)}`;
     const readHead = async () => (await json(refUrl, token, { cache: 'no-store' }, signal)).object.sha as string;
     const conflict = (latest: string) => new Error(`目标分支 ${targetOwner}/${targetRepo}:${branch} 在上传期间已变化（${parent.slice(0, 7) || '未创建'} → ${latest.slice(0, 7)}），本次未强制覆盖；本地文件已保留。请重新读取目标分支后重试，或上传到新分支。`);
     let parent = '';
     try { parent = await readHead(); }
     catch (error) { if (!(error instanceof GitHubError) || error.status !== 404 && error.status !== 409) throw error; }
+    trace.phase('准备上传文件');
     const localFiles=hasLocalFolderChanges(files)?files.map(({path,sha,mode,size})=>({path,sha:sha!,mode:mode||'100644',size,type:'blob' as const})):undefined;
     const allFiles = [...files];
     if (description || remark || originalSourceUrl) {
@@ -393,7 +402,9 @@ export const githubClient = {
         signal.throwIfAborted();
         prepared.push({ ...file, sha: file.nativeRef ? file.sha : await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) });
       }
+      trace.phase('原生暂存与 Git 推送（含排队等待）');
       const result = await gitServiceTransfer('push', { owner: identity.owner, repo: identity.repo, expectedRepoId: identity.id, branch, files: prepared, message: commitMessage, rebaseOnConflict: !!options.rebaseOnConflict }, token, signal);
+      trace.native(result.timings);trace.phase('验证目标提交与分支');
       if (!result.verified || result.repoId !== identity.id || result.branch !== branch || !/^[a-f0-9]{40}$/.test(result.commitSha) || !/^[a-f0-9]{40}$/.test(result.treeSha)) throw new Error('Git 推送回执无效，本地缓存已保留');
       const committed = await json(`${base}/git/commits/${result.commitSha}`, token, { cache: 'no-store' }, signal);
       const tree = await getTree(targetOwner, targetRepo, result.treeSha, token, signal);
@@ -401,6 +412,7 @@ export const githubClient = {
       if (committed.tree.sha !== result.treeSha || blobs.length !== prepared.length || tree.some(item => item.type === 'commit') || blobs.some(item => item.sha !== expected.get(item.path)?.sha || item.mode !== (expected.get(item.path)?.mode || '100644')) || await readHead() !== result.commitSha) throw new Error('Git 推送后的文件或分支校验失败，本地缓存已保留，请检查目标最新提交');
       return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: identity.id, commitSha: result.commitSha as string, treeSha: result.treeSha as string, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length, ...(localFiles?{localFiles}:{}) };
     }
+    trace.phase('比较目标并合并上传文件（含排队等待）');
     let parentTree = '';
     const existing = new Map<string, RepoEntry>();
     if (parent) {
@@ -437,7 +449,7 @@ export const githubClient = {
       // Small UTF-8 sources can be created in one tree request. Binary and large
       // files retain verified blob checkpoints. Never send both content and sha.
       const inlineSize = new TextEncoder().encode(JSON.stringify(file.content)).length;
-      if (allFiles.length >= 4 && !file.isBase64 && old?.sha !== hash && !verifiedBlobs.has(hash) && inlineSize <= 128 * 1024 && !acknowledged.has(hash)) {
+      if (allFiles.length >= 4 && !file.isBase64 && old?.sha !== hash && !verifiedBlobs.has(hash) && inlineSize <= 512 * 1024 && !acknowledged.has(hash)) {
         if (inlineSize > inlineBudget) await flushText();
         inlineBudget -= inlineSize; inlineCount++;
         progress(`正在合并文本文件 ${++done}/${allFiles.length}：${file.path}`);
@@ -464,6 +476,13 @@ export const githubClient = {
       progress(`正在上传并校验 ${++done}/${allFiles.length}：${file.path}`);
       return { path: file.path, mode: file.mode || '100644', type: 'blob', sha };
     });
+    // No content changed: verify the same target head and avoid even a tree
+    // mutation. This also avoids consuming write budget for repeated uploads.
+    if (parent && ![...existing.values()].some(item => item.type === 'commit') && expectedFiles.length === [...existing.values()].filter(item => item.type === 'blob').length && expectedFiles.every(file => existing.get(file.path)?.sha === file.sha && existing.get(file.path)?.mode === file.mode) && await readHead() === parent) {
+      progress('目标分支内容一致，已跳过重复上传');
+      return { success: true, verified: true, unchanged: true, repoPrivate: identity.private as boolean | undefined, repoId: meta.id as number | undefined, commitSha: parent, treeSha: parentTree, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: 0, ...(localFiles?{localFiles}:{}) };
+    }
+    trace.phase('生成提交并验证目标分支');
     // Build an exact snapshot. Omitting base_tree applies source deletions as well.
     let treeSha: string;
     if (treeItems.length) treeSha = (await json(`${base}/git/trees`, token, body('POST', { tree: treeItems }))).sha;
@@ -509,6 +528,7 @@ export const githubClient = {
       progress('目标分支出现新提交，正在接续最新历史创建覆盖更新…');
     }
     throw new Error('目标分支持续变化，已停止重试并保留本地文件');
+    });
   },
 
   async fetchBranches(url: string, token?: string, signal?: AbortSignal): Promise<string[]> {

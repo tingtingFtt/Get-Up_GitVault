@@ -84,4 +84,41 @@ public class ManagedFolderStoreTest {
             f.store.clear("large","large",false);assertTrue(f.store.describe(id,false,null).getBoolean("missing"));
         }
     }
+    @Test public void batchDocumentStagingPreservesBytesNamesAndModesAcrossSharedDirectories()throws Exception{
+        try(Fixture f=new Fixture()){
+            JSArray expected=new JSArray();Map<String,byte[]> bytes=new LinkedHashMap<>();
+            for(int i=0;i<150;i++){String path="目录/group-"+(i%3)+"/file-"+i+(i%2==0?".bin":"");byte[] body=i==0?new byte[0]:("源码-"+i+"\n").getBytes(StandardCharsets.UTF_8);bytes.put(path,body);JSObject file=entry(path,body);file.put("mode",i==1?"100755":"100644");expected.put(file);}
+            String id=f.begin("batch",expected).getString("id");for(int i=0;i<expected.length();i++){JSONObject file=expected.getJSONObject(i);byte[] body=bytes.get(file.getString("path"));f.store.write(id,file.getString("path"),body.length,file.getString("sha"),file.getString("mode"),new ByteArrayInputStream(body),null);}f.store.finish(id);
+            JSArray handles=new JSArray(f.store.describe(id,false,null).getJSONArray("files").toString());File gitDir=new File(f.home,"batch-git");
+            try(Git git=Git.init().setBare(true).setDirectory(gitDir).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),gitDir,new AtomicBoolean());ManagedFolderStore.ReadBatch reader=f.store.readBatch()){
+                store.appendDocuments(handles,reader,message->{});ObjectId tree=store.writeTree(expected);
+                try(org.eclipse.jgit.treewalk.TreeWalk walk=new org.eclipse.jgit.treewalk.TreeWalk(git.getRepository())){walk.addTree(tree);walk.setRecursive(true);int count=0;while(walk.next()){String path=walk.getPathString();assertArrayEquals(bytes.get(path),git.getRepository().open(walk.getObjectId(0)).getBytes());assertEquals(path.endsWith("file-1")?FileMode.EXECUTABLE_FILE:FileMode.REGULAR_FILE,walk.getFileMode(0));count++;}assertEquals(bytes.size(),count);}
+            }
+        }
+    }
+    @Test public void failedOrCancelledDocumentBatchesCannotPublishTheExpectedTree()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] body="original".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",body));String id=f.begin("changed",expected).getString("id");f.store.write(id,"a",body.length,hash(body),"100644",new ByteArrayInputStream(body),null);f.store.finish(id);JSArray handles=new JSArray(f.store.describe(id,false,null).getJSONArray("files").toString());
+            Files.write(f.content(id,"a").toPath(),"modified".getBytes(StandardCharsets.UTF_8));AtomicBoolean stop=new AtomicBoolean();File gitDir=new File(f.home,"failed-git");
+            try(Git git=Git.init().setBare(true).setDirectory(gitDir).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),gitDir,stop);ManagedFolderStore.ReadBatch reader=f.store.readBatch()){
+                try{store.appendDocuments(handles,reader,message->{});fail("Changed source must stop before push");}catch(IOException correct){assertTrue(correct.getMessage().contains("变化"));}
+                try{store.writeTree(expected);fail("Failed batch must not publish");}catch(IOException correct){}
+                stop.set(true);try{store.appendDocuments(handles,reader,message->{});fail("Cancelled batch must stop");}catch(IOException correct){assertTrue(correct.getMessage().contains("取消"));}
+            }
+        }
+    }
+    @Test public void indexedGitFetchStillDetectsChangesBeforePublishingItsFolder()throws Exception{
+        try(Fixture f=new Fixture()){
+            File gitDir=new File(f.home,"fetch-git");try(Git git=Git.init().setBare(true).setDirectory(gitDir).call()){
+                JSArray source=new JSArray();for(int i=0;i<20;i++){JSObject file=new JSObject();file.put("path","shared/f"+i+".txt");file.put("content","text-"+i);file.put("mode","100644");source.put(file);}
+                ObjectId tree=GitVaultGitPlugin.writeSnapshot(git.getRepository(),source,new AtomicBoolean()),commit;
+                try(ObjectInserter insert=git.getRepository().newObjectInserter()){CommitBuilder builder=new CommitBuilder();PersonIdent author=new PersonIdent("test","test@example.invalid");builder.setAuthor(author);builder.setCommitter(author);builder.setTreeId(tree);builder.setMessage("source");commit=insert.insert(builder);insert.flush();}
+                try(GitSnapshotStore objects=new GitSnapshotStore(git.getRepository(),gitDir,new AtomicBoolean())){
+                    JSArray expected=new JSArray(objects.describe(commit.name()).getJSONArray("files").toString());String id=f.begin(commit.name(),expected).getString("id");
+                    try{f.store.fetch(id,git.getRepository(),expected,new AtomicBoolean(),message->{if(message.contains("完整快照"))try{Files.write(f.content(id,"shared/f0.txt").toPath(),new byte[]{1});}catch(Exception error){throw new RuntimeException(error);}});fail("Final disk verification must detect external changes");}catch(IOException correct){assertTrue(correct.getMessage().contains("变化"));}
+                    assertEquals("staging",f.store.describe(id,false,null).getString("state"));
+                }
+            }
+        }
+    }
 }

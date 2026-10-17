@@ -7,6 +7,7 @@ interface NativeGit {
  transfer(options: Record<string, unknown>): Promise<any>;
  prepareUpload(options: Record<string, unknown>): Promise<void>;
  appendDocument(options: Record<string, unknown>): Promise<void>;
+ appendDocuments(options: Record<string, unknown>): Promise<void>;
  appendChunk(options: Record<string, unknown>): Promise<void>;
  readChunk(options: Record<string, unknown>): Promise<{offset:number;bytes:number;done:boolean;content:string}>;
  release(options: {id:string}): Promise<void>;
@@ -17,6 +18,7 @@ const plugin=registerPlugin<NativeGit>('GitVaultGit');
 export const nativeGitBridge: NativeGit={
  transfer:options=>plugin.transfer(options),prepareUpload:options=>plugin.prepareUpload(options),
  appendDocument:options=>plugin.appendDocument(options),
+ appendDocuments:options=>plugin.appendDocuments(options),
  appendChunk:options=>plugin.appendChunk(options),readChunk:options=>plugin.readChunk(options),release:options=>plugin.release(options),
  cancel:options=>plugin.cancel(options),addListener:(name,listener)=>plugin.addListener(name,listener)
 };
@@ -41,10 +43,16 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
    const files=sourceFiles||[];let completed=0;
    const totalBytes=files.reduce((sum,file)=>sum+(file.size??(file.isBase64?base64Size(file.content.replace(/\s/g,'')):new TextEncoder().encode(file.content).length)),0);
    await nativeGitBridge.prepareUpload({id,totalBytes});signal.throwIfAborted();
-   for(const file of files){
+   for(let index=0;index<files.length;){
+    const file=files[index];
     const metadata={id,path:file.path,sha:file.sha,mode:file.mode||'100644'};
     if(file.nativeRef){
-     await nativeGitBridge.appendDocument({...metadata,nativeRef:file.nativeRef,size:file.size});
+     const batch=[];
+     while(index<files.length&&files[index].nativeRef&&batch.length<256){
+      const next=files[index++];batch.push({path:next.path,sha:next.sha,mode:next.mode||'100644',nativeRef:next.nativeRef,size:next.size});
+     }
+     signal.throwIfAborted();await nativeGitBridge.appendDocuments({id,files:batch});completed+=batch.length;
+     report(`原生 Git：已批量暂存 ${completed}/${files.length}`);continue;
     }else if(file.isBase64){
      const text=file.content.replace(/\s/g,'');let offset=0;
      for(let at=0;at<text.length||at===0;at+=encodedChunkSize){
@@ -57,6 +65,7 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
       signal.throwIfAborted();await nativeGitBridge.appendChunk({...metadata,offset,content:encode(bytes.subarray(offset,offset+NATIVE_CHUNK_BYTES)),done:offset+NATIVE_CHUNK_BYTES>=bytes.length});
      }
     }
+    index++;
     report(`原生 Git：已分块暂存 ${++completed}/${files.length}：${file.path}`);
    }
    signal.throwIfAborted();return nativeGitBridge.transfer({...identity,action,id,token,files:files.map(file=>({path:file.path,sha:file.sha,mode:file.mode||'100644'}))});

@@ -59,7 +59,7 @@ test('native folder fetch and push move metadata through the bridge, never file 
  enable();const file=nativeFile({path:'huge.bin',content:'',isBase64:true,sha:'a'.repeat(40),size:512*1024*1024,mode:'100644'});
  mock.method(nativeGitBridge,'addListener',async()=>({remove:async()=>{}}));mock.method(nativeGitBridge,'release',async()=>{});mock.method(nativeGitBridge,'prepareUpload',async()=>{});
  mock.method(nativeGitBridge,'readChunk',async()=>{assert.fail('No body should cross the bridge');});mock.method(nativeGitBridge,'appendChunk',async()=>{assert.fail('Document streams must stay native');});
- let streamed=0;mock.method(nativeGitBridge,'appendDocument',async(value:any)=>{assert.equal(value.size,file.size);assert.deepEqual(value.nativeRef,file.nativeRef);streamed++;});
+ let streamed=0;mock.method(nativeGitBridge,'appendDocuments',async(value:any)=>{assert.equal(value.files.length,1);assert.equal(value.files[0].size,file.size);assert.deepEqual(value.files[0].nativeRef,file.nativeRef);streamed++;});
  mock.method(nativeGitBridge,'transfer',async(value:any)=>value.action==='fetch'?{folder:true,chunked:true,files:[file]}:{verified:true});
  let accepted=0;await nativeGitTransfer('fetch',{owner:'a',repo:'b',expectedRepoId:1,folderVersion:'version'},'',new AbortController().signal,{onFile:async value=>{assert.deepEqual(value.nativeRef,file.nativeRef);accepted++;}});
  await nativeGitTransfer('push',{owner:'a',repo:'b',expectedRepoId:1,files:[file]},'',new AbortController().signal);assert.equal(accepted,1);assert.equal(streamed,1);
