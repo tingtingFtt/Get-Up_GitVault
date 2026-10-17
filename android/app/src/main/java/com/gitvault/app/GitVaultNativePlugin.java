@@ -138,6 +138,7 @@ public class GitVaultNativePlugin extends Plugin {
     @PluginMethod public void folderAttach(PluginCall call){folderTask(call,store->store.attach(call.getString("version",""),call.getString("owner",""),call.getString("ref",""),call.getBoolean("history",false)));}
     private JSObject cleanParts(JSObject result)throws Exception{org.json.JSONArray ids=result.getJSONArray("ids");for(String key:new java.util.ArrayList<>(folderParts.keySet()))for(int i=0;i<ids.length();i++)if(key.startsWith(ids.getString(i)+":")){File part=folderParts.remove(key);if(part!=null&&!part.delete()&&part.exists())throw new java.io.IOException("临时分块清理失败");}return result;}
     @PluginMethod public void folderClear(PluginCall call){folderTask(call,store->cleanParts(store.clear(call.getString("owner",""),call.getString("ref",""),call.getBoolean("force",false),call.getArray("verifiedFiles"))));}
+    @PluginMethod public void folderDiscard(PluginCall call){folderTask(call,store->cleanParts(store.discard(call.getString("version",""))));}
     @PluginMethod public void folderCleanTemporary(PluginCall call){folderTask(call,store->cleanParts(store.cleanTemporary(call.getBoolean("force",false))));}
     @PluginMethod public void folderPut(PluginCall call){folderTask(call,store->{
         String version=call.getString("version",""),path=call.getString("path",""),key=version+":"+path;long offset=call.getData().getLong("offset");String encoded=call.getString("data","");

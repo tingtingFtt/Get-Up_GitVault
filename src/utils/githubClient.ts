@@ -581,13 +581,13 @@ export const githubClient = {
     throw new Error(`分叉仍在创建或缺少分支，请稍后重试以关联已有 Fork：https://github.com/${forkOwner}/${forkName}`);
   },
 
-  async syncAllForkBranches(owner: string, repo: string, token: string, onBranch?: (result: { branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string }) => void) {
+  async syncAllForkBranches(owner: string, repo: string, token: string, onBranch?: (result: { branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string; nativeVersion?:string }) => void) {
     const meta = await json(root(owner, repo), token);
     if (!meta.fork || !meta.parent) throw new Error('目标不是 Fork');
     const sourceOwner = meta.parent.owner.login;
     const sourceRepo = meta.parent.name;
     const branches = await githubClient.fetchBranches(`${sourceOwner}/${sourceRepo}`, token, operation.signal);
-    const results: Array<{ branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string }> = [];
+    const results: Array<{ branch: string; success: boolean; error?: string; sourceSha?: string; commitSha?: string; nativeVersion?:string }> = [];
     for (const branch of branches) {
       operation.signal.throwIfAborted();
       progress(`正在同步分支 ${branch}（${results.length + 1}/${branches.length}）…`);
@@ -595,7 +595,7 @@ export const githubClient = {
         const snapshot = await githubClient.fetchRepo(`${sourceOwner}/${sourceRepo}`, branch, token);
         const uploaded = await githubClient.push(owner, repo, branch, token, snapshot.files, `Sync upstream ${sourceOwner}/${sourceRepo}:${branch} @ ${snapshot.latestCommitSha}`, undefined, undefined, undefined, { rebaseOnConflict: true, expectedRepoId: meta.id });
         if (typeof indexedDB !== 'undefined') await transferCache.clear(snapshot.latestCommitSha);
-        results.push({ branch, success: true, sourceSha: snapshot.latestCommitSha, commitSha: uploaded.commitSha });
+        results.push({ branch, success: true, sourceSha: snapshot.latestCommitSha, commitSha: uploaded.commitSha, ...(snapshot.files.nativeSnapshot?{nativeVersion:snapshot.files.nativeSnapshot.version}:{}) });
       } catch (error) { results.push({ branch, success: false, error: (error as Error).message }); }
       onBranch?.(results[results.length - 1]);
     }

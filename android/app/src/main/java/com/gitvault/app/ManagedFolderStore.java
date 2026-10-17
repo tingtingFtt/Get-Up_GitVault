@@ -136,6 +136,7 @@ final class ManagedFolderStore {
             for(JSONObject value:targets){if(value.getJSONObject("owners").length()<=1)erase(value,force||approved.contains(value.getString("id")));else{value.getJSONObject("owners").remove(owner);save(value);}}JSObject result=new JSObject();result.put("versions",targets.size());result.put("ids",ids);return result;
         }
     }
+    JSObject discard(String id)throws Exception{synchronized(LOCK){JSONObject value=load(id);JSObject result=new JSObject();JSONArray ids=new JSONArray();if(value!=null&&value.getJSONObject("owners").length()==0){erase(value,false);ids.put(id);}result.put("versions",ids.length());result.put("ids",ids);return result;}}
     JSObject cleanTemporary(boolean force)throws Exception{synchronized(LOCK){int count=0;JSONArray ids=new JSONArray();for(JSONObject value:all())if(value.getJSONObject("owners").length()==0){erase(value,force);ids.put(value.getString("id"));count++;}JSObject result=new JSObject();result.put("versions",count);result.put("ids",ids);return result;}}
     JSObject exportFiles(String uri,String prefix,JSArray entries,JSONObject project)throws Exception{
         synchronized(LOCK){DocumentFile destination=walk(root(uri),prefix,true);for(int i=0;i<entries.length();i++){

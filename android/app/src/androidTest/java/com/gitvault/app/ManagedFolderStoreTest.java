@@ -68,7 +68,7 @@ public class ManagedFolderStoreTest {
     @Test public void sharedVersionsAndHistoryHaveIndependentCleanupScopes()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] bytes={1,2,3};JSArray manifest=new JSArray();manifest.put(entry("a",bytes));String id=f.begin("old",manifest).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);f.store.attach(id,"one","old",true);f.store.attach(id,"two","old",false);
-            f.store.clear("one","old",false);assertTrue(f.content(id,"a").exists());assertEquals(0,f.store.cleanTemporary(false).getInt("versions"));f.store.clear("two","old",false);assertTrue(f.store.describe(id,false,null).getBoolean("missing"));
+            assertEquals(0,f.store.discard(id).getInt("versions"));f.store.clear("one","old",false);assertTrue(f.content(id,"a").exists());assertEquals(0,f.store.cleanTemporary(false).getInt("versions"));f.store.clear("two","old",false);assertTrue(f.store.describe(id,false,null).getBoolean("missing"));
         }
     }
     @Test public void nativeDocumentStreamsExceed100MiBWithoutMaterializingTheFile()throws Exception{

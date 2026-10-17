@@ -1974,7 +1974,10 @@ export default config;
       if (item.success && item.sourceSha && item.commitSha) record.bindings[item.branch] = { branch: item.branch, sourceSha: item.sourceSha, commitSha: item.commitSha, updatedAt: record.updatedAt };
       if (!item.success) logOperation('完整分叉分支同步', 'error', repo, `${item.branch}：${item.error}`, '合并上游');
     }
-    if (Object.keys(record.bindings).length) await publishAccountRecord(repo, record, token);
+    if (Object.keys(record.bindings).length) {
+      await publishAccountRecord(repo, record, token);
+      for(const item of results)if(item.success&&item.nativeVersion){try{await folderBridge.discard({version:item.nativeVersion});}catch(error){logOperation('分叉临时文件清理','error',repo,`${item.branch}：${(error as Error).message}`,'分支上传已完成，保留临时目录',error);}}
+    }
   };
 
   const syncFullProject = async (repo: TrackedRepo, token: string, synced?: Awaited<ReturnType<typeof githubClient.syncAllForkBranches>>) => {
