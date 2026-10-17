@@ -51,7 +51,9 @@ function completed(tx: IDBTransaction): Promise<void> {
 }
 async function withDB<T>(task: (db: IDBDatabase) => Promise<T>) {
   const db = await openDB();
-  try { return await task(db); } finally { db.close(); }
+  try { return await task(db); }
+  catch (error) { if ((error as Error).name === 'QuotaExceededError') throw new Error('本地存储空间或浏览器缓存配额不足，请释放空间后重试；原有项目和已保存的下载进度保留', { cause: error }); throw error; }
+  finally { db.close(); }
 }
 export const transferCache = {
   async load(transfer: string): Promise<CachedFile[]> {
@@ -75,7 +77,7 @@ export const transferCache = {
     await withDB(async db => {
       const tx = db.transaction(TRANSFERS, 'readwrite'); const done = completed(tx);
       const store = tx.objectStore(TRANSFERS);
-      for (const item of await read<any[]>(store.index('commitSha').getAll(commitSha))) store.delete(item.id);
+      for (const key of await read<IDBValidKey[]>(store.index('commitSha').getAllKeys(commitSha))) store.delete(key);
       await done;
     });
   },
@@ -113,13 +115,26 @@ export const localCache = {
       prepared.push({ ...file, sha, size: bytes.length });
     }
     await withDB(async db => {
+      // Commit bounded content batches before publishing the snapshot reference.
+      // Existing snapshots stay intact if storage fills up during any batch.
+      let batch: CachedFile[] = [], bytes = 0;
+      const flush = async () => {
+        if (!batch.length) return;
+        const tx = db.transaction(CONTENTS, 'readwrite'), done = completed(tx);
+        for (const file of batch) tx.objectStore(CONTENTS).put({ sha: file.sha, content: file.content, isBase64: file.isBase64 });
+        await done; batch = []; bytes = 0;
+      };
+      for (const file of prepared) { batch.push(file); bytes += file.size || 0; if (bytes >= 4 * 1024 * 1024 || batch.length >= 32) await flush(); }
+      await flush();
       const tx = db.transaction([SNAPSHOTS, CONTENTS, LEGACY, TRANSFERS], 'readwrite');
       const done = completed(tx);
-      for (const file of prepared) tx.objectStore(CONTENTS).put({ sha: file.sha, content: file.content, isBase64: file.isBase64 });
+      // A different tab may have pruned an old snapshot between batches.
+      const present = await Promise.all(prepared.map(file => read(tx.objectStore(CONTENTS).getKey(file.sha!))));
+      prepared.forEach((file, i) => { if (present[i] === undefined) tx.objectStore(CONTENTS).put({ sha: file.sha, content: file.content, isBase64: file.isBase64 }); });
       tx.objectStore(SNAPSHOTS).put({ id: snapshotId(repoId, ref), repoId, ref, savedAt: new Date().toISOString(), files: prepared.map(({ content, ...file }) => file) });
       tx.objectStore(LEGACY).put({ repoId, currentRef: ref });
-      const parts = await read<any[]>(tx.objectStore(TRANSFERS).index('commitSha').getAll(ref));
-      for (const part of parts) tx.objectStore(TRANSFERS).delete(part.id);
+      const partKeys = await read<IDBValidKey[]>(tx.objectStore(TRANSFERS).index('commitSha').getAllKeys(ref));
+      for (const key of partKeys) tx.objectStore(TRANSFERS).delete(key);
       await done;
     });
   },

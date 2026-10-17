@@ -1,4 +1,5 @@
 import { hasNativeGit, nativeGitTransfer } from './nativeGit';
+import type { NativeFetchOptions } from './nativeGit';
 import type { CachedFile } from './localCache';
 
 export interface GitServiceConfig { mode: 'rest' | 'git' | 'native'; url: string }
@@ -34,9 +35,9 @@ export async function testGitService(url: string, signal = new AbortController()
   if (!['fetch','push'].every(item => result.capabilities?.includes(item))) throw new GitServiceError('Git 服务缺少拉取或推送能力');
   return result;
 }
-export async function gitServiceTransfer(action: 'fetch' | 'push', payload: { owner: string; repo: string; expectedRepoId: number; ref?: string; branch?: string; files?: CachedFile[]; message?: string; rebaseOnConflict?: boolean }, token: string, signal: AbortSignal) {
+export async function gitServiceTransfer(action: 'fetch' | 'push', payload: { owner: string; repo: string; expectedRepoId: number; ref?: string; branch?: string; files?: CachedFile[]; message?: string; rebaseOnConflict?: boolean; totalBytes?: number }, token: string, signal: AbortSignal, options: NativeFetchOptions = {}) {
   const config = gitServiceConfig();
-  if (config.mode === 'native') return nativeGitTransfer(action,payload,token,signal);
+  if (config.mode === 'native') return nativeGitTransfer(action,payload,token,signal,options);
   if (config.mode !== 'git') throw new GitServiceError('当前尚未启用 Git 服务传输');
   if (!token) throw new GitServiceError('Git 服务模式需要先填写 GitHub Token', 401);
   await testGitService(config.url, signal); signal.throwIfAborted();

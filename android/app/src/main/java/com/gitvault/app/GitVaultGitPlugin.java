@@ -5,7 +5,6 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -22,20 +21,37 @@ import org.eclipse.jgit.transport.*;
 public class GitVaultGitPlugin extends Plugin {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final ConcurrentHashMap<String,AtomicBoolean> cancelled = new ConcurrentHashMap<>();
-    private static final long MAX_BYTES=100L*1024*1024;
+    private final Map<String,Staged> sessions=new HashMap<>();
+    private static final class Staged {
+        final File folder;final Git git;final GitSnapshotStore store;
+        Staged(File folder,AtomicBoolean stop)throws Exception{this.folder=folder;git=Git.init().setBare(true).setDirectory(folder).call();store=new GitSnapshotStore(git.getRepository(),folder,stop);git.getRepository().getConfig().setString("gc",null,"auto","0");}
+    }
+    private Staged createSession(String id,PluginCall call)throws Exception{
+        File folder=new File(getContext().getCacheDir(),"gitvault-session-"+UUID.randomUUID());
+        Staged staged=null;
+        try{staged=new Staged(folder,cancelled.get(id));long total=call.getData().optLong("totalBytes",0);if(total<0||total>Long.MAX_VALUE/3)throw new IOException("项目大小无效");staged.store.ensureSpace(total*3);sessions.put(id,staged);return staged;}
+        catch(Exception error){if(staged!=null){staged.git.close();}remove(folder);throw error;}
+    }
+    private void releaseSession(String id){Staged staged=sessions.remove(id);if(staged!=null){try{staged.store.close();}catch(Exception ignored){}staged.git.close();remove(staged.folder);}cancelled.remove(id);}
+    @Override public void load(){File[] leftovers=getContext().getCacheDir().listFiles((dir,name)->name.startsWith("gitvault-session-"));if(leftovers!=null)for(File file:leftovers)remove(file);}
+    @Override protected void handleOnDestroy(){for(AtomicBoolean stop:cancelled.values())stop.set(true);io.execute(()->{for(String id:new ArrayList<>(sessions.keySet()))releaseSession(id);});io.shutdown();}
+    @PluginMethod public void prepareUpload(PluginCall call){String id=call.getString("id","");if(id.isEmpty()||cancelled.putIfAbsent(id,new AtomicBoolean())!=null){call.reject("Git 任务 ID 无效");return;}io.execute(()->{try{createSession(id,call);call.resolve();}catch(Exception error){releaseSession(id);call.reject(error.getMessage());}});}
+    @PluginMethod public void readChunk(PluginCall call){chunkCall(call,false);}
+    @PluginMethod public void appendChunk(PluginCall call){chunkCall(call,true);}
+    private void chunkCall(PluginCall call,boolean upload){String id=call.getString("id","");io.execute(()->{try{Staged staged=sessions.get(id);if(staged==null)throw new IOException("Git 临时任务已结束，请重试");if(upload){staged.store.append(call.getData());call.resolve();}else call.resolve(staged.store.readChunk(call.getString("path",""),call.getData().getLong("offset")));}catch(Exception error){call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}});}
+    @PluginMethod public void release(PluginCall call){String id=call.getString("id","");io.execute(()->{releaseSession(id);call.resolve();});}
     @PluginMethod public void cancel(PluginCall call) { String id=call.getString("id","");if(!id.isEmpty())cancelled.computeIfAbsent(id,key->new AtomicBoolean()).set(true);call.resolve(); }
     @PluginMethod public void transfer(PluginCall call) {
-        String id=call.getString("id",""); if(id.isEmpty()||cancelled.putIfAbsent(id,new AtomicBoolean())!=null){call.reject("Git 任务 ID 无效");return;}
-        io.execute(()->{File folder=null;String token=call.getString("token","");
+        String id=call.getString("id","");boolean fetching="fetch".equals(call.getString("action",""));if(id.isEmpty()||(fetching?cancelled.putIfAbsent(id,new AtomicBoolean())!=null:!cancelled.containsKey(id))){call.reject("Git 任务 ID 无效");return;}
+        io.execute(()->{boolean retain=false;String token=call.getString("token","");
             try {
                 String owner=call.getString("owner",""),name=call.getString("repo",""),action=call.getString("action","");
                 if(!owner.matches("[A-Za-z0-9_.-]+")||!name.matches("[A-Za-z0-9_.-]+")||!Arrays.asList("fetch","push").contains(action))throw new IOException("Git 仓库参数无效");
                 AtomicBoolean stop=cancelled.get(id); check(stop);
                 long expectedRepoId=readRepositoryId(call);
                 verifyIdentity(owner,name,expectedRepoId,token,stop);
-                folder=new File(getContext().getCacheDir(),"git-"+UUID.randomUUID());
-                try(Git git=Git.init().setBare(true).setDirectory(folder).call()) {
-                    git.getRepository().getConfig().setString("gc",null,"auto","0");
+                Staged staged=fetching?createSession(id,call):sessions.get(id);if(staged==null)throw new IOException("Git 上传暂存已结束，请重试");
+                { Git git=staged.git;
                     String remote="https://github.com/"+owner+"/"+name+".git";
                     CredentialsProvider credentials=new UsernamePasswordCredentialsProvider("x-access-token",token);
                     ProgressMonitor monitor=new ProgressMonitor(){
@@ -45,10 +61,10 @@ public class GitVaultGitPlugin extends Plugin {
                     if(action.equals("fetch")) {
                         String ref=call.getString("ref","");if(!ref.matches("[a-f0-9]{40}"))throw new IOException("拉取必须固定完整提交 SHA");
                         git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec(ref+":refs/gitvault/source")).setProgressMonitor(monitor).call();
-                        check(stop);result=readSnapshot(git.getRepository(),ref,stop);
+                        check(stop);result=staged.store.describe(ref);retain=true;
                     } else {
                         String branch=call.getString("branch","");if(!Repository.isValidRefName("refs/heads/"+branch))throw new IOException("Git 分支名称无效");
-                        ObjectId tree=writeSnapshot(git.getRepository(),call.getArray("files",new JSArray()),stop);
+                        ObjectId tree=staged.store.writeTree(call.getArray("files",new JSArray()));
                         result=null;
                         for(int attempt=0;attempt<3;attempt++) {
                             check(stop);String head=remoteHead(remote,branch,credentials);
@@ -77,8 +93,8 @@ public class GitVaultGitPlugin extends Plugin {
                     }
                     check(stop);call.resolve(result);
                 }
-            }catch(Exception exception){String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");call.reject(message,cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}
-            finally {if(folder!=null)remove(folder);cancelled.remove(id);}
+            }catch(Exception exception){String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}
+            finally {if(!retain)releaseSession(id);}
         });
     }
     private void progress(String id,String message){JSObject value=new JSObject();value.put("id",id);value.put("message","原生 Git："+message);notifyListeners("progress",value);}
@@ -115,14 +131,14 @@ public class GitVaultGitPlugin extends Plugin {
         JSObject result=new JSObject();JSArray files=new JSArray();long total=0;
         try(RevWalk walk=new RevWalk(repository);TreeWalk tree=new TreeWalk(repository)) {
             org.eclipse.jgit.revwalk.RevCommit commit=walk.parseCommit(ObjectId.fromString(ref));tree.addTree(commit.getTree());tree.setRecursive(true);
-            while(tree.next()){check(stop);if(tree.getFileMode(0)==FileMode.GITLINK)throw new IOException("项目包含暂不支持的子模块");ObjectLoader loader=repository.open(tree.getObjectId(0));total+=loader.getSize();if(total>MAX_BYTES)throw new IOException("项目超过 100 MiB 上限");byte[] bytes=loader.getBytes((int)MAX_BYTES);if(new String(bytes,0,Math.min(bytes.length,50),StandardCharsets.UTF_8).startsWith("version https://git-lfs.github.com/spec/v1"))throw new IOException("项目包含未下载的 LFS 大文件");JSObject file=new JSObject();file.put("path",tree.getPathString());file.put("sha",tree.getObjectId(0).name());file.put("mode",Integer.toOctalString(tree.getFileMode(0).getBits()));file.put("encoding","base64");file.put("content",android.util.Base64.encodeToString(bytes,android.util.Base64.NO_WRAP));files.put(file);}
+            while(tree.next()){check(stop);if(tree.getFileMode(0)==FileMode.GITLINK)throw new IOException("项目包含暂不支持的子模块");ObjectLoader loader=repository.open(tree.getObjectId(0));total+=loader.getSize();byte[] bytes=loader.getBytes();if(new String(bytes,0,Math.min(bytes.length,50),StandardCharsets.UTF_8).startsWith("version https://git-lfs.github.com/spec/v1"))throw new IOException("项目包含未下载的 LFS 大文件");JSObject file=new JSObject();file.put("path",tree.getPathString());file.put("sha",tree.getObjectId(0).name());file.put("mode",Integer.toOctalString(tree.getFileMode(0).getBits()));file.put("encoding","base64");file.put("content",android.util.Base64.encodeToString(bytes,android.util.Base64.NO_WRAP));files.put(file);}
             result.put("commitSha",commit.name());result.put("treeSha",commit.getTree().name());result.put("files",files);return result;
         }
     }
     static ObjectId writeSnapshot(Repository repository,JSArray files,AtomicBoolean stop)throws Exception {
         List<DirCacheEntry> entries=new ArrayList<>();Set<String> paths=new HashSet<>();long total=0;
         try(ObjectInserter insert=repository.newObjectInserter()) {
-            for(int i=0;i<files.length();i++){check(stop);JSONObject file=files.getJSONObject(i);String path=file.getString("path");ExportPath.validate(path);for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能写入 Git 内部路径");if(!paths.add(path))throw new IOException("重复的文件路径");int mode=Integer.parseInt(file.optString("mode","100644"),8);if(mode!=0100644&&mode!=0100755&&mode!=0120000)throw new IOException("不支持的文件模式");byte[] bytes=file.optBoolean("isBase64",false)?android.util.Base64.decode(file.getString("content"),android.util.Base64.DEFAULT):file.getString("content").getBytes(StandardCharsets.UTF_8);total+=bytes.length;if(total>MAX_BYTES)throw new IOException("项目超过 100 MiB 上限");ObjectId blob=insert.insert(Constants.OBJ_BLOB,bytes);if(file.has("sha")&&!file.getString("sha").equals(blob.name()))throw new IOException("本地文件哈希不一致");DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(mode));entry.setObjectId(blob);entries.add(entry);}
+            for(int i=0;i<files.length();i++){check(stop);JSONObject file=files.getJSONObject(i);String path=file.getString("path");ExportPath.validate(path);for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能写入 Git 内部路径");if(!paths.add(path))throw new IOException("重复的文件路径");int mode=Integer.parseInt(file.optString("mode","100644"),8);if(mode!=0100644&&mode!=0100755&&mode!=0120000)throw new IOException("不支持的文件模式");byte[] bytes=file.optBoolean("isBase64",false)?android.util.Base64.decode(file.getString("content"),android.util.Base64.DEFAULT):file.getString("content").getBytes(StandardCharsets.UTF_8);total+=bytes.length;ObjectId blob=insert.insert(Constants.OBJ_BLOB,bytes);if(file.has("sha")&&!file.getString("sha").equals(blob.name()))throw new IOException("本地文件哈希不一致");DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(mode));entry.setObjectId(blob);entries.add(entry);}
             entries.sort((a,b)->{byte[] x=a.getRawPath(),y=b.getRawPath();for(int i=0;i<Math.min(x.length,y.length);i++)if(x[i]!=y[i])return (x[i]&255)-(y[i]&255);return x.length-y.length;});DirCache cache=DirCache.newInCore();DirCacheBuilder builder=cache.builder();for(DirCacheEntry entry:entries)builder.add(entry);builder.finish();ObjectId tree=cache.writeTree(insert);insert.flush();return tree;
         }
     }

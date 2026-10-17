@@ -6,6 +6,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import static org.junit.Assert.*;
 import java.io.File;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import com.getcapacitor.*;
 import org.eclipse.jgit.api.Git;
@@ -27,6 +28,42 @@ public class GitTransferTest {
         }
     }
     private JSObject file(String path,String content,String mode){JSObject file=new JSObject();file.put("path",path);file.put("content",content);file.put("mode",mode);return file;}
+    @Test public void diskBackedSnapshotExceeds100MiBWithBoundedChunks()throws Exception{
+        File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-large-test-"+System.nanoTime());
+        AtomicBoolean stop=new AtomicBoolean();long total=0;
+        try(Git git=Git.init().setBare(true).setDirectory(folder).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),folder,stop)){
+            byte[] bytes=new byte[1024*1024+1];Arrays.fill(bytes,(byte)173);JSArray expected=new JSArray();
+            for(int i=0;i<101;i++){
+                bytes[0]=(byte)i;String sha;try(ObjectInserter insert=git.getRepository().newObjectInserter()){sha=insert.idFor(Constants.OBJ_BLOB,bytes).name();}
+                String path="资源/file-"+i+".bin";JSObject metadata=new JSObject();metadata.put("path",path);metadata.put("sha",sha);metadata.put("mode","100644");expected.put(metadata);
+                for(int offset=0;offset<bytes.length;offset+=GitSnapshotStore.CHUNK_BYTES){
+                    JSObject chunk=new JSObject(metadata.toString());chunk.put("offset",offset);chunk.put("done",offset+GitSnapshotStore.CHUNK_BYTES>=bytes.length);chunk.put("content",android.util.Base64.encodeToString(Arrays.copyOfRange(bytes,offset,Math.min(bytes.length,offset+GitSnapshotStore.CHUNK_BYTES)),android.util.Base64.NO_WRAP));store.append(chunk);
+                }
+            }
+            ObjectId tree=store.writeTree(expected),commitId;
+            try(ObjectInserter insert=git.getRepository().newObjectInserter()){
+                CommitBuilder commit=new CommitBuilder();PersonIdent author=new PersonIdent("GitVault","gitvault@example.invalid");commit.setAuthor(author);commit.setCommitter(author);commit.setTreeId(tree);commit.setMessage("large snapshot");commitId=insert.insert(commit);insert.flush();
+            }
+            JSObject manifest=store.describe(commitId.name());assertEquals(101,manifest.getJSONArray("files").length());
+            for(int i=0;i<101;i++){
+                org.json.JSONObject entry=manifest.getJSONArray("files").getJSONObject(i);assertFalse(entry.has("content"));long offset=0;
+                java.security.MessageDigest hash=java.security.MessageDigest.getInstance("SHA-1");hash.update(("blob "+entry.getLong("size")+"\0").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                do{JSObject chunk=store.readChunk(entry.getString("path"),offset);byte[] part=android.util.Base64.decode(chunk.getString("content"),android.util.Base64.DEFAULT);assertTrue(part.length<=GitSnapshotStore.CHUNK_BYTES);hash.update(part);offset+=part.length;}while(offset<entry.getLong("size"));
+                StringBuilder actual=new StringBuilder();for(byte value:hash.digest())actual.append(String.format("%02x",value&255));assertEquals(entry.getString("sha"),actual.toString());total+=offset;
+            }
+            assertTrue(total>100L*1024*1024);stop.set(true);
+            try{store.readChunk(manifest.getJSONArray("files").getJSONObject(0).getString("path"),0);fail("Cancellation must stop chunk reads");}catch(java.io.IOException expectedError){assertTrue(expectedError.getMessage().contains("取消"));}
+        }finally{remove(folder);}
+    }
+    @Test public void incompleteOrCorruptStagingCannotPublishATree()throws Exception{
+        File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-invalid-test-"+System.nanoTime());
+        try(Git git=Git.init().setBare(true).setDirectory(folder).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),folder,new AtomicBoolean())){
+            JSObject chunk=new JSObject();chunk.put("path","a.bin");chunk.put("mode","100644");chunk.put("sha","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");chunk.put("offset",0);chunk.put("content","dGVzdA==");chunk.put("done",false);store.append(chunk);
+            try{store.writeTree(new JSArray());fail("Incomplete chunks must never publish a tree");}catch(java.io.IOException expected){assertTrue(expected.getMessage().contains("未全部落盘"));}
+            chunk.put("offset",4);chunk.put("content","");chunk.put("done",true);
+            try{store.append(chunk);fail("Wrong object hash must never be accepted");}catch(java.io.IOException expected){assertTrue(expected.getMessage().contains("哈希不一致"));}
+        }finally{remove(folder);}
+    }
     @Test public void nativeGitPreservesBytesModesBranchAndHistory()throws Exception{
         File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-test-"+System.nanoTime());
         File destination=new File(folder,"remote"),source=new File(folder,"source");

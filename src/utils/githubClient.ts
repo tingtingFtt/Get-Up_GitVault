@@ -163,9 +163,9 @@ export const githubClient = {
     const resumed = checkpoint ? await checkpoint.load(transfer) : [];
     const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
     const files = new Map<string, CachedFile>();
-    let pendingParts: CachedFile[] = [], saving = Promise.resolve();
-    const flushParts = () => { const batch = pendingParts; pendingParts = []; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
-    const savePart = async (file: CachedFile) => { if (!checkpoint) return; pendingParts.push(file); if (pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
+    let pendingParts: CachedFile[] = [], pendingBytes = 0, saving = Promise.resolve();
+    const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
+    const savePart = async (file: CachedFile) => { if (!checkpoint) return; pendingParts.push(file); pendingBytes += file.size || file.content.length; if (pendingBytes >= 4 * 1024 * 1024 || pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
     let done = 0;
     const missing: RepoEntry[] = [];
     for (const entry of entries) {
@@ -176,24 +176,31 @@ export const githubClient = {
     if (gitServiceConfig().mode !== 'rest' && missing.length) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
-      const result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha }, token || '', signal);
-      if (result.commitSha !== commit.sha || result.treeSha !== commit.commit.tree.sha || !Array.isArray(result.files) || result.files.length !== entries.length) throw new Error('Git 拉取结果与选定快照不一致，本地原版本已保留');
       const expected = new Map(entries.map(entry => [entry.path, entry]));
+      const acceptFile = async (remote: { path: string; sha: string; mode: string; encoding: string; content: string }) => {
+        signal.throwIfAborted(); const entry = expected.get(remote.path);
+        if (!entry || remote.sha !== entry.sha || remote.mode !== entry.mode || remote.encoding !== 'base64') throw new Error('Git 文件清单校验失败，本地原版本已保留');
+        const file = await cachedFile(entry, bytesFromBase64(remote.content)); await savePart(file); files.set(entry.path, file);
+      };
+      let result;
+      try { result = await gitServiceTransfer('fetch', { owner, repo, expectedRepoId: meta.id, ref: commit.sha, totalBytes: entries.reduce((n, entry) => n + (entry.size || 0), 0) }, token || '', signal, { onFile: acceptFile, paths: missing.map(entry => entry.path) }); }
+      finally { await flushParts(); }
+      if (result.commitSha !== commit.sha || result.treeSha !== commit.commit.tree.sha || !Array.isArray(result.files) || result.files.length !== entries.length) throw new Error('Git 拉取结果与选定快照不一致，本地原版本已保留');
       const received = new Set<string>();
       for (const remote of result.files) {
         signal.throwIfAborted();
         const entry = expected.get(remote.path);
         if (!entry || received.has(remote.path) || remote.sha !== entry.sha || remote.mode !== entry.mode || remote.encoding !== 'base64') throw new Error('Git 文件清单校验失败，本地原版本已保留');
         received.add(remote.path);
-        const file = await cachedFile(entry, bytesFromBase64(remote.content));
-        await savePart(file);
-        files.set(entry.path, file);
+        if (!result.streamed) await acceptFile(remote);
+        else if (files.get(entry.path)?.sha !== entry.sha) throw new Error('Git 文件分块未完整接收，本地原版本已保留');
       }
       done = files.size;
     }
     // A large initial import is cheaper as one archive; each downloaded blob is still verified.
     // Browser archive redirects can fail CORS, so each channel has its own catch/deadline.
-    if (missing.length > 12 && files.size !== entries.length) {
+    const remainingBytes = missing.reduce((sum, entry) => sum + (entry.size || 0), 0);
+    if (missing.length > 12 && remainingBytes <= 32 * 1024 * 1024 && files.size !== entries.length) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
       for (const archiveUrl of archiveUrls) {
@@ -226,7 +233,7 @@ export const githubClient = {
         }
       }
     }
-    try { await mapConcurrent(missing.filter(e => !files.has(e.path)), 5, async entry => {
+    try { await mapConcurrent(missing.filter(e => !files.has(e.path)), remainingBytes > 32 * 1024 * 1024 ? 2 : 5, async entry => {
       signal.throwIfAborted();
       const data = await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal);
       const bytes = bytesFromBase64(data.content);
@@ -371,7 +378,11 @@ export const githubClient = {
     if (gitServiceConfig().mode !== 'rest') {
       if (!Number.isSafeInteger(identity.id) || !identity.id || identity.id <= 0) throw new Error('目标仓库缺少可信 ID，未开始 Git 推送');
       progress(`正在通过 Git 推送 ${allFiles.length} 个文件到 ${targetOwner}/${targetRepo}:${branch}…`);
-      const prepared = await Promise.all(allFiles.map(async file => ({ ...file, sha: await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) })));
+      const prepared: CachedFile[] = [];
+      for (const file of allFiles) {
+        signal.throwIfAborted();
+        prepared.push({ ...file, sha: await gitBlobSha(file.isBase64 ? bytesFromBase64(file.content) : new TextEncoder().encode(file.content)) });
+      }
       const result = await gitServiceTransfer('push', { owner: identity.owner, repo: identity.repo, expectedRepoId: identity.id, branch, files: prepared, message: commitMessage, rebaseOnConflict: !!options.rebaseOnConflict }, token, signal);
       if (!result.verified || result.repoId !== identity.id || result.branch !== branch || !/^[a-f0-9]{40}$/.test(result.commitSha) || !/^[a-f0-9]{40}$/.test(result.treeSha)) throw new Error('Git 推送回执无效，本地缓存已保留');
       const committed = await json(`${base}/git/commits/${result.commitSha}`, token, { cache: 'no-store' }, signal);

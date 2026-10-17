@@ -162,6 +162,26 @@ test('cancel aborts an active fetch and no completion is reported', async () => 
   const pending = githubClient.fetchRepo('demo/project');
   cancelGithubOperation(); await assert.rejects(pending, { name: 'AbortError' });
 });
+test('large REST snapshots bypass whole-archive buffering while preserving every file',async()=>{
+  const files=Array.from({length:13},(_,i)=>file(`asset-${i}.bin`,`asset-${i}`));
+  source(files);
+  const base=handler;
+  handler=(path,init)=>path.includes('/git/trees/')?response({tree:files.map(value=>({path:value.path,sha:value.sha,mode:value.mode,type:'blob',size:3*1024*1024}))}):base(path,init);
+  const result=await githubClient.fetchRepo('demo/project');
+  assert.equal(result.files.length,13);assert.ok(!calls.some(call=>call.path.includes('/zipball/')));
+});
+test('quota failure after a content batch never publishes a partial replacement snapshot',async()=>{
+  await localCache.saveProjectFiles('quota-project',[file('old.txt','old')],'old');
+  const first=file('first.txt','A'.repeat(4*1024*1024)),second=file('second.txt','new');
+  const original=IDBObjectStore.prototype.put;
+  mock.method(IDBObjectStore.prototype,'put',function(this:IDBObjectStore,value:any,key?:IDBValidKey){
+    if(this.name==='file_contents'&&value.sha===second.sha)throw new DOMException('quota exhausted','QuotaExceededError');
+    return key===undefined?original.call(this,value):original.call(this,value,key);
+  });
+  await assert.rejects(localCache.saveProjectFiles('quota-project',[first,second],'new'),/存储空间或浏览器缓存配额不足/);
+  assert.equal((await localCache.getProjectFiles('quota-project'))[0].content,'old');
+  assert.deepEqual(await localCache.getProjectFiles('quota-project','new'),[]);
+});
 test('cache stores independent versions and retains old contents after update', async () => {
   await localCache.saveProjectFiles('project', [file('a.txt', 'old')], 'v1');
   await localCache.saveProjectFiles('project', [file('a.txt', 'new')], 'v2');

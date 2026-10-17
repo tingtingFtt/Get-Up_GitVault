@@ -26,6 +26,18 @@ import static org.junit.Assert.*;
 /** Tests the actual native WebView frame; HTML/WebView padding cannot satisfy these checks. */
 @RunWith(AndroidJUnit4.class)
 public class SystemInsetsTest {
+    @Test public void actualWebViewStagesAndReleasesBinaryChunksWithoutAnyRemoteWrite()throws Exception{
+        try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
+            waitForPage(scenario);AtomicReference<String> result=new AtomicReference<>("pending");
+            String script="(async()=>{const git=window.Capacitor.Plugins.GitVaultGit,id=crypto.randomUUID();try{const bytes=new Uint8Array(1024*1024+7);for(let i=0;i<bytes.length;i++)bytes[i]=i%251;const prefix=new TextEncoder().encode('blob '+bytes.length+'\\0'),input=new Uint8Array(prefix.length+bytes.length);input.set(prefix);input.set(bytes,prefix.length);const sha=[...new Uint8Array(await crypto.subtle.digest('SHA-1',input))].map(x=>x.toString(16).padStart(2,'0')).join('');await git.prepareUpload({id,totalBytes:bytes.length});for(let offset=0;offset<bytes.length;offset+=393216){const part=bytes.subarray(offset,offset+393216);let text='';for(let at=0;at<part.length;at+=8192)text+=String.fromCharCode(...part.subarray(at,at+8192));await git.appendChunk({id,path:'资源/binary.bin',mode:'100755',sha,offset,content:btoa(text),done:offset+part.length===bytes.length});}await git.release({id});let rejected=false;try{await git.appendChunk({id});}catch{rejected=true;}if(!rejected)throw Error('Released staging remained accessible');window.__gitChunkResult='ok';}catch(error){window.__gitChunkResult='error: '+error.message;}finally{await git.release({id});}})()";
+            scenario.onActivity(activity->activity.getBridge().getWebView().evaluateJavascript(script,null));
+            for(int attempt=0;attempt<150&&result.get().equals("pending");attempt++){
+                scenario.onActivity(activity->activity.getBridge().getWebView().evaluateJavascript("window.__gitChunkResult||'pending'",value->result.set(value==null?"pending":value.replace("\"",""))));
+                if(result.get().equals("pending"))Thread.sleep(100);
+            }
+            assertEquals("Actual JavaScript/Capacitor/disk chunk transfer failed","ok",result.get());
+        }
+    }
     private void waitForPage(ActivityScenario<MainActivity> scenario) throws Exception {
         AtomicBoolean ready = new AtomicBoolean(false);
         for (int attempt = 0; attempt < 100 && !ready.get(); attempt++) {
