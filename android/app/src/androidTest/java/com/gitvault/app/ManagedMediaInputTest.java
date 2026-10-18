@@ -2,6 +2,10 @@ package com.gitvault.app;
 
 import android.app.UiAutomation;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.view.accessibility.AccessibilityNodeInfo;
+import androidx.test.core.app.ActivityScenario;
 import android.graphics.Bitmap;
 import android.media.ExifInterface;
 import android.net.Uri;
@@ -38,6 +42,32 @@ public class ManagedMediaInputTest {
         HttpURLConnection connection=(HttpURLConnection)new URL("https://raw.githubusercontent.com/xiaolongbao0709/ai-virtual-phone-share/616f16f29011673299cab0e586682c048c86ac3b/"+path).openConnection();connection.setConnectTimeout(60000);connection.setReadTimeout(60000);
         try(InputStream input=connection.getInputStream()) {byte[] bytes=input.readAllBytes();assertEquals(238293,bytes.length);assertEquals("9d901d1fbc202bc2788f8d1d588333b492d665a0",hash(bytes));return bytes;}finally{connection.disconnect();}
     }
+    private static boolean hasText(AccessibilityNodeInfo node,String text){
+        if(node==null)return false;if(node.getText()!=null&&node.getText().toString().contains(text)||node.getContentDescription()!=null&&node.getContentDescription().toString().contains(text))return true;
+        for(int i=0;i<node.getChildCount();i++)if(hasText(node.getChild(i),text))return true;return false;
+    }
+    private static boolean clickText(AccessibilityNodeInfo node,String text){
+        if(node==null)return false;
+        if(node.getText()!=null&&node.getText().toString().equalsIgnoreCase(text)){
+            AccessibilityNodeInfo target=node;for(int i=0;i<4&&target!=null;i++,target=target.getParent())if(target.isEnabled()&&target.isClickable())return target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        }
+        for(int i=0;i<node.getChildCount();i++)if(clickText(node.getChild(i),text))return true;return false;
+    }
+    private static Uri authorizeTestDirectory(Context context,UiAutomation automation,ActivityScenario<MainActivity> scenario,String name)throws Exception{
+        try(InputStream output=new android.os.ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand("mkdir -p /sdcard/Download/"+name))){output.readAllBytes();}
+        String documentId="primary:Download/"+name;
+        Uri tree=DocumentsContract.buildTreeDocumentUri(AUTHORITY,documentId),initial=DocumentsContract.buildDocumentUri(AUTHORITY,documentId);
+        scenario.onActivity(activity->{Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI,initial);intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);activity.startActivityForResult(intent,43212);});
+        boolean selected=false;int flags=Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        for(int attempt=0;attempt<150;attempt++){
+            if(context.checkUriPermission(tree,android.os.Process.myPid(),android.os.Process.myUid(),flags)==PackageManager.PERMISSION_GRANTED){context.getContentResolver().takePersistableUriPermission(tree,flags);return tree;}
+            AccessibilityNodeInfo window=automation.getRootInActiveWindow();
+            if(!selected&&hasText(window,name))selected=clickText(window,"Use this folder");
+            else if(selected)clickText(window,"Allow");
+            Thread.sleep(200);
+        }
+        throw new IOException("System directory picker did not grant the isolated test folder");
+    }
     @Test public void originalDescriptorIsRestrictedToManagedSystemMediaUris(){
         assertTrue(ManagedDocumentInput.needsOriginalDescriptor(Uri.parse("content://"+AUTHORITY+"/document/primary%3ADownload%2Fphoto.JPG")));
         assertTrue(ManagedDocumentInput.needsOriginalDescriptor(Uri.parse("content://"+AUTHORITY+"/document/primary%3ADownload%2Fvideo.mp4")));
@@ -48,14 +78,12 @@ public class ManagedMediaInputTest {
     @Test @SdkSuppress(minSdkVersion=29) public void reportedJpegAndSyntheticExifRoundTripThroughActualSharedStorageAndGit()throws Exception{
         Context context=InstrumentationRegistry.getInstrumentation().getTargetContext();
         UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
-        File home=Files.createTempDirectory(context.getCacheDir().toPath(),"media-integrity-").toFile();DocumentFile selected=null;
-        // Instrumentation-only access to the system DocumentsProvider. The app
-        // uses its user's persistent SAF tree grant. No media-location or broad
-        // storage permission is added to the application manifest.
-        automation.adoptShellPermissionIdentity("android.permission.MANAGE_DOCUMENTS");
+        File home=Files.createTempDirectory(context.getCacheDir().toPath(),"media-integrity-").toFile();DocumentFile selected=null;Uri granted=null;ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class);
+        // Follow the same system directory picker and persistent URI grant as
+        // the user; do not adopt broad storage or media-location permissions.
         try {
-            Uri tree=DocumentsContract.buildTreeDocumentUri(AUTHORITY,"primary:Download");DocumentFile downloads=DocumentFile.fromTreeUri(context,tree);assertNotNull(downloads);
-            selected=downloads.createDirectory("GitVault-media-test-"+UUID.randomUUID());assertNotNull(selected);
+            granted=authorizeTestDirectory(context,automation,scenario,"GV-media-"+UUID.randomUUID().toString().substring(0,8));
+            selected=DocumentFile.fromTreeUri(context,granted);assertNotNull(selected);assertTrue(selected.canRead());assertTrue(selected.canWrite());
             File synthetic=new File(home,"with-location.jpg");Bitmap bitmap=Bitmap.createBitmap(16,16,Bitmap.Config.ARGB_8888);
             try(OutputStream output=new FileOutputStream(synthetic)){assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG,95,output));}finally{bitmap.recycle();}
             ExifInterface exif=new ExifInterface(synthetic.getAbsolutePath());exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE,"1/1,2/1,3/1");exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE_REF,"N");exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE,"4/1,5/1,6/1");exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF,"E");exif.saveAttributes();
@@ -78,6 +106,6 @@ public class ManagedMediaInputTest {
             for(Map.Entry<String,byte[]> file:bodies.entrySet())try(InputStream input=store.open(id,file.getKey())){assertArrayEquals(file.getValue(),input.readAllBytes());}
             store.attach(id,"test","616f16f29011673299cab0e586682c048c86ac3b",false);store.clear("test","616f16f29011673299cab0e586682c048c86ac3b",false);assertTrue(store.describe(id,false,null).getBoolean("missing"));
             GitObjectCacheTest.benchmark("GITVAULT_MEDIA_INTEGRITY provider="+AUTHORITY+" files=2 legacyDifferent="+redactedReads+" originalByteExact=true gitRoundTrip=true");
-        }finally{try{if(selected!=null)assertTrue("Test directory must be removed",selected.delete());}finally{remove(home);automation.dropShellPermissionIdentity();}}
+        }finally{try{if(selected!=null)assertTrue("Test directory must be removed",selected.delete());}finally{if(granted!=null)context.getContentResolver().releasePersistableUriPermission(granted,Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);remove(home);scenario.close();}}
     }
 }

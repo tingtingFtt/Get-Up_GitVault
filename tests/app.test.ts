@@ -587,9 +587,9 @@ test('history upload sends old bytes and purges only that selected version', asy
   const checkbox = [...document.querySelectorAll<HTMLInputElement>('input[type=checkbox]')].find(e => e.parentElement?.textContent?.includes('上传验证成功后清理'))!;
   await act(async () => checkbox.click());
   const submit = buttons().find(b => b.textContent === '确认上传')!;
-  await act(async () => { submit.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await new Promise(r => setTimeout(r, 50)); });
-  assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
+  await act(async () => { submit.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); });
   await waitFor(() => storedProjects()[0].backups[0].isCachePurged === true);
+  assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
   assert.equal((await localCache.getProjectFiles('tracked', 'v1')).length, 0);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   const stored = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];

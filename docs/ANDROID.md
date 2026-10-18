@@ -139,4 +139,4 @@ Android 测试包含固定的 `xiaolongbao0709/ai-virtual-phone-share` main 提�
 
 损坏／缺失的未绑定下载候选仍仅自动修复一次。持续不匹配会保留旧快照与文件并停止；不会以新哈希冒充上游版本。错误中显示期望／实际 SHA，`.gitvault-diagnostic.json` 增加固定提交、实际／期望字节数与目录提供者标识，不记录 EXIF 位置值或 Token。
 
-新增 Android 仪器测试直接使用共享存储的真实 `com.android.externalstorage.documents` 提供者，验证上述固定 JPG 和人工 EXIF 图片的目录落盘、重复读取、完整快照校验、批量 Git 树与清理。测试仅在独立生成的测试目录操作；测试进程临时使用 MANAGE_DOCUMENTS 权限，应用清单不包含此权限。普通文件、第三方 URI 路由及已有篡改／删除保护继续验证。
+新增 Android 仪器测试直接使用共享存储的真实 `com.android.externalstorage.documents` 提供者，验证上述固定 JPG 和人工 EXIF 图片的目录落盘、重复读取、完整快照校验、批量 Git 树与清理。测试通过系统目录选择器取得独立测试目录的持久读写授权，仅在该目录操作，不采用全盘、相册或 MANAGE_DOCUMENTS 权限。普通文件、第三方 URI 路由及已有篡改／删除保护继续验证。
