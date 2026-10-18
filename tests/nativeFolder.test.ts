@@ -101,3 +101,12 @@ test('REST directory imports refetch only damaged files and reject repair paths 
  blobs=[];checks=0;mock.method(folderBridge,'finish',async()=>{throw Object.assign(new Error('bad request'),{code:'FOLDER_REPAIR',data:{version:'version',repairPaths:['../outside']}});});
  await assert.rejects(githubClient.fetchRepo('source/project'),/快照外路径/);assert.equal(blobs.length,2);
 });
+test('verified ready directory references win over older cached handles and still receive final verification',async()=>{
+ enable();immediateTransport();beginGithubOperation();const bytes=Buffer.from('verified'),entry={path:'a',sha:sha(bytes),mode:'100644',size:bytes.length,type:'blob'};let checks=0;
+ globalThis.fetch=async input=>{const path=String(input);if(path.endsWith('/repos/source/project'))return new Response(JSON.stringify({id:77,default_branch:'main'}));if(path.includes('/commits/'))return new Response(JSON.stringify({sha:'pinned',commit:{tree:{sha:'tree'},author:{}}}));if(path.includes('/git/trees/'))return new Response(JSON.stringify({tree:[entry]}));assert.fail('Ready snapshots must not download file bodies: '+path);};
+ mock.method(folderBridge,'begin',async()=>({id:'version',state:'ready',reusedReady:true,files:[nativeFile({...entry,content:'',isBase64:true})]}));
+ mock.method(folderBridge,'copy',async()=>assert.fail('Ready snapshots must not rewrite bound project files'));
+ mock.method(folderBridge,'put',async()=>assert.fail('Ready snapshots must not rewrite source bodies'));
+ mock.method(folderBridge,'finish',async()=>{checks++;return{};});
+ const result=await githubClient.fetchRepo('source/project',undefined,undefined,{cachedFiles:[{...entry,content:'',isBase64:true,nativeRef:{version:'old',path:'a'}}]});assert.equal(result.files[0].nativeRef?.version,'version');assert.equal(checks,1);
+});

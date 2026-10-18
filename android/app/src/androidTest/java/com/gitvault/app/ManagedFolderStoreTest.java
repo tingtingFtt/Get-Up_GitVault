@@ -182,6 +182,13 @@ public class ManagedFolderStoreTest {
             byte[] bytes="actual bytes".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",bytes));String id=f.begin("provider-length",expected).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);JSObject file=f.store.describeFile(id,"a");assertEquals(bytes.length,file.getLong("size"));assertEquals(hash(bytes),file.getString("sha"));assertFalse(f.store.describe(id,true,null).getBoolean("dirty"));
         }
     }
+    @Test public void unchangedBoundSnapshotsReuseTheVerifiedDirectoryWithoutRewritingSourceFiles()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes="verified".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",bytes));String id=f.begin("same",expected).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);f.store.attach(id,"owner","same",false);
+            assertTrue(f.content(id,"a").setLastModified(1000));JSObject reused=f.begin("same",expected);assertEquals(id,reused.getString("id"));assertTrue(reused.getBoolean("reusedReady"));assertEquals(1,reused.getJSONArray("files").length());f.store.finish(id);assertEquals(1000,f.content(id,"a").lastModified());
+            Files.write(f.content(id,"a").toPath(),new byte[]{1});try{f.begin("same",expected);fail("Changed bound directories must not be reused silently");}catch(ManagedFolderStore.Changed correct){assertTrue(f.content(id,"a").exists());}
+        }
+    }
     @Test public void cleanupPreflightsFailedCandidatesBeforeDeletingTheCurrentVersion()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] bytes="data".getBytes(StandardCharsets.UTF_8);JSArray oldExpected=new JSArray();oldExpected.put(entry("a",bytes));String old=f.begin("same",oldExpected).getString("id");f.store.write(old,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);Files.write(f.content(old,"a").toPath(),new byte[]{1});

@@ -168,7 +168,7 @@ export const githubClient = {
     const checkpoint = typeof window !== 'undefined' && typeof indexedDB !== 'undefined' ? transferCache : undefined;
     const transfer = `${owner}/${repo}@${commit.sha}`;
     const resumed = folder ? folder.files as CachedFile[] : checkpoint ? await checkpoint.load(transfer) : [];
-    const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
+    const previous = new Map([...(options.cachedFiles || []), ...resumed].map(f => [f.path, f]));
     const previousBlobs = new Map([...previous.values()].filter(file => !file.nativeRef).map(file => [file.sha, file]));
     const files = new Map<string, CachedFile>();
     const storageErrors=new WeakSet<object>();
