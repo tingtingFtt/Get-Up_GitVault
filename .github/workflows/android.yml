@@ -73,7 +73,7 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug :app:assembleDebugAndroidTest
       - name: Upload installable test APK
         uses: actions/upload-artifact@v4
         with:
