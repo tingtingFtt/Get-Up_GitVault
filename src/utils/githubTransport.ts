@@ -148,24 +148,30 @@ export function createGithubTransport(options: TransportOptions = {}) {
     } finally { closed = true; clearTimeout(timer); signal.removeEventListener('abort', abort); }
   };
   const executeRequest = async <T>(url: string, init: RequestInit, signal: AbortSignal, timeout: number, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idle=false): Promise<T> => {
+      const queuedAt=clock.now();let entered=false,waitMs=0,requestMs=0,attempts=0,rateLimits=0;
       const write = !['GET', 'HEAD', 'OPTIONS'].includes((init.method || 'GET').toUpperCase());
       const execute = async () => {
+        entered=true;waitMs+=Math.max(0,clock.now()-queuedAt);
         for (let attempt = 0; ; attempt++) {
-          await admit(write, signal);
+          const waiting=clock.now();try{await admit(write, signal);}finally{waitMs+=Math.max(0,clock.now()-waiting);}
+          const started=clock.now();attempts++;
           try { return await fetchOnce(url, init, signal, timeout, attempt, consume, idle); }
           catch (error) {
             signal.throwIfAborted();
             if (!(error instanceof GitHubError) || !error.rateLimited) throw error;
+            rateLimits++;
             pause(error.retryAt!);
             if (attempt >= retries) throw error;
             // Only an explicit rate-limit rejection is replayed here. Lost
             // mutation responses and 5xx remain the caller's reconciliation job.
           } finally {
+            requestMs+=Math.max(0,clock.now()-started);
             if (write) { nextWrite = clock.now() + writeInterval; persist(LAST_WRITE, String(nextWrite)); }
           }
         }
       };
-      if (!write) return withReadSlot(execute, signal);
+      try {
+      if (!write) return await withReadSlot(execute, signal);
       const { pending, settled } = serial(writeTail, async () => {
         signal.throwIfAborted();
         if (options.shareAcrossTabs !== false && typeof navigator !== 'undefined' && navigator.locks) {
@@ -174,7 +180,13 @@ export function createGithubTransport(options: TransportOptions = {}) {
         return execute();
       });
       writeTail = settled;
-      return abortable(pending, signal);
+      return await abortable(pending, signal);
+      } finally {
+        if(!entered)waitMs=Math.max(0,clock.now()-queuedAt);
+        // Only numeric timings and the in-memory signal used for attribution;
+        // URLs, request headers, response bodies and credentials are excluded.
+        if(typeof window!=='undefined')try{window.dispatchEvent(new CustomEvent('gitvault-transport-metric',{detail:{signal,waitMs,requestMs,attempts,rateLimits}}));}catch{}
+      }
     };
   return {
     request(url: string, init: RequestInit, signal: AbortSignal, timeout = 45000): Promise<Response> {

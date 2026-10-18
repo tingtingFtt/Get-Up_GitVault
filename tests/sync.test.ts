@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import 'fake-indexeddb/auto';
 import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, parseRepository, TargetRepositoryError } from '../src/utils/githubClient';
-import { localCache, uploadCache } from '../src/utils/localCache';
+import { transferCache, localCache, uploadCache } from '../src/utils/localCache';
 import type { CachedFile } from '../src/utils/localCache';
 import { immediateTransport } from './transportFixture';
 
@@ -617,6 +617,17 @@ test('an incomplete archive retains verified files and REST downloads only missi
  const zip=zipSync({'root/0.txt':Buffer.from(files[0].content)});
  handler=(path,init)=>path.includes('/zipball/')?new Response(zip):base(path,init);
  const result=await githubClient.fetchRepo('demo/project',undefined,'token');assert.equal(result.files.length,13);assert.equal(calls.filter(call=>call.path.includes('/git/blobs/')).length,12);assert.ok(!calls.some(call=>call.path.endsWith('/git/blobs/'+files[0].sha)));
+});
+test('partially verified ZIPs do not restart the whole archive on a second endpoint',async()=>{
+ const {zipSync}=await import('fflate');const files=Array.from({length:13},(_,i)=>file(`${i}.txt`,`partial-${i}`));source(files);const base=handler;
+ handler=(path,init)=>path.includes('/zipball/')?new Response(zipSync({'root/0.txt':Buffer.from(files[0].content)})):base(path,init);
+ const result=await githubClient.fetchRepo('demo/project');assert.equal(result.files.length,13);assert.equal(calls.filter(call=>call.path.includes('/zipball/')).length,1);assert.ok(!calls.some(call=>call.path.includes('codeload.github.com')));assert.equal(calls.filter(call=>call.path.includes('/git/blobs/')).length,12);
+});
+test('archive storage failures stop without retrying another archive or downloading blobs',async()=>{
+ const {zipSync}=await import('fflate');const files=Array.from({length:13},(_,i)=>file(`${i}.txt`,`storage-${i}`));source(files);const base=handler;
+ handler=(path,init)=>path.includes('/zipball/')?new Response(zipSync(Object.fromEntries(files.map(file=>['root/'+file.path,Buffer.from(file.content)])))):base(path,init);
+ mock.method(transferCache,'saveBatch',async()=>{throw new Error('存储空间不足');});
+ await assert.rejects(githubClient.fetchRepo('demo/project'),/存储空间不足/);assert.ok(!calls.some(call=>call.path.includes('codeload.github.com')||call.path.includes('/git/blobs/')));
 });
 test('first uploads combine medium UTF-8 files into a verified tree instead of separate blob writes',async()=>{
  const {gitTreeSha}=await import('../src/utils/gitFiles');const files=[file('medium.txt','x'.repeat(256*1024)),file('a','a'),file('b','b'),file('c','c')];

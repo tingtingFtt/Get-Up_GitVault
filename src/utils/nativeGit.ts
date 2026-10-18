@@ -2,6 +2,7 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import type { PluginListenerHandle } from '@capacitor/core';
 import type { CachedFile } from './localCache';
 import {noteFolderRepair} from './nativeFolder';
+import {nativeGitCacheEnabled} from './nativeGitCache';
 export interface NativeGitFile { path: string; sha: string; mode: string; size?: number; encoding: 'base64'; content: string; nativeRef?: CachedFile['nativeRef'] }
 export interface NativeFetchOptions { onFile?: (file: NativeGitFile) => Promise<void>; paths?: string[] }
 interface NativeGit {
@@ -39,11 +40,12 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
  signal.addEventListener('abort',abort,{once:true});
  const work=async()=>{
   signal.throwIfAborted();
-  const {files:sourceFiles,...identity}=payload;
+  const {files:sourceFiles,...sourceIdentity}=payload;
+  const identity={...sourceIdentity,retainObjects:nativeGitCacheEnabled()};
   if(action==='push'){
    const files=sourceFiles||[];let completed=0;
    const totalBytes=files.reduce((sum,file)=>sum+(file.size??(file.isBase64?base64Size(file.content.replace(/\s/g,'')):new TextEncoder().encode(file.content).length)),0);
-   await nativeGitBridge.prepareUpload({id,totalBytes});signal.throwIfAborted();
+   await nativeGitBridge.prepareUpload({...identity,id,totalBytes,token});signal.throwIfAborted();
    for(let index=0;index<files.length;){
     const file=files[index];
     const metadata={id,path:file.path,sha:file.sha,mode:file.mode||'100644'};

@@ -8,6 +8,7 @@ import { githubTransport, GitHubError } from './githubTransport';
 export { GitHubError } from './githubTransport';
 import { gitServiceConfig, gitServiceTransfer } from './gitService';
 import { measureTransfer } from './transferMetrics';
+import {shouldUseArchive} from './transferPlan';
 
 export interface RepoEntry {
   path: string;
@@ -170,13 +171,14 @@ export const githubClient = {
     const previous = new Map([...resumed, ...(options.cachedFiles || [])].map(f => [f.path, f]));
     const previousBlobs = new Map([...previous.values()].filter(file => !file.nativeRef).map(file => [file.sha, file]));
     const files = new Map<string, CachedFile>();
+    const storageErrors=new WeakSet<object>();
     let pendingParts: CachedFile[] = [], pendingBytes = 0, saving = Promise.resolve();
     const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
     const savePart = async (file: CachedFile) => { if (folder) return; if (!checkpoint) return; pendingParts.push(file); pendingBytes += file.size || file.content.length; if (pendingBytes >= 4 * 1024 * 1024 || pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
     const storeFile = async (file:CachedFile) => {
       if(!file.isBase64&&file.content.startsWith('version https://git-lfs.github.com/spec/v1'))throw new Error('项目包含 Git LFS 指针，未标记完整下载');
-      const saved=folder&&file.nativeRef?.version!==folder.id?await putFolderFile(folder.id,file,signal):file;
-      await savePart(saved);files.set(file.path,saved);
+      try{const saved=folder&&file.nativeRef?.version!==folder.id?await putFolderFile(folder.id,file,signal):file;
+      await savePart(saved);files.set(file.path,saved);}catch(error){if(error&&typeof error==='object')storageErrors.add(error);throw error;}
     };
     let done = 0, nativeFolderFinished=false;
     const missing: RepoEntry[] = [];
@@ -186,6 +188,7 @@ export const githubClient = {
       else missing.push(entry);
     }
     trace.phase('获取、校验并保存文件（含排队等待）');
+    trace.count('复用文件',done);
     if (gitServiceConfig().mode !== 'rest' && missing.length) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
@@ -214,12 +217,13 @@ export const githubClient = {
     // Stream large initial snapshots too: keep neither the complete ZIP nor
     // all inflated bytes alongside the cached source bodies in memory.
     const remainingBytes = missing.reduce((sum, entry) => sum + (entry.size || 0), 0);
-    if (missing.length > 12 && files.size !== entries.length) {
+    if (shouldUseArchive(entries,missing.filter(entry=>!files.has(entry.path)))) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
       const { readArchive } = await import('./archiveDownload');
       for (const archiveUrl of archiveUrls) {
         signal.throwIfAborted();
+        const before=files.size;trace.count('ZIP 尝试',1);let received=0;
         try {
           progress(`正在流式下载压缩包（${entries.length} 个文件）…`, options);
           let lastReport = 0;
@@ -227,16 +231,22 @@ export const githubClient = {
             readArchive(response, missing.filter(entry => !files.has(entry.path)), downloadSignal, async (entry, bytes) => {
               const file = await cachedFile(entry, bytes); await storeFile(file); done++;
               if (Date.now() - lastReport >= 200 || done === entries.length) { lastReport = Date.now(); progress(`正在解压、校验并保存 ${done}/${entries.length}：${entry.path}`, options); }
-            }, bytes => { if (Date.now() - lastReport >= 500) { lastReport = Date.now(); progress(`正在接收压缩包 ${(bytes / 1024 / 1024).toFixed(1)} MiB · 已保存 ${done}/${entries.length}`, options); } }, touch));
+            }, bytes => { received=bytes;if (Date.now() - lastReport >= 500) { lastReport = Date.now(); progress(`正在接收压缩包 ${(bytes / 1024 / 1024).toFixed(1)} MiB · 已保存 ${done}/${entries.length}`, options); } }, touch));
           break;
         } catch (error) {
           await flushParts();
           if (signal.aborted) throw signal.reason;
           if (error instanceof GitHubError && error.rateLimited) throw error;
+          if(error&&typeof error==='object'&&storageErrors.has(error))throw error;
+          if(['QuotaExceededError','NotAllowedError','SecurityError'].includes((error as Error)?.name))throw error;
+          trace.count('ZIP 失败',1);
           done = files.size;
           progress('压缩包不可用，保留已验证文件并补齐缺失内容…', options);
           if (files.size === entries.length) break;
-        }
+          // Once an archive has yielded verified files, do not download the
+          // complete ZIP again via another endpoint just to fill a small gap.
+          if(files.size>before)break;
+        }finally{trace.count('ZIP 接收字节',received);}
       }
     }
     // Identical Git blobs at different paths need one download and one hash.
@@ -247,6 +257,7 @@ export const githubClient = {
       signal.throwIfAborted();
       const entry = aliases[0];
       const reused = reusableBlobs.get(entry.sha);
+      if(!reused)trace.count('补拉文件',1);
       const file = reused || await cachedFile(entry, bytesFromBase64((await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal)).content));
       for (const alias of aliases) { if (alias.size !== undefined && alias.size !== file.size) throw new Error('相同内容的文件大小不一致：' + alias.path); await storeFile({ ...file, path: alias.path, mode: alias.mode }); done++; }
       progress(`正在下载并校验 ${done}/${entries.length}：${entry.path}`, options);

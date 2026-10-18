@@ -19,6 +19,8 @@ final class GitSnapshotStore implements Closeable {
     private final AtomicBoolean stop;
     private final Map<String,JSONObject> manifest=new LinkedHashMap<>();
     private final Map<String,DirCacheEntry> uploaded=new LinkedHashMap<>();
+    private final Set<String> stagedBlobs=new HashSet<>();
+    long newObjects,reusedObjects,sourceBytes;
     private InputStream input;
     private String reading="",writing="";
     private long readOffset,writeOffset;
@@ -103,9 +105,14 @@ final class GitSnapshotStore implements Closeable {
         for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能上传 Git 内部路径");
         int bits=Integer.parseInt(mode,8);if(bits!=0100644&&bits!=0100755&&bits!=0120000)throw new IOException("文件模式无效");
         if(size<0||!sha.matches("[a-f0-9]{40}"))throw new IOException("目录文件大小或哈希无效");
-        ObjectId blob=insert.insert(Constants.OBJ_BLOB,size,new FilterInputStream(input){@Override public int read()throws IOException{check();return super.read();}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();return super.read(bytes,offset,length);}});
+        InputStream checked=new FilterInputStream(input){@Override public int read()throws IOException{check();int value=in.read();if(value!=-1)sourceBytes++;return value;}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();int count=in.read(bytes,offset,length);if(count>0)sourceBytes+=count;return count;}};
+        boolean reuse=stagedBlobs.contains(sha)||repository.hasObject(ObjectId.fromString(sha));
+        // Always read/hash current source bytes, even on a cache hit. Reusing
+        // an object may avoid compression and writes, never content validation.
+        ObjectId blob=reuse?insert.idFor(Constants.OBJ_BLOB,size,checked):insert.insert(Constants.OBJ_BLOB,size,checked);
         if(input.read()!=-1)throw new IOException("目录文件大小在上传期间变化，未推送："+path);
         if(!blob.name().equals(sha))throw new IOException("目录文件在上传期间变化，未推送："+path);
+        stagedBlobs.add(sha);if(reuse)reusedObjects++;else newObjects++;
         DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(bits));entry.setObjectId(blob);uploaded.put(path,entry);
     }
     static ObjectId writeTree(Repository repository,List<DirCacheEntry> entries)throws IOException{

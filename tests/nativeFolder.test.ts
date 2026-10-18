@@ -6,6 +6,7 @@ import {Capacitor} from '@capacitor/core';
 import {folderBridge,hydrateFile,saveFolderArchive,finishFolder} from '../src/utils/nativeFolder';
 import {exportProjectDirectory} from '../src/utils/nativePlatform';
 import {nativeGitBridge,nativeGitTransfer} from '../src/utils/nativeGit';
+import {nativeGitCacheBridge} from '../src/utils/nativeGitCache';
 import {localCache,type CachedFile} from '../src/utils/localCache';
 import {githubClient,beginGithubOperation} from '../src/utils/githubClient';
 import {immediateTransport} from './transportFixture';
@@ -17,6 +18,7 @@ const nativeFile=(file:CachedFile)=>({...file,content:'',isBase64:true,nativeRef
 const db=()=>new Promise<IDBDatabase>((resolve,reject)=>{const req=indexedDB.open('GitVault_Storage_v1');req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});
 async function readStore(name:string){const value=await db();try{return await new Promise<any[]>((resolve,reject)=>{const req=value.transaction(name).objectStore(name).getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});}finally{value.close();}}
 beforeEach(async()=>{
+ mock.method(nativeGitCacheBridge,'clear',async()=>({bytes:0}));
  localStorage.clear();documents=new Map();entries=[];attached=false;
  await new Promise<void>((resolve,reject)=>{const req=indexedDB.deleteDatabase('GitVault_Storage_v1');req.onsuccess=()=>resolve();req.onerror=()=>reject(req.error);});
  mock.method(folderBridge,'begin',async(value:any)=>{entries=value.files;return{id:'version',files:[]};});

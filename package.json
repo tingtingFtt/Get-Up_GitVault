@@ -12,6 +12,7 @@
     "lint": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
     "test:layout": "node scripts/check-layout.mjs",
+    "benchmark:transfer": "node --import tsx scripts/benchmark-transfer.mjs",
     "android:sync": "npm run build -- --base=./ && cap sync android",
     "android:open": "cap open android",
     "android:debug": "npm run android:sync && cd android && ./gradlew assembleDebug",

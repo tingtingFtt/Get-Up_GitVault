@@ -1,4 +1,5 @@
 import {folderBridge, usesNativeFolder, hydrateFile, saveFolderArchive, withFolderConfirmation, type FolderFiles} from './utils/nativeFolder';
+import {nativeGitCacheEnabled,saveNativeGitCache,clearNativeGitCache} from './utils/nativeGitCache';
 import AppUpdates, { openAppUpdater } from './components/AppUpdates';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
@@ -258,6 +259,7 @@ export default function App() {
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'github' | 'backup' | 'apk'>('github');
   const [gitSettings, setGitSettings] = useState(() => { try { return gitServiceConfig(); } catch { return {mode:'rest' as const,url:''}; } });
+  const [retainGitObjects,setRetainGitObjects]=useState(nativeGitCacheEnabled);
   const [gitServiceTesting, setGitServiceTesting] = useState(false);
   const [isDiffModalOpen, setIsDiffModalOpen] = useState(false);
   const [diffBackupTarget, setDiffBackupTarget] = useState<BackupVersion | null>(null);
@@ -862,6 +864,7 @@ export default function App() {
   const handleSaveGlobalSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
+    await saveNativeGitCache(retainGitObjects);
     saveGitServiceConfig(gitSettings);
     writeCredentialValue('gitvault_global_token', globalToken.trim());
     localStorage.setItem('gitvault_global_username', globalUsername.trim());
@@ -1650,8 +1653,8 @@ export default config;
   };
   const clearApkTemporary = async () => {
     if(isLoading||isBatchUploading||importLock.current||batchTaskLock.current)return;
-    if(!await appDialog.confirm('清理未完成下载的候选目录和内部下载进度？已绑定项目文件、项目记录和 GitHub 历史会保留。'))return;
-    startOperation();try{await withFolderConfirmation(force=>folderBridge.cleanTemporary({force}),'候选下载目录存在变动，是否清理？');await transferCache.clearAll();logOperation('临时缓存清理','success',undefined,'候选目录与下载进度已清理');appDialog.notify('临时缓存已清理。');}catch(error){logOperation('临时缓存清理','error',undefined,(error as Error).message,'删除临时文件',error);appDialog.notify('临时缓存清理未完成：'+(error as Error).message);}finally{setIsLoading(false);}
+    if(!await appDialog.confirm('清理未完成下载的候选目录、内部下载进度及 Git 加速缓存？已绑定项目文件、项目记录和 GitHub 历史会保留。'))return;
+    startOperation();try{await clearNativeGitCache();await withFolderConfirmation(force=>folderBridge.cleanTemporary({force}),'候选下载目录存在变动，是否清理？');await transferCache.clearAll();logOperation('临时缓存清理','success',undefined,'候选目录与下载进度已清理');appDialog.notify('临时缓存已清理。');}catch(error){logOperation('临时缓存清理','error',undefined,(error as Error).message,'删除临时文件',error);appDialog.notify('临时缓存清理未完成：'+(error as Error).message);}finally{setIsLoading(false);}
   };
   const exportCurrentProject = async () => {
     if (!activeRepo || isLoading) return;
@@ -4833,6 +4836,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                     <option value="git">Git 推送／拉取（使用自有服务）</option>
                   </select>
                   <p className="text-[11px] text-[#7A7367] leading-relaxed">当前选择：{gitSettings.mode==='native'?'APK 原生 Git 直接拉取和推送源码，无需填写服务地址。':gitSettings.mode==='git'?'Git 服务传输源码；仓库管理继续使用 GitHub API。':'GitHub API 传输，已启用限速与暂停重试。'}</p>
+                  {isApkEnvironment&&<label className="flex items-start gap-2 text-[11px] text-[#7A7367] leading-relaxed min-w-0"><input type="checkbox" checked={retainGitObjects} onChange={e=>setRetainGitObjects(e.target.checked)} className="accent-[#8E9F8B] mt-1 shrink-0" /><span className="min-w-0 break-words">保留 Git 加速缓存（最多 512 MiB，7 天未用自动回收）。可加快后续同步；关闭、清理项目或临时缓存时会清除全部 Git 加速缓存，已下载项目和独立导出仍按原规则处理。</span></label>}
                   {gitSettings.mode==='git' && <>
                     <label className="font-semibold text-[#474239]" htmlFor="git-service-url">Git 服务地址</label>
                     <input id="git-service-url" aria-label="Git 服务地址" type="url" value={gitSettings.url} onChange={e=>setGitSettings({...gitSettings,url:e.target.value})} placeholder="https://git.example.com" className="w-full min-w-0 bg-white border border-[#DFD8CE] rounded-xl px-3 py-2 text-[#2E2B27]" />

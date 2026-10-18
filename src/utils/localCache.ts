@@ -1,5 +1,6 @@
 /** Durable, version-aware project cache. File contents are shared by Git blob SHA. */
 import { gitBlobSha } from './gitFiles';
+import { clearNativeGitCache } from './nativeGitCache';
 import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, finishFolder, folderFiles, hydrateFile, withFolderConfirmation, type FolderFiles } from './nativeFolder';
 
 export interface CachedFile {
@@ -209,6 +210,9 @@ export const localCache = {
     });
   },
   async deleteProjectFiles(repoId: string, ref?: string, options:{interactive?:boolean;verifiedFiles?:Array<{path:string;sha:string;mode:string}>}={}): Promise<void> {
+    // Git pools may contain source and target history shared across tasks. Clear
+    // all acceleration objects so a source purge cannot leave a reconstructible copy.
+    await clearNativeGitCache();
     if(hasFolderApi()) {
       const clear=(force:boolean)=>folderBridge.clear({owner:repoId,ref:ref||'',force,verifiedFiles:options.verifiedFiles});
       if(options.interactive)await withFolderConfirmation(clear,'清理将删除该项目目录中的已下载文件，保留项目记录和 GitHub 历史。');else await clear(false);

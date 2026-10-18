@@ -47,6 +47,15 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
+      - name: Compare transfer plans on local HTTP
+        run: npm run benchmark:transfer -- transfer-benchmark.json
+
+      - name: Upload transfer comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVault-transfer-benchmark
+          path: transfer-benchmark.json
+
       - name: Build
         run: npm run build -- --base=/Get-Up_GitVault/
 

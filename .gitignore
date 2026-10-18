@@ -9,3 +9,5 @@ test-results/
 *.keystore
 __pycache__/
 android-device-screenshots/
+
+transfer-benchmark.json
