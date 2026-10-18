@@ -1463,3 +1463,19 @@ test('manual cache cleanup preserves files while a preview or transfer is readin
   assert.equal(storedProjects()[0].isCachePurged,false);
   await act(async()=>{finish(file('new'));});
 });
+
+for(const scenario of ['deleted','recreated'] as const)test(`HTTP fresh B retains an unavailable primary target after it is ${scenario}, without reading or overwriting a replacement`,async()=>{
+  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'fixed-copy');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+  const previous=server.repositories.get('fixed-copy')!,fixedId=previous.id;
+  if(scenario==='deleted')server.repositories.delete('fixed-copy');
+  else server.repositories.set('fixed-copy',{...previous,id:fixedId+1000,refs:new Map([['main','init'],['develop','other-v']])});
+  const before=server.sent.length;await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);
+  const b=storedProjects()[0];assert.ok(b,'Fresh B must still recover the project and fixed binding');
+  assert.equal(b.uploadTarget.id,fixedId);assert.equal(b.primarySource.repositoryId,fixedId);assert.equal(b.accountState,'pending');assert.equal(b.remoteSnapshot,undefined);
+  assert.ok(Object.values(b.targetHealth).some((health:any)=>health.status===(scenario==='deleted'?'unavailable':'identity-changed')));
+  assert.ok(!server.sent.slice(before).some(request=>request.method!=='GET'));
+  if(scenario==='recreated'){
+    assert.equal(server.repositories.get('fixed-copy')!.refs.get('develop'),'other-v');
+    assert.ok(!server.sent.slice(before).some(request=>request.path.startsWith('/repos/destination/fixed-copy/commits/')||request.path.startsWith('/repos/destination/fixed-copy/git/')));
+  }
+});

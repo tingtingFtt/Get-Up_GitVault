@@ -1,6 +1,7 @@
 /** Durable, version-aware project cache. File contents are shared by Git blob SHA. */
 import { gitBlobSha } from './gitFiles';
 import { clearNativeGitCache } from './nativeGitCache';
+import { markTransferFailure, type TransferFailureKind } from './transferFailure';
 import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, finishFolder, folderFiles, hydrateFile, withFolderConfirmation, type FolderFiles } from './nativeFolder';
 
 export interface CachedFile {
@@ -13,12 +14,13 @@ export interface CachedFile {
   mode?: string;
 }
 const DB_NAME = 'GitVault_Storage_v1';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const LEGACY = 'project_files';
 const SNAPSHOTS = 'snapshots';
 const CONTENTS = 'file_contents';
 const RECEIPTS = 'sync_receipts';
 const TRANSFERS = 'download_parts';
+const RECOVERY = 'download_recovery';
 const UPLOADS = 'uploaded_blobs';
 const snapshotId = (repoId: string, ref: string) => `${repoId}@${ref}`;
 interface Snapshot { id: string; repoId: string; ref: string; files: Omit<CachedFile, 'content'>[]; savedAt: string; nativeVersion?: string }
@@ -35,6 +37,7 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(SNAPSHOTS)) { const store = db.createObjectStore(SNAPSHOTS, { keyPath: 'id' }); store.createIndex('repoId', 'repoId'); }
       if (!db.objectStoreNames.contains(CONTENTS)) db.createObjectStore(CONTENTS, { keyPath: 'sha' });
       if (!db.objectStoreNames.contains(TRANSFERS)) { const store = db.createObjectStore(TRANSFERS, { keyPath: 'id' }); store.createIndex('transfer', 'transfer'); store.createIndex('commitSha', 'commitSha'); }
+      if (!db.objectStoreNames.contains(RECOVERY)) db.createObjectStore(RECOVERY, { keyPath: 'transfer' }).createIndex('commitSha', 'commitSha');
       if (!db.objectStoreNames.contains(RECEIPTS)) db.createObjectStore(RECEIPTS, { keyPath: 'id' });
       if (!db.objectStoreNames.contains(UPLOADS)) db.createObjectStore(UPLOADS, { keyPath: 'id' }).createIndex('repoId', 'repoId');
     };
@@ -52,14 +55,32 @@ function completed(tx: IDBTransaction): Promise<void> {
     tx.onerror = () => { /* onabort owns the transaction result */ };
   });
 }
+async function clearDownloadState(tx: IDBTransaction, ref: string) {
+  for (const name of [TRANSFERS, RECOVERY]) {
+    const store = tx.objectStore(name);
+    for (const key of await read<IDBValidKey[]>(store.index('commitSha').getAllKeys(ref))) store.delete(key);
+  }
+}
 async function withDB<T>(task: (db: IDBDatabase) => Promise<T>) {
   const db = await openDB();
   try { return await task(db); }
-  catch (error) { if ((error as Error).name === 'QuotaExceededError') throw new Error('本地存储空间或浏览器缓存配额不足，请释放空间后重试；原有项目和已保存的下载进度保留', { cause: error }); throw error; }
+  catch (error) { if ((error as Error).name === 'QuotaExceededError') throw markTransferFailure(new Error('本地存储空间或浏览器缓存配额不足，请释放空间后重试；原有项目和已保存的下载进度保留', { cause: error }), 'storage-space'); throw error; }
   finally { db.close(); }
 }
 export const transferCache = {
-  async clearAll():Promise<void>{await withDB(async db=>{const tx=db.transaction(TRANSFERS,'readwrite'),done=completed(tx);tx.objectStore(TRANSFERS).clear();await done;});},
+  async clearAll():Promise<void>{await withDB(async db=>{const tx=db.transaction([TRANSFERS,RECOVERY],'readwrite'),done=completed(tx);tx.objectStore(TRANSFERS).clear();tx.objectStore(RECOVERY).clear();await done;});},
+  async archiveRecovery(transfer: string): Promise<TransferFailureKind | undefined> {
+    return withDB(async db => {
+      const value = await read<any>(db.transaction(RECOVERY, 'readonly').objectStore(RECOVERY).get(transfer));
+      return value?.savedAt > Date.now() - 7 * 86400000 && ['network','archive','validation','cancelled'].includes(value.kind) ? value.kind : undefined;
+    });
+  },
+  async noteArchiveRecovery(transfer: string, commitSha: string, kind: TransferFailureKind): Promise<void> {
+    await withDB(async db => {
+      const tx = db.transaction(RECOVERY, 'readwrite'), done = completed(tx);
+      tx.objectStore(RECOVERY).put({ transfer, commitSha, kind, savedAt: Date.now() }); await done;
+    });
+  },
   async load(transfer: string): Promise<CachedFile[]> {
     return withDB(async db => {
       const tx = db.transaction(TRANSFERS, 'readonly');
@@ -79,9 +100,8 @@ export const transferCache = {
   },
   async clear(commitSha: string): Promise<void> {
     await withDB(async db => {
-      const tx = db.transaction(TRANSFERS, 'readwrite'); const done = completed(tx);
-      const store = tx.objectStore(TRANSFERS);
-      for (const key of await read<IDBValidKey[]>(store.index('commitSha').getAllKeys(commitSha))) store.delete(key);
+      const tx = db.transaction([TRANSFERS, RECOVERY], 'readwrite'); const done = completed(tx);
+      await clearDownloadState(tx, commitSha);
       await done;
     });
   },
@@ -128,10 +148,10 @@ export const localCache = {
         const originals=new Map(files.map((file,i)=>[file.path,{...file,...metadata[i]}]));
         await finishFolder(version!,async paths=>{for(const path of paths){const original=originals.get(path);if(!original)throw new Error('目录修复请求包含迁移清单外路径');await putFolderFile(version!,original);}});files = handles;
       }
-      await withDB(async db => { const tx = db.transaction([SNAPSHOTS, LEGACY, TRANSFERS], 'readwrite'), done = completed(tx);
+      await withDB(async db => { const tx = db.transaction([SNAPSHOTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite'), done = completed(tx);
         tx.objectStore(SNAPSHOTS).put({ id: snapshotId(repoId, ref), repoId, ref, files: files.map(({ content, ...file }) => file), nativeVersion: version, savedAt: new Date().toISOString() });
         if(!options.history)tx.objectStore(LEGACY).put({ repoId, currentRef: ref });
-        for (const key of await read<IDBValidKey[]>(tx.objectStore(TRANSFERS).index('commitSha').getAllKeys(ref))) tx.objectStore(TRANSFERS).delete(key);
+        await clearDownloadState(tx, ref);
         await done;
       });
       const attached=await folderBridge.attach({ version, owner: repoId, ref, history: !!options.history });
@@ -158,15 +178,14 @@ export const localCache = {
       };
       for (const file of prepared) { batch.push(file); bytes += file.size || 0; if (bytes >= 4 * 1024 * 1024 || batch.length >= 32) await flush(); }
       await flush();
-      const tx = db.transaction([SNAPSHOTS, CONTENTS, LEGACY, TRANSFERS], 'readwrite');
+      const tx = db.transaction([SNAPSHOTS, CONTENTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite');
       const done = completed(tx);
       // A different tab may have pruned an old snapshot between batches.
       const present = await Promise.all(prepared.map(file => read(tx.objectStore(CONTENTS).getKey(file.sha!))));
       prepared.forEach((file, i) => { if (present[i] === undefined) tx.objectStore(CONTENTS).put({ sha: file.sha, content: file.content, isBase64: file.isBase64 }); });
       tx.objectStore(SNAPSHOTS).put({ id: snapshotId(repoId, ref), repoId, ref, savedAt: new Date().toISOString(), files: prepared.map(({ content, ...file }) => file) });
       tx.objectStore(LEGACY).put({ repoId, currentRef: ref });
-      const partKeys = await read<IDBValidKey[]>(tx.objectStore(TRANSFERS).index('commitSha').getAllKeys(ref));
-      for (const key of partKeys) tx.objectStore(TRANSFERS).delete(key);
+      await clearDownloadState(tx, ref);
       await done;
     });
   },
@@ -218,13 +237,13 @@ export const localCache = {
       if(options.interactive)await withFolderConfirmation(clear,'清理将删除该项目目录中的已下载文件，保留项目记录和 GitHub 历史。');else await clear(false);
     }
     await withDB(async db => {
-      const tx = db.transaction([LEGACY, SNAPSHOTS, CONTENTS, TRANSFERS], 'readwrite');
+      const tx = db.transaction([LEGACY, SNAPSHOTS, CONTENTS, TRANSFERS, RECOVERY], 'readwrite');
       const done = completed(tx);
       const snapshots = tx.objectStore(SNAPSHOTS);
       const all = await read<Snapshot[]>(snapshots.getAll());
       const removed = all.filter(s => s.repoId === repoId && (!ref || s.ref === ref));
       for (const snapshot of removed) snapshots.delete(snapshot.id);
-      for (const snapshot of removed) for (const key of await read<IDBValidKey[]>(tx.objectStore(TRANSFERS).index('commitSha').getAllKeys(snapshot.ref))) tx.objectStore(TRANSFERS).delete(key);
+      for (const snapshot of removed) await clearDownloadState(tx, snapshot.ref);
       const remaining = all.filter(s => !removed.some(r => r.id === s.id));
       const referenced = new Set(remaining.flatMap(s => s.files.map(f => f.sha)));
       for (const snapshot of removed) for (const file of snapshot.files) if (!referenced.has(file.sha)) tx.objectStore(CONTENTS).delete(file.sha!);

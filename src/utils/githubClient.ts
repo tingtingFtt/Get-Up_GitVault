@@ -9,6 +9,7 @@ export { GitHubError } from './githubTransport';
 import { gitServiceConfig, gitServiceTransfer } from './gitService';
 import { measureTransfer } from './transferMetrics';
 import {shouldUseArchive} from './transferPlan';
+import {markTransferFailure, transferFailureKind, transferFailureLabel, isStorageFailure} from './transferFailure';
 
 export interface RepoEntry {
   path: string;
@@ -118,8 +119,8 @@ function base64FromBytes(bytes: Uint8Array) {
 }
 
 async function cachedFile(entry: RepoEntry, bytes: Uint8Array): Promise<CachedFile> {
-  if (entry.size !== undefined && bytes.length !== entry.size) throw new Error(`文件大小校验失败: ${entry.path}`);
-  if (await gitBlobSha(bytes) !== entry.sha) throw new Error(`文件校验失败: ${entry.path}`);
+  if (entry.size !== undefined && bytes.length !== entry.size) throw markTransferFailure(new Error(`文件大小校验失败: ${entry.path}`), 'validation');
+  if (await gitBlobSha(bytes) !== entry.sha) throw markTransferFailure(new Error(`文件校验失败: ${entry.path}`), 'validation');
   let content: string;
   let isBase64 = false;
   try {
@@ -171,14 +172,13 @@ export const githubClient = {
     const previous = new Map([...(options.cachedFiles || []), ...resumed].map(f => [f.path, f]));
     const previousBlobs = new Map([...previous.values()].filter(file => !file.nativeRef).map(file => [file.sha, file]));
     const files = new Map<string, CachedFile>();
-    const storageErrors=new WeakSet<object>();
     let pendingParts: CachedFile[] = [], pendingBytes = 0, saving = Promise.resolve();
-    const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)); return saving; };
+    const flushParts = () => { const batch = pendingParts; pendingParts = []; pendingBytes = 0; if (checkpoint && batch.length) saving = saving.then(() => checkpoint.saveBatch(transfer, commit.sha, batch)).catch(error => { throw markTransferFailure(error, isStorageFailure(error) ? transferFailureKind(error) : 'storage'); }); return saving; };
     const savePart = async (file: CachedFile) => { if (folder) return; if (!checkpoint) return; pendingParts.push(file); pendingBytes += file.size || file.content.length; if (pendingBytes >= 4 * 1024 * 1024 || pendingParts.length >= (entries.length >= 64 ? 32 : 1)) await flushParts(); };
     const storeFile = async (file:CachedFile) => {
       if(!file.isBase64&&file.content.startsWith('version https://git-lfs.github.com/spec/v1'))throw new Error('项目包含 Git LFS 指针，未标记完整下载');
       try{const saved=folder&&file.nativeRef?.version!==folder.id?await putFolderFile(folder.id,file,signal):file;
-      await savePart(saved);files.set(file.path,saved);}catch(error){if(error&&typeof error==='object')storageErrors.add(error);throw error;}
+      await savePart(saved);files.set(file.path,saved);}catch(error){throw markTransferFailure(error, isStorageFailure(error) ? transferFailureKind(error) : 'storage');}
     };
     let done = 0, nativeFolderFinished=false;
     const missing: RepoEntry[] = [];
@@ -217,7 +217,11 @@ export const githubClient = {
     // Stream large initial snapshots too: keep neither the complete ZIP nor
     // all inflated bytes alongside the cached source bodies in memory.
     const remainingBytes = missing.reduce((sum, entry) => sum + (entry.size || 0), 0);
-    if (shouldUseArchive(entries,missing.filter(entry=>!files.has(entry.path)))) {
+    // A previous partial archive already paid for the whole package. Keep that
+    // decision across reloads and fill only missing blobs for the same commit.
+    const archiveRecovery = checkpoint ? await checkpoint.archiveRecovery(transfer) : undefined;
+    if (archiveRecovery && missing.length) progress('恢复上次下载：复用已校验文件，仅补齐缺失内容…', options);
+    if (!archiveRecovery && shouldUseArchive(entries,missing.filter(entry=>!files.has(entry.path)))) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
       const { readArchive } = await import('./archiveDownload');
@@ -235,13 +239,18 @@ export const githubClient = {
           break;
         } catch (error) {
           await flushParts();
+          // Persist only partial progress; metadata never contains source bodies,
+          // credentials or an unpinned branch name. Storage failures stop here.
+          if (checkpoint && files.size > before && !isStorageFailure(error)) {
+            await checkpoint.noteArchiveRecovery(transfer, commit.sha, signal.aborted ? 'cancelled' : transferFailureKind(error));
+          }
           if (signal.aborted) throw signal.reason;
           if (error instanceof GitHubError && error.rateLimited) throw error;
-          if(error&&typeof error==='object'&&storageErrors.has(error))throw error;
-          if(['QuotaExceededError','NotAllowedError','SecurityError'].includes((error as Error)?.name))throw error;
+          if(isStorageFailure(error))throw error;
           trace.count('ZIP 失败',1);
+          trace.recovery(error);
           done = files.size;
-          progress('压缩包不可用，保留已验证文件并补齐缺失内容…', options);
+          progress(`${transferFailureLabel(error)}；保留已验证文件并补齐缺失内容…`, options);
           if (files.size === entries.length) break;
           // Once an archive has yielded verified files, do not download the
           // complete ZIP again via another endpoint just to fill a small gap.

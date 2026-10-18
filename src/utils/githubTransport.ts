@@ -1,3 +1,4 @@
+import { markTransferFailure } from './transferFailure';
 export class GitHubError extends Error {
   constructor(message: string, public status: number, public rateLimited = false, public retryAt?: number) { super(message); }
 }
@@ -118,7 +119,9 @@ export function createGithubTransport(options: TransportOptions = {}) {
     const touch = () => { if (closed || controller.signal.aborted) return; clearTimeout(timer); timer = setTimeout(() => controller.abort(new DOMException('GitHub 请求超时，请重试', 'TimeoutError')), timeout); };
     touch();
     try {
-      const response = await fetch(url, { ...init, signal: controller.signal });
+      const response = await fetch(url, { ...init, signal: controller.signal }).catch(error => {
+        controller.signal.throwIfAborted(); throw markTransferFailure(error, 'network');
+      });
       if (!response.ok) {
         const bytes = await response.arrayBuffer();
         let message = new TextDecoder().decode(bytes);

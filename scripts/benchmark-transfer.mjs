@@ -50,4 +50,5 @@ try{
   }
  }
 }finally{server.close();server.closeAllConnections();}
+const {benchmarkClient}=await import('./benchmark-client.mjs');report.client=await benchmarkClient(original);
 console.log(JSON.stringify(report,null,2));if(process.argv[2])await writeFile(process.argv[2],JSON.stringify(report,null,2)+'\n');

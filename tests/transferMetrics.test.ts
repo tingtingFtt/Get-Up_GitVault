@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { measureTransfer } from '../src/utils/transferMetrics';
 import { clearOperationLogs, readOperationLogs } from '../src/utils/operationLog';
 import {createGithubTransport} from '../src/utils/githubTransport';
+import {markTransferFailure} from '../src/utils/transferFailure';
 test('transfer diagnostics record stages and native sub-timings without bodies or credentials', async () => {
   clearOperationLogs();
   const value = await measureTransfer({ action: '上传', project: 'a/b', mode: 'native', signal: new AbortController().signal }, async trace => {
@@ -26,4 +27,12 @@ test('cancelled and failed transfers log the interrupted phase without changing 
     await assert.rejects(measureTransfer({ action: '拉取', project: 'a/b', mode: 'rest', signal }, async trace => { trace.phase('目录写入');throw error; }), candidate => candidate === error);
     assert.equal(readOperationLogs()[0].status, cancelled ? 'cancelled' : 'error');assert.equal(readOperationLogs()[0].stage, '目录写入');
   }
+});
+test('a successful archive fallback retains its classified cause and final storage errors stay separate',async()=>{
+  clearOperationLogs();const context={action:'拉取',project:'a/b',mode:'rest',signal:new AbortController().signal};
+  await measureTransfer(context,async trace=>{trace.recovery(markTransferFailure(new Error('must-not-log-response'),'network'));});
+  assert.match(readOperationLogs()[0].message,/压缩包恢复原因：网络失败或超时 1 次/);
+  assert.ok(!readOperationLogs()[0].message.includes('must-not-log-response'));
+  await assert.rejects(measureTransfer(context,async()=>{throw new DOMException('full','QuotaExceededError');}));
+  assert.match(readOperationLogs()[0].message,/失败分类：存储空间或配额不足/);
 });

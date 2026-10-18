@@ -19,7 +19,7 @@ public class GitObjectCacheTest {
     private File home()throws IOException{return Files.createTempDirectory(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir().toPath(),"cache-test-").toFile();}
     private static void remove(File file){File[] children=file.listFiles();if(children!=null)for(File child:children)remove(child);file.delete();}
     private static void put(File folder,String name,int bytes)throws IOException{Files.write(new File(folder,name).toPath(),new byte[bytes]);}
-    private static void benchmark(String line)throws IOException{
+    static void benchmark(String line)throws IOException{
         File report=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getFilesDir(),"gitvault-transfer-benchmark.txt");
         try(FileOutputStream output=new FileOutputStream(report,true)){output.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));}
         // Gradle uninstalls the test app after instrumentation. Move the report

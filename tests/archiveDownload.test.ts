@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { zipSync } from 'fflate';
 import { readArchive } from '../src/utils/archiveDownload';
 import { gitBlobSha } from '../src/utils/gitFiles';
+import {transferFailureKind} from '../src/utils/transferFailure';
 
 async function fixture(files: Record<string, Uint8Array>) {
   const entries = await Promise.all(Object.entries(files).map(async ([path, bytes]) => ({ path, sha: await gitBlobSha(bytes), mode: '100644', size: bytes.length })));
@@ -50,4 +51,14 @@ test('resume skips unwanted archive entries through a discard stream and saves o
   const input = stream(zip, 107);const saved: string[] = [];
   await readArchive(input.response, entries.filter(entry => entry.path === 'missing'), new AbortController().signal, async entry => { saved.push(entry.path); });
   assert.deepEqual(saved, ['missing']);
+});
+test('archive recovery distinguishes dropped network, broken ZIP, manifest mismatch and storage failure', async () => {
+  const {entries, zip} = await fixture({a: new Uint8Array([1,2,3])});
+  const signal = new AbortController().signal;
+  const dropped = new Response(new ReadableStream({start(controller) {controller.error(new TypeError('connection lost'));}}));
+  await assert.rejects(readArchive(dropped, entries, signal, async()=>{}), e => transferFailureKind(e)==='network');
+  await assert.rejects(readArchive(stream(zip).response, [...entries, {...entries[0], path:'absent'}], signal, async()=>{}), e => transferFailureKind(e)==='archive');
+  await assert.rejects(readArchive(stream(zip).response, [{...entries[0],size:999}], signal, async()=>assert.fail()), e => transferFailureKind(e)==='validation');
+  const quota = new DOMException('full','QuotaExceededError');
+  await assert.rejects(readArchive(stream(zip).response, entries, signal, async()=>{throw quota;}), e=>e===quota&&transferFailureKind(e)==='storage-space');
 });
