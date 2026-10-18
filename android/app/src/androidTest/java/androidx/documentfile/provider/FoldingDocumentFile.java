@@ -1,16 +1,18 @@
-package com.gitvault.app;
+package androidx.documentfile.provider;
 
 import android.net.Uri;
-import androidx.documentfile.provider.DocumentFile;
+import java.text.Normalizer;
+import java.util.Locale;
 
 /** Android filesystem-backed provider double with case-folded sibling lookup. */
-final class FoldingDocumentFile extends DocumentFile {
+public final class FoldingDocumentFile extends DocumentFile {
     private final DocumentFile delegate;
     private final boolean zeroSize;
-    FoldingDocumentFile(DocumentFile delegate){this(delegate,false);}
-    FoldingDocumentFile(DocumentFile delegate,boolean zeroSize){super(null);this.delegate=delegate;this.zeroSize=zeroSize;}
+    public FoldingDocumentFile(DocumentFile delegate){this(delegate,false);}
+    public FoldingDocumentFile(DocumentFile delegate,boolean zeroSize){super(null);this.delegate=delegate;this.zeroSize=zeroSize;}
     private DocumentFile wrap(DocumentFile value){return value==null?null:new FoldingDocumentFile(value,zeroSize);}
-    private DocumentFile existing(String name){for(DocumentFile child:delegate.listFiles())if(FolderPathLayout.folded(name).equals(FolderPathLayout.folded(child.getName())))return child;return null;}
+    private static String folded(String name){return Normalizer.normalize(name,Normalizer.Form.NFC).toUpperCase(Locale.ROOT).toLowerCase(Locale.ROOT);}
+    private DocumentFile existing(String name){for(DocumentFile child:delegate.listFiles())if(folded(name).equals(folded(child.getName())))return child;return null;}
     @Override public DocumentFile createFile(String mime,String name){DocumentFile old=existing(name);return wrap(old==null?delegate.createFile(mime,name):old);}
     @Override public DocumentFile createDirectory(String name){DocumentFile old=existing(name);return wrap(old==null?delegate.createDirectory(name):old);}
     @Override public Uri getUri(){return delegate.getUri();}

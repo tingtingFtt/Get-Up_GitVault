@@ -2,6 +2,7 @@ package com.gitvault.app;
 
 import android.content.Context;
 import androidx.documentfile.provider.DocumentFile;
+import androidx.documentfile.provider.FoldingDocumentFile;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import com.getcapacitor.*;
@@ -129,22 +130,22 @@ public class ManagedFolderStoreTest {
             String id=f.begin("case",expected).getString("id");f.store.write(id,"资源/应用/Bubble/.author",upper.length,hash(upper),"100644",new ByteArrayInputStream(upper),null);f.store.write(id,"资源/应用/bubble/.author",lower.length,hash(lower),"100644",new ByteArrayInputStream(lower),null);f.store.finish(id);f.store.attach(id,"case","case",false);
             JSObject scanned=f.store.describe(id,true,null);assertFalse(scanned.getBoolean("dirty"));assertEquals(2,scanned.getJSONObject("pathMappings").length());
             try(InputStream input=f.store.open(id,"资源/应用/Bubble/.author")){assertArrayEquals(upper,input.readAllBytes());}try(InputStream input=f.store.open(id,"资源/应用/bubble/.author")){assertArrayEquals(lower,input.readAllBytes());}
-            File metadata=new File(f.index,id+".json");assertEquals(2,new JSONObject(Files.readString(metadata.toPath())).getJSONObject("pathMappings").length());
+            File metadata=new File(f.index,id+".json");assertEquals(2,new JSONObject(new String(Files.readAllBytes(metadata.toPath()),StandardCharsets.UTF_8)).getJSONObject("pathMappings").length());
             JSArray handles=new JSArray(scanned.getJSONArray("files").toString());File gitDir=new File(f.home,"case-git");try(Git git=Git.init().setBare(true).setDirectory(gitDir).call();GitSnapshotStore objects=new GitSnapshotStore(git.getRepository(),gitDir,new AtomicBoolean());ManagedFolderStore.ReadBatch reader=f.store.readBatch()){objects.appendDocuments(handles,reader,message->{});assertNotNull(objects.writeTree(expected));assertArrayEquals(upper,git.getRepository().open(ObjectId.fromString(hash(upper))).getBytes());assertArrayEquals(lower,git.getRepository().open(ObjectId.fromString(hash(lower))).getBytes());}
-            f.store.exportFiles("content://test/tree/root","exports/case",handles,new JSONObject());JSONObject exported=new JSONObject(Files.readString(new File(f.root,"exports/case/.gitvault-export.json").toPath()));assertEquals(2,exported.getJSONObject("pathMappings").length());f.store.clear("case","case",false);assertTrue(new File(f.root,"exports/case/.gitvault-export.json").exists());
+            f.store.exportFiles("content://test/tree/root","exports/case",handles,new JSONObject());JSONObject exported=new JSONObject(new String(Files.readAllBytes(new File(f.root,"exports/case/.gitvault-export.json").toPath()),StandardCharsets.UTF_8));assertEquals(2,exported.getJSONObject("pathMappings").length());f.store.clear("case","case",false);assertTrue(new File(f.root,"exports/case/.gitvault-export.json").exists());
         }
     }
     @Test public void verificationReportsMissingModifiedAndExtraWithoutDeletingAnything()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] original="old".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",original));expected.put(entry("missing",original));String id=f.begin("diagnostics",expected).getString("id");f.store.write(id,"a",original.length,hash(original),"100644",new ByteArrayInputStream(original),null);Files.write(f.content(id,"a").toPath(),new byte[]{1});Files.write(f.content(id,"extra").toPath(),original);
             try{f.store.finish(id);fail("Mismatched directory must not publish");}catch(ManagedFolderStore.Verification error){assertFalse(error.repairable);assertEquals(1,error.details.getJSONObject("counts").getInt("missing"));assertEquals(1,error.details.getJSONObject("counts").getInt("modified"));assertEquals(1,error.details.getJSONObject("counts").getInt("extra"));assertTrue(error.getMessage().contains("缺失：missing"));assertTrue(error.getMessage().contains("内容不同：a"));assertTrue(error.getMessage().contains("额外文件：extra"));}
-            assertTrue(f.content(id,"extra").exists());File marker=new File(f.content(id,"a").getParentFile().getParentFile(),".gitvault-diagnostic.json");assertTrue(marker.exists());assertEquals(3,new JSONObject(Files.readString(marker.toPath())).getJSONArray("differences").length());
+            assertTrue(f.content(id,"extra").exists());File marker=new File(f.content(id,"a").getParentFile().getParentFile(),".gitvault-diagnostic.json");assertTrue(marker.exists());assertEquals(3,new JSONObject(new String(Files.readAllBytes(marker.toPath()),StandardCharsets.UTF_8)).getJSONArray("differences").length());
         }
     }
     @Test public void uncheckpointedCompleteFilesAreRecoveredAndOldIncompatibleCandidatesRemainUntouched()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] body="data".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",body));String id=f.begin("resume-orphan",expected).getString("id");Files.write(f.content(id,"a").toPath(),body);assertEquals(1,f.begin("resume-orphan",expected).getJSONArray("files").length());f.store.finish(id);
-            expected=new JSArray();expected.put(entry("Bubble/a",body));expected.put(entry("bubble/a",body));String previous=f.begin("legacy",expected).getString("id");File meta=new File(f.index,previous+".json");JSONObject saved=new JSONObject(Files.readString(meta.toPath()));saved.remove("pathMappings");Files.writeString(meta.toPath(),saved.toString());java.lang.reflect.Field cache=ManagedFolderStore.class.getDeclaredField("memoryIndex");cache.setAccessible(true);((Map<?,?>)cache.get(null)).remove(previous);
+            expected=new JSArray();expected.put(entry("Bubble/a",body));expected.put(entry("bubble/a",body));String previous=f.begin("legacy",expected).getString("id");File meta=new File(f.index,previous+".json");JSONObject saved=new JSONObject(new String(Files.readAllBytes(meta.toPath()),StandardCharsets.UTF_8));saved.remove("pathMappings");Files.write(meta.toPath(),saved.toString().getBytes(StandardCharsets.UTF_8));java.lang.reflect.Field cache=ManagedFolderStore.class.getDeclaredField("memoryIndex");cache.setAccessible(true);((Map<?,?>)cache.get(null)).remove(previous);
             String fresh=f.begin("legacy",expected).getString("id");assertNotEquals(previous,fresh);assertTrue(meta.exists());
         }
     }
