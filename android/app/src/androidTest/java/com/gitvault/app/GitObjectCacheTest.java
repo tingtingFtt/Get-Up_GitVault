@@ -24,8 +24,14 @@ public class GitObjectCacheTest {
         try(FileOutputStream output=new FileOutputStream(report,true)){output.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));}
         // Gradle uninstalls the test app after instrumentation. Move the report
         // to the shell-owned location before app-private files disappear.
-        android.os.ParcelFileDescriptor copied=InstrumentationRegistry.getInstrumentation().getUiAutomation().executeShellCommand("run-as com.gitvault.app.debug cat files/gitvault-transfer-benchmark.txt > /data/local/tmp/gitvault-transfer-benchmark.txt");
-        try(InputStream result=new android.os.ParcelFileDescriptor.AutoCloseInputStream(copied)){byte[] buffer=new byte[1024];while(result.read(buffer)!=-1){}}
+        // UiAutomation executes commands directly, without shell redirection.
+        byte[] expected=Files.readAllBytes(report.toPath());
+        android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        android.os.ParcelFileDescriptor[] copied=automation.executeShellCommandRwe("tee /data/local/tmp/gitvault-transfer-benchmark.txt");
+        try(OutputStream input=new android.os.ParcelFileDescriptor.AutoCloseOutputStream(copied[1])){input.write(expected);}
+        try(InputStream output=new android.os.ParcelFileDescriptor.AutoCloseInputStream(copied[0])){assertArrayEquals(expected,output.readAllBytes());}
+        try(InputStream error=new android.os.ParcelFileDescriptor.AutoCloseInputStream(copied[2])){assertEquals("Performance export failed",0,error.readAllBytes().length);}
+        try(InputStream actual=new android.os.ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand("cat /data/local/tmp/gitvault-transfer-benchmark.txt"))){assertArrayEquals(expected,actual.readAllBytes());}
         System.out.println(line);
     }
     @Test public void retentionIsExplicitIdentityScopedAndClearable()throws Exception{
