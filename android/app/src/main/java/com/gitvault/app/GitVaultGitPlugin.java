@@ -70,7 +70,7 @@ public class GitVaultGitPlugin extends Plugin {
                         String ref=call.getString("ref","");if(!ref.matches("[a-f0-9]{40}"))throw new IOException("拉取必须固定完整提交 SHA");
                         git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec("+"+ref+":refs/gitvault/source")).setProgressMonitor(monitor).call();
                         timings.put("fetchMs",android.os.SystemClock.elapsedRealtime()-phaseStart);phaseStart=android.os.SystemClock.elapsedRealtime();
-                        check(stop);result=staged.store.describe(ref);
+                        check(stop);result=staged.store.describe(ref);pinInternalRef(git.getRepository(),"refs/gitvault/source",ObjectId.fromString(ref));
                         String folderVersion=call.getString("folderVersion","");
                         if(!folderVersion.isEmpty()){
                             JSObject stored=new ManagedFolderStore(getContext()).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
@@ -86,8 +86,10 @@ public class GitVaultGitPlugin extends Plugin {
                             check(stop);String head=remoteHead(remote,branch,credentials);
                             ObjectId parent=null;
                             if(!head.isEmpty()) {
-                                git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec("+refs/heads/"+branch+":refs/gitvault/target")).setProgressMonitor(monitor).call();
-                                parent=git.getRepository().resolve("refs/gitvault/target");
+                                FetchResult fetched=git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec("+refs/heads/"+branch+":refs/gitvault/target")).setProgressMonitor(monitor).call();
+                                Ref advertised=fetched.getAdvertisedRef("refs/heads/"+branch);
+                                if(advertised==null||!git.getRepository().hasObject(advertised.getObjectId()))throw new IOException("目标分支获取结果不完整，未创建提交");
+                                parent=advertised.getObjectId();pinInternalRef(git.getRepository(),"refs/gitvault/target",parent);
                             }
                             ObjectId commit;
                             try(RevWalk walk=new RevWalk(git.getRepository());ObjectInserter insert=git.getRepository().newObjectInserter()) {
@@ -146,6 +148,12 @@ public class GitVaultGitPlugin extends Plugin {
     static String readText(InputStream input,int maximum)throws IOException{if(input==null)return "";try(InputStream stream=input;ByteArrayOutputStream output=new ByteArrayOutputStream()){byte[] buffer=new byte[8192];int n;while((n=stream.read(buffer))!=-1){if(output.size()+n>maximum)throw new IOException("响应超过大小限制");output.write(buffer,0,n);}return output.toString("UTF-8");}}
     private static String remoteHead(String remote,String branch,CredentialsProvider credentials)throws Exception {
         for(Ref ref:Git.lsRemoteRepository().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setHeads(true).call())if(ref.getName().equals("refs/heads/"+branch))return ref.getObjectId().name();return "";
+    }
+    static void pinInternalRef(Repository repository,String name,ObjectId commit)throws IOException {
+        if(!Arrays.asList("refs/gitvault/source","refs/gitvault/target").contains(name))throw new IOException("Git 内部引用无效");
+        RefUpdate update=repository.updateRef(name);update.setNewObjectId(commit);
+        RefUpdate.Result result=update.forceUpdate();
+        if(result!=RefUpdate.Result.NEW&&result!=RefUpdate.Result.FORCED&&result!=RefUpdate.Result.FAST_FORWARD&&result!=RefUpdate.Result.NO_CHANGE)throw new IOException("无法固定 Git 缓存提交："+result);
     }
     static JSObject readSnapshot(Repository repository,String ref,AtomicBoolean stop)throws Exception {
         JSObject result=new JSObject();JSArray files=new JSArray();long total=0;
