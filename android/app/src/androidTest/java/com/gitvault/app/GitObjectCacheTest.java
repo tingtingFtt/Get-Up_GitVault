@@ -19,6 +19,11 @@ public class GitObjectCacheTest {
     private File home()throws IOException{return Files.createTempDirectory(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir().toPath(),"cache-test-").toFile();}
     private static void remove(File file){File[] children=file.listFiles();if(children!=null)for(File child:children)remove(child);file.delete();}
     private static void put(File folder,String name,int bytes)throws IOException{Files.write(new File(folder,name).toPath(),new byte[bytes]);}
+    private static void benchmark(String line)throws IOException{
+        File report=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getFilesDir(),"gitvault-transfer-benchmark.txt");
+        try(FileOutputStream output=new FileOutputStream(report,true)){output.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+        System.out.println(line);
+    }
     @Test public void retentionIsExplicitIdentityScopedAndClearable()throws Exception{
         File home=home();try{
             GitObjectCache cache=new GitObjectCache(home);GitObjectCache.Lease first=cache.acquire(77,true);put(first.folder,"data",4);cache.release(first);assertEquals(4,cache.bytes());
@@ -50,7 +55,7 @@ public class GitObjectCacheTest {
                 }
                 long elapsed=android.os.SystemClock.elapsedRealtime()-start;if(run==0)coldMs=elapsed;else warmMs=elapsed;cache.release(lease);
             }
-            System.out.println("GITVAULT_BENCHMARK files=128 bytes=8388608 coldStageMs="+coldMs+" warmStageMs="+warmMs+" coldNewObjects=128 warmNewObjects=0 warmReusedObjects=128 tree="+tree);
+            benchmark("GITVAULT_BENCHMARK files=128 bytes=8388608 coldStageMs="+coldMs+" warmStageMs="+warmMs+" coldNewObjects=128 warmNewObjects=0 warmReusedObjects=128 tree="+tree);
             cache.clear();assertEquals(0,cache.bytes());
         }finally{remove(home);}
     }
@@ -66,7 +71,7 @@ public class GitObjectCacheTest {
                     assertEquals(run==2?"0eac81e38a73452529108ba3654317062d12be3c":"93654ba0fcbc4533e6c68803976ca279978dc4ff",store.describe(commit).getString("treeSha"));
                     GitVaultGitPlugin.pinInternalRef(git.getRepository(),"refs/gitvault/source",ObjectId.fromString(commit));
                     assertEquals(commit,git.getRepository().resolve("refs/gitvault/source").name());
-                    System.out.println("GITVAULT_FETCH_BENCHMARK cacheHit="+lease.reused+" fetchMs="+(android.os.SystemClock.elapsedRealtime()-start));
+                    benchmark("GITVAULT_FETCH_BENCHMARK cacheHit="+lease.reused+" fetchMs="+(android.os.SystemClock.elapsedRealtime()-start));
                 }cache.release(lease);
             }
         }finally{remove(home);}
