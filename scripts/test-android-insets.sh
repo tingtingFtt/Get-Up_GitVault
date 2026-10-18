@@ -7,7 +7,7 @@ collect_screenshots() {
     adb pull "/data/local/tmp/gitvault-insets-$name.png" "$project_root/android-device-screenshots/" || true
   done
   local report="$project_root/android-device-screenshots/native-transfer-benchmark.txt"
-  adb exec-out run-as com.gitvault.app.debug cat files/gitvault-transfer-benchmark.txt > "$report" || true
+  adb pull /data/local/tmp/gitvault-transfer-benchmark.txt "$report" || true
   if test -s "$report"; then cat "$report"; fi
 }
 trap collect_screenshots EXIT

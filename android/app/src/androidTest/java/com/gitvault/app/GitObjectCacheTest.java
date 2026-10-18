@@ -22,6 +22,10 @@ public class GitObjectCacheTest {
     private static void benchmark(String line)throws IOException{
         File report=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getFilesDir(),"gitvault-transfer-benchmark.txt");
         try(FileOutputStream output=new FileOutputStream(report,true)){output.write((line+"\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));}
+        // Gradle uninstalls the test app after instrumentation. Move the report
+        // to the shell-owned location before app-private files disappear.
+        android.os.ParcelFileDescriptor copied=InstrumentationRegistry.getInstrumentation().getUiAutomation().executeShellCommand("run-as com.gitvault.app.debug cat files/gitvault-transfer-benchmark.txt > /data/local/tmp/gitvault-transfer-benchmark.txt");
+        try(InputStream result=new android.os.ParcelFileDescriptor.AutoCloseInputStream(copied)){byte[] buffer=new byte[1024];while(result.read(buffer)!=-1){}}
         System.out.println(line);
     }
     @Test public void retentionIsExplicitIdentityScopedAndClearable()throws Exception{
