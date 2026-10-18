@@ -228,6 +228,9 @@ final class ManagedFolderStore {
     JSObject clear(String owner,String ref,boolean force,JSONArray verified)throws Exception{
         synchronized(LOCK){List<JSONObject> targets=new ArrayList<>();Set<String> approved=new HashSet<>();Set<String> keys=new HashSet<>();for(JSONObject value:all()){JSONObject binding=value.getJSONObject("owners").optJSONObject(owner);if(binding!=null&&(ref.isEmpty()||ref.equals(binding.getString("ref")))){if(value.getJSONObject("owners").length()==1&&!force){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty")){if(!ref.isEmpty()&&matches(state,verified))approved.add(value.getString("id"));else throw new Changed("清理将包含本地修改或额外文件："+state.getJSONArray("changes").toString());}}targets.add(value);keys.add(value.getString("key"));}}
             for(JSONObject value:all())if(value.getJSONObject("owners").length()==0&&keys.contains(value.getString("key"))&&(ref.isEmpty()||ref.equals(value.getString("ref"))))targets.add(value);
+            // A legacy failed candidate can contain merged/corrupt paths. Check
+            // every candidate before deleting the current, verified directory.
+            if(!force)for(JSONObject value:targets)if(value.getJSONObject("owners").length()==0){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty")){if(!ref.isEmpty()&&matches(state,verified))approved.add(value.getString("id"));else throw new Changed("旧临时下载目录有变化，尚未开始清理项目文件；可先使用清理临时缓存："+state.getJSONArray("changes").toString());}}
             JSONArray ids=new JSONArray();for(JSONObject value:targets)ids.put(value.getString("id"));
             for(JSONObject value:targets){if(value.getJSONObject("owners").length()<=1)erase(value,force||approved.contains(value.getString("id")));else{value.getJSONObject("owners").remove(owner);save(value);}}JSObject result=new JSObject();result.put("versions",targets.size());result.put("ids",ids);return result;
         }

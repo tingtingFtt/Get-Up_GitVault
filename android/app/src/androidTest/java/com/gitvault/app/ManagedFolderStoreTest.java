@@ -181,6 +181,14 @@ public class ManagedFolderStoreTest {
         try(Fixture f=new Fixture(true,true,true)){
             byte[] bytes="actual bytes".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("a",bytes));String id=f.begin("provider-length",expected).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);JSObject file=f.store.describeFile(id,"a");assertEquals(bytes.length,file.getLong("size"));assertEquals(hash(bytes),file.getString("sha"));assertFalse(f.store.describe(id,true,null).getBoolean("dirty"));
         }
+    @Test public void cleanupPreflightsFailedCandidatesBeforeDeletingTheCurrentVersion()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes="data".getBytes(StandardCharsets.UTF_8);JSArray oldExpected=new JSArray();oldExpected.put(entry("a",bytes));String old=f.begin("same",oldExpected).getString("id");f.store.write(old,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);Files.write(f.content(old,"a").toPath(),new byte[]{1});
+            JSArray expected=new JSArray();expected.put(entry("a",bytes));expected.put(entry("b",bytes));String current=f.begin("same",expected).getString("id");for(String path:Arrays.asList("a","b"))f.store.write(current,path,bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(current);f.store.attach(current,"owner","same",false);
+            try{f.store.clear("owner","same",false,expected);fail("Legacy changes must be checked before any deletion");}catch(ManagedFolderStore.Changed correct){assertTrue(correct.getMessage().contains("尚未开始清理"));}
+            assertTrue(f.content(current,"a").exists());assertTrue(f.content(old,"a").exists());f.store.cleanTemporary(true);f.store.clear("owner","same",false,expected);assertTrue(f.store.describe(current,false,null).getBoolean("missing"));
+        }
+    }
     }
 
 }
