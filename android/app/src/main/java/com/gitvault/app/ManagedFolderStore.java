@@ -105,7 +105,7 @@ final class ManagedFolderStore {
         public void close(){versions.clear();}
     }
     ReadBatch readBatch(){return new ReadBatch();}
-    private InputStream input(DocumentFile doc)throws IOException{InputStream stream=context.getContentResolver().openInputStream(doc.getUri());if(stream==null)throw new IOException("无法读取项目文件");return stream;}
+    private InputStream input(DocumentFile doc)throws IOException{return ManagedDocumentInput.open(context.getContentResolver(),doc.getUri());}
     private OutputStream output(DocumentFile doc)throws IOException{OutputStream stream=context.getContentResolver().openOutputStream(doc.getUri(),"wt");if(stream==null)throw new IOException("无法写入项目文件");return stream;}
     private static void check(AtomicBoolean stop)throws IOException{if(stop!=null&&(stop.get()||Thread.currentThread().isInterrupted()))throw new IOException("目录任务已取消，已完成的文件保留");}
     private static String hex(byte[] bytes){StringBuilder text=new StringBuilder();for(byte value:bytes)text.append(String.format(Locale.ROOT,"%02x",value&255));return text.toString();}
@@ -131,7 +131,7 @@ final class ManagedFolderStore {
                 if(previous==null){differences.put(new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","extra"));if(!includeExtras)continue;}
                 ContentDigest actual;try{actual=digest(doc,previous!=null&&previous.has("size")?previous.getLong("size"):doc.length(),stop);}catch(IOException error){check(stop);if(includeExtras)throw new IOException("无法校验目录文件："+path+"；"+error.getMessage(),error);differences.put(new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","unreadable").put("reason",String.valueOf(error.getMessage())));continue;}
                 JSONObject entry=new JSONObject();entry.put("path",path);entry.put("sha",actual.sha);entry.put("size",actual.size);entry.put("added",previous==null);entry.put("mode",previous==null?"100644":previous.getString("mode"));
-                if(previous!=null&&(!actual.sha.equals(previous.getString("sha"))||previous.has("size")&&previous.getLong("size")!=actual.size)){differences.put(new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","modified").put("expectedSha",previous.getString("sha")).put("actualSha",actual.sha));repairs.put(path);}
+                if(previous!=null&&(!actual.sha.equals(previous.getString("sha"))||previous.has("size")&&previous.getLong("size")!=actual.size)){JSONObject difference=new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","modified").put("expectedSha",previous.getString("sha")).put("actualSha",actual.sha).put("actualSize",actual.size).put("provider",doc.getUri().getAuthority());if(previous.has("size"))difference.put("expectedSize",previous.getLong("size"));differences.put(difference);repairs.put(path);}
                 entries.add(entry);
             }
             for(String path:baseline.keySet())if(!found.contains(path)){differences.put(new JSONObject().put("path",path).put("physicalPath",names.physical(path)).put("type","missing"));repairs.put(path);}
@@ -182,10 +182,10 @@ final class ManagedFolderStore {
         }
     }
     private Verification verification(JSONObject value,JSObject checked)throws Exception{
-        JSONObject counts=checked.getJSONObject("counts");JSONArray differences=checked.getJSONArray("differences");JSObject details=new JSObject();details.put("version",value.getString("id"));details.put("counts",counts);details.put("repairPaths",checked.getJSONArray("repairPaths"));details.put("differences",differences);details.put("pathMappings",value.optJSONObject("pathMappings"));
+        JSONObject counts=checked.getJSONObject("counts");JSONArray differences=checked.getJSONArray("differences");JSObject details=new JSObject();details.put("version",value.getString("id"));details.put("ref",value.getString("ref"));details.put("counts",counts);details.put("repairPaths",checked.getJSONArray("repairPaths"));details.put("differences",differences);details.put("pathMappings",value.optJSONObject("pathMappings"));
         boolean repairable=value.getString("state").equals("staging")&&value.getJSONObject("owners").length()==0&&counts.getInt("extra")==0&&counts.getInt("unreadable")==0&&checked.getJSONArray("repairPaths").length()>0;
         StringBuilder message=new StringBuilder("目录文件已变化或缺失，未发布新快照。缺失 "+counts.getInt("missing")+" · 内容不同 "+counts.getInt("modified")+" · 额外文件 "+counts.getInt("extra")+" · 读取失败 "+counts.getInt("unreadable"));
-        for(int i=0;i<Math.min(20,differences.length());i++){JSONObject entry=differences.getJSONObject(i);String type=entry.getString("type");message.append("\n").append(type.equals("missing")?"缺失：":type.equals("extra")?"额外文件：":type.equals("unreadable")?"读取失败：":"内容不同：").append(entry.getString("path"));if(entry.has("reason"))message.append("；").append(entry.getString("reason"));}
+        for(int i=0;i<Math.min(20,differences.length());i++){JSONObject entry=differences.getJSONObject(i);String type=entry.getString("type");message.append("\n").append(type.equals("missing")?"缺失：":type.equals("extra")?"额外文件：":type.equals("unreadable")?"读取失败：":"内容不同：").append(entry.getString("path"));if(type.equals("modified"))message.append("（期望 SHA ").append(entry.getString("expectedSha")).append("，实际 SHA ").append(entry.getString("actualSha")).append("）");if(entry.has("reason"))message.append("；").append(entry.getString("reason"));}
         if(counts.getInt("extra")>0)message.append("\n额外文件未删除，请将它们移出本次 files 目录后重试。");
         message.append("\n完整差异记录：").append(value.getString("relative")).append("/.gitvault-diagnostic.json");
         value.put("validation",details);try{save(value);DocumentFile version=versionDir(value,false);if(version!=null){DocumentFile target=version.findFile(".gitvault-diagnostic.json");if(target==null)target=createFile(version,".gitvault-diagnostic.json");try(OutputStream output=output(target)){output.write(details.toString().getBytes(StandardCharsets.UTF_8));}}}catch(Exception ignored){/* Keep the original verification reason even if diagnostics cannot be stored. */}
