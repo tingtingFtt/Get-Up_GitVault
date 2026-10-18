@@ -106,6 +106,15 @@ public class ManagedMediaInputTest {
             for(Map.Entry<String,byte[]> file:bodies.entrySet())try(InputStream input=store.open(id,file.getKey())){assertArrayEquals(file.getValue(),input.readAllBytes());}
             store.attach(id,"test","616f16f29011673299cab0e586682c048c86ac3b",false);store.clear("test","616f16f29011673299cab0e586682c048c86ac3b",false);assertTrue(store.describe(id,false,null).getBoolean("missing"));
             GitObjectCacheTest.benchmark("GITVAULT_MEDIA_INTEGRITY provider="+AUTHORITY+" files=2 legacyDifferent="+redactedReads+" originalByteExact=true gitRoundTrip=true");
-        }finally{try{if(selected!=null)assertTrue("Test directory must be removed",selected.delete());}finally{if(granted!=null)context.getContentResolver().releasePersistableUriPermission(granted,Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);remove(home);scenario.close();}}
+        }finally{
+            try{if(selected!=null)assertTrue("Test directory must be removed",selected.delete());}
+            finally{
+                try{
+                    // Deleting the selected tree can revoke its grant itself.
+                    // Release only a grant that still exists after deletion.
+                    if(granted!=null)for(android.content.UriPermission permission:context.getContentResolver().getPersistedUriPermissions())if(permission.getUri().equals(granted))context.getContentResolver().releasePersistableUriPermission(granted,Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                }finally{remove(home);scenario.close();}
+            }
+        }
     }
 }
