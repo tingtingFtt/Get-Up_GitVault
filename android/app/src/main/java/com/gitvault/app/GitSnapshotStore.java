@@ -72,8 +72,10 @@ final class GitSnapshotStore implements Closeable {
         byte[] bytes=android.util.Base64.decode(encoded,android.util.Base64.DEFAULT);if(bytes.length>CHUNK_BYTES)throw new IOException("上传分块超过大小限制");ensureSpace(bytes.length);
         try(OutputStream output=new FileOutputStream(part,true)){output.write(bytes);}writeOffset+=bytes.length;
         if(chunk.getBoolean("done")){
-            ObjectId blob;try(ObjectInserter insert=repository.newObjectInserter();InputStream stream=new FileInputStream(part)){blob=insert.insert(Constants.OBJ_BLOB,part.length(),stream);insert.flush();}
+            String expected=current.getString("sha");boolean reuse=stagedBlobs.contains(expected)||repository.hasObject(ObjectId.fromString(expected));
+            ObjectId blob;try(ObjectInserter insert=repository.newObjectInserter();InputStream stream=checked(new FileInputStream(part))){blob=reuse?insert.idFor(Constants.OBJ_BLOB,part.length(),stream):insert.insert(Constants.OBJ_BLOB,part.length(),stream);insert.flush();}
             if(!blob.name().equals(current.getString("sha")))throw new IOException("上传文件哈希不一致，未推送远端");
+            stagedBlobs.add(expected);if(reuse)reusedObjects++;else newObjects++;
             DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(Integer.parseInt(current.getString("mode"),8)));entry.setObjectId(blob);uploaded.put(path,entry);
             if(!part.delete())throw new IOException("上传临时文件清理失败");part=null;writing="";current=null;
         }
@@ -105,7 +107,7 @@ final class GitSnapshotStore implements Closeable {
         for(String segment:path.split("/"))if(segment.equalsIgnoreCase(".git"))throw new IOException("不能上传 Git 内部路径");
         int bits=Integer.parseInt(mode,8);if(bits!=0100644&&bits!=0100755&&bits!=0120000)throw new IOException("文件模式无效");
         if(size<0||!sha.matches("[a-f0-9]{40}"))throw new IOException("目录文件大小或哈希无效");
-        InputStream checked=new FilterInputStream(input){@Override public int read()throws IOException{check();int value=in.read();if(value!=-1)sourceBytes++;return value;}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();int count=in.read(bytes,offset,length);if(count>0)sourceBytes+=count;return count;}};
+        InputStream checked=checked(input);
         boolean reuse=stagedBlobs.contains(sha)||repository.hasObject(ObjectId.fromString(sha));
         // Always read/hash current source bytes, even on a cache hit. Reusing
         // an object may avoid compression and writes, never content validation.
@@ -115,6 +117,7 @@ final class GitSnapshotStore implements Closeable {
         stagedBlobs.add(sha);if(reuse)reusedObjects++;else newObjects++;
         DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(bits));entry.setObjectId(blob);uploaded.put(path,entry);
     }
+    private InputStream checked(InputStream input){return new FilterInputStream(input){@Override public int read()throws IOException{check();int value=in.read();if(value!=-1)sourceBytes++;return value;}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();int count=in.read(bytes,offset,length);if(count>0)sourceBytes+=count;return count;}};}
     static ObjectId writeTree(Repository repository,List<DirCacheEntry> entries)throws IOException{
         entries.sort((a,b)->{byte[] x=a.getRawPath(),y=b.getRawPath();for(int i=0;i<Math.min(x.length,y.length);i++)if(x[i]!=y[i])return (x[i]&255)-(y[i]&255);return x.length-y.length;});
         DirCache cache=DirCache.newInCore();DirCacheBuilder builder=cache.builder();for(DirCacheEntry entry:entries)builder.add(entry);builder.finish();

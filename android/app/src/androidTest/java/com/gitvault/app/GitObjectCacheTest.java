@@ -80,4 +80,13 @@ public class GitObjectCacheTest {
             }
         }finally{remove(home);}
     }
+    @Test public void chunkedAndDirectoryUploadsShareValidatedObjectReuse()throws Exception{
+        File home=home();try(Git git=Git.init().setBare(true).setDirectory(home).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),home,new AtomicBoolean())){
+            byte[] bytes={1,2,3};String sha;try(ObjectInserter hash=git.getRepository().newObjectInserter()){sha=hash.idFor(Constants.OBJ_BLOB,bytes).name();}
+            store.appendStream("directory",sha,"100644",bytes.length,new ByteArrayInputStream(bytes));
+            JSObject chunk=new JSObject();chunk.put("path","chunked");chunk.put("sha",sha);chunk.put("mode","100644");chunk.put("offset",0);chunk.put("done",true);chunk.put("content",android.util.Base64.encodeToString(bytes,android.util.Base64.NO_WRAP));store.append(chunk);
+            assertEquals(1,store.newObjects);assertEquals(1,store.reusedObjects);assertEquals(6,store.sourceBytes);
+            chunk.put("path","corrupt");chunk.put("content","BAUG");try{store.append(chunk);fail("Chunked cache hits must verify the new bytes");}catch(IOException expected){assertTrue(expected.getMessage().contains("哈希不一致"));}
+        }finally{remove(home);}
+    }
 }
