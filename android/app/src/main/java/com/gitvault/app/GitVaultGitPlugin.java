@@ -70,7 +70,7 @@ public class GitVaultGitPlugin extends Plugin {
                         String ref=call.getString("ref","");if(!ref.matches("[a-f0-9]{40}"))throw new IOException("拉取必须固定完整提交 SHA");
                         git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec("+"+ref+":refs/gitvault/source")).setProgressMonitor(monitor).call();
                         timings.put("fetchMs",android.os.SystemClock.elapsedRealtime()-phaseStart);phaseStart=android.os.SystemClock.elapsedRealtime();
-                        check(stop);result=staged.store.describe(ref);pinInternalRef(git.getRepository(),"refs/gitvault/source",ObjectId.fromString(ref));
+                        check(stop);result=staged.store.describe(ref);pinForCache(staged,id,"refs/gitvault/source",ObjectId.fromString(ref));
                         String folderVersion=call.getString("folderVersion","");
                         if(!folderVersion.isEmpty()){
                             JSObject stored=new ManagedFolderStore(getContext()).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
@@ -89,7 +89,7 @@ public class GitVaultGitPlugin extends Plugin {
                                 FetchResult fetched=git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setDepth(1).setRefSpecs(new RefSpec("+refs/heads/"+branch+":refs/gitvault/target")).setProgressMonitor(monitor).call();
                                 Ref advertised=fetched.getAdvertisedRef("refs/heads/"+branch);
                                 if(advertised==null||!git.getRepository().hasObject(advertised.getObjectId()))throw new IOException("目标分支获取结果不完整，未创建提交");
-                                parent=advertised.getObjectId();pinInternalRef(git.getRepository(),"refs/gitvault/target",parent);
+                                parent=advertised.getObjectId();pinForCache(staged,id,"refs/gitvault/target",parent);
                             }
                             ObjectId commit;
                             try(RevWalk walk=new RevWalk(git.getRepository());ObjectInserter insert=git.getRepository().newObjectInserter()) {
@@ -103,7 +103,7 @@ public class GitVaultGitPlugin extends Plugin {
                                 for(PushResult pushedResult:pushed)for(RemoteRefUpdate update:pushedResult.getRemoteUpdates())if(update.getStatus()!=RemoteRefUpdate.Status.OK&&update.getStatus()!=RemoteRefUpdate.Status.UP_TO_DATE)throw new IOException("Git 推送拒绝："+update.getStatus());
                             }catch(Exception exception){failure=exception;}
                             String actual=remoteHead(remote,branch,credentials);check(stop);
-                            if(actual.equals(commit.name())) {pinInternalRef(git.getRepository(),"refs/gitvault/target",commit);result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",expectedRepoId);result.put("verified",true);break;}
+                            if(actual.equals(commit.name())) {pinForCache(staged,id,"refs/gitvault/target",commit);result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",expectedRepoId);result.put("verified",true);break;}
                             if(call.getBoolean("rebaseOnConflict",false)&&!actual.equals(parent==null?"":parent.name())&&attempt<2)continue;
                             if(failure!=null)throw failure;throw new IOException("目标分支在推送期间变化；本地文件保留，不会强推");
                         }
@@ -148,6 +148,10 @@ public class GitVaultGitPlugin extends Plugin {
     static String readText(InputStream input,int maximum)throws IOException{if(input==null)return "";try(InputStream stream=input;ByteArrayOutputStream output=new ByteArrayOutputStream()){byte[] buffer=new byte[8192];int n;while((n=stream.read(buffer))!=-1){if(output.size()+n>maximum)throw new IOException("响应超过大小限制");output.write(buffer,0,n);}return output.toString("UTF-8");}}
     private static String remoteHead(String remote,String branch,CredentialsProvider credentials)throws Exception {
         for(Ref ref:Git.lsRemoteRepository().setRemote(remote).setCredentialsProvider(credentials).setTimeout(60).setHeads(true).call())if(ref.getName().equals("refs/heads/"+branch))return ref.getObjectId().name();return "";
+    }
+    private void pinForCache(Staged staged,String id,String name,ObjectId commit){
+        if(!staged.lease.retain||staged.invalidCache)return;
+        try{pinInternalRef(staged.git.getRepository(),name,commit);}catch(IOException failure){staged.invalidCache=true;progress(id,"Git 加速缓存暂不可写，本次传输继续；任务结束后回收临时对象");}
     }
     static void pinInternalRef(Repository repository,String name,ObjectId commit)throws IOException {
         if(!Arrays.asList("refs/gitvault/source","refs/gitvault/target").contains(name))throw new IOException("Git 内部引用无效");
