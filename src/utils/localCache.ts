@@ -1,6 +1,6 @@
 /** Durable, version-aware project cache. File contents are shared by Git blob SHA. */
 import { gitBlobSha } from './gitFiles';
-import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, folderFiles, hydrateFile, withFolderConfirmation, type FolderFiles } from './nativeFolder';
+import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, finishFolder, folderFiles, hydrateFile, withFolderConfirmation, type FolderFiles } from './nativeFolder';
 
 export interface CachedFile {
   nativeRef?: { version: string; path: string; dirty?: boolean; added?: boolean };
@@ -124,7 +124,8 @@ export const localCache = {
         const stage = await beginFolder(options.storageKey || JSON.stringify([repoId, 'main']), ref, options.label || repoId, metadata);
         version = stage.id; const handles: CachedFile[] = [];
         for(let i=0;i<files.length;i++)handles.push(await putFolderFile(version!,{...files[i],...metadata[i]}));
-        await folderBridge.finish({ version }); files = handles;
+        const originals=new Map(files.map((file,i)=>[file.path,{...file,...metadata[i]}]));
+        await finishFolder(version!,async paths=>{for(const path of paths){const original=originals.get(path);if(!original)throw new Error('目录修复请求包含迁移清单外路径');await putFolderFile(version!,original);}});files = handles;
       }
       await withDB(async db => { const tx = db.transaction([SNAPSHOTS, LEGACY, TRANSFERS], 'readwrite'), done = completed(tx);
         tx.objectStore(SNAPSHOTS).put({ id: snapshotId(repoId, ref), repoId, ref, files: files.map(({ content, ...file }) => file), nativeVersion: version, savedAt: new Date().toISOString() });
@@ -241,7 +242,8 @@ export const localCache = {
     const stage = await beginFolder(storageKey, ref, label, metadata.files.map(file => ({ path: file.path, sha: file.sha!, mode: file.mode || '100644', size: file.size })));
     const files: CachedFile[] = [];
     for (const entry of metadata.files) { signal?.throwIfAborted(); const file = entry.nativeRef?{...entry,content:''}:await localCache.getProjectFile(repoId, entry.path, ref); if (!file) throw new Error('旧缓存不完整，尚未切换主存储'); files.push(await putFolderFile(stage.id, file,signal)); }
-    await folderBridge.finish({ version: stage.id }); await localCache.saveProjectFiles(repoId, files, ref);
+    const originals=new Map(metadata.files.map(file=>[file.path,file]));
+    await finishFolder(stage.id,async paths=>{for(const path of paths){signal?.throwIfAborted();const entry=originals.get(path);if(!entry)throw new Error('目录修复请求包含迁移清单外路径');const original=entry.nativeRef?{...entry,content:''}:await localCache.getProjectFile(repoId,path,ref);if(!original)throw new Error('旧缓存不完整，尚未切换主存储');await putFolderFile(stage.id,original,signal);}},signal);await localCache.saveProjectFiles(repoId, files, ref);
     await withDB(async db=>{const tx=db.transaction(SNAPSHOTS,'readwrite'),done=completed(tx),store=tx.objectStore(SNAPSHOTS);for(const old of await read<Snapshot[]>(store.index('repoId').getAll(repoId)))if(!old.nativeVersion&&old.ref!==ref)store.delete(old.id);await done;});
     await localCache.pruneBodies();
   },

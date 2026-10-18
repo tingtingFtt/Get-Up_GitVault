@@ -3,7 +3,7 @@ import {test,beforeEach,afterEach,mock} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {Capacitor} from '@capacitor/core';
-import {folderBridge,hydrateFile,saveFolderArchive} from '../src/utils/nativeFolder';
+import {folderBridge,hydrateFile,saveFolderArchive,finishFolder} from '../src/utils/nativeFolder';
 import {exportProjectDirectory} from '../src/utils/nativePlatform';
 import {nativeGitBridge,nativeGitTransfer} from '../src/utils/nativeGit';
 import {localCache,type CachedFile} from '../src/utils/localCache';
@@ -78,4 +78,24 @@ test('explicit directory exports use native streams without hydrating or transmi
  let exported=false;mock.method(folderBridge,'export',async(value:any)=>{assert.equal(value.files[0].size,file.size);assert.equal(value.files[0].content,undefined);assert.ok(value.prefix.startsWith('GitVault-exports/'));assert.equal(value.project.token,undefined);exported=true;});
  mock.method(folderBridge,'read',async()=>assert.fail('Export bytes must stay native'));
  await exportProjectDirectory('content://test/tree/root',{owner:'a',repo:'b',branch:'dev',latestCommitSha:'c'.repeat(40),token:'must-not-export'} as any,[file]);assert.ok(exported);
+});
+test('folder verification repairs only requested paths once and requires a second successful check',async()=>{
+ let checks=0,repairs=0;mock.method(folderBridge,'finish',async()=>{if(++checks===1)throw Object.assign(new Error('missing a'),{code:'FOLDER_REPAIR',data:{version:'candidate',repairPaths:['a','b','a']}});return{state:'ready'};});
+ const result=await finishFolder('candidate',async paths=>{repairs++;assert.deepEqual(paths,['a','b']);});assert.equal(result.state,'ready');assert.equal(checks,2);assert.equal(repairs,1);
+ mock.method(folderBridge,'finish',async()=>{throw Object.assign(new Error('still modified'),{code:'FOLDER_REPAIR',data:{version:'candidate',repairPaths:['a']}});});repairs=0;await assert.rejects(finishFolder('candidate',async()=>{repairs++;}),/still modified/);assert.equal(repairs,1);
+});
+test('extra files, mismatched candidate IDs and cancellation never trigger unsafe repair or publication',async()=>{
+ for(const problem of [{code:'FOLDER_STORAGE',data:{version:'candidate',repairPaths:['a']}},{code:'FOLDER_REPAIR',data:{version:'other',repairPaths:['a']}},{code:'FOLDER_REPAIR',data:{version:'candidate',repairPaths:[1]}}]){
+  mock.method(folderBridge,'finish',async()=>{throw Object.assign(new Error('preserve extra files'),problem);});await assert.rejects(finishFolder('candidate',async()=>assert.fail('Unsafe repair')),/preserve extra/);
+ }
+ let checks=0;const controller=new AbortController();mock.method(folderBridge,'finish',async()=>{checks++;throw Object.assign(new Error('missing'),{code:'FOLDER_REPAIR',data:{version:'candidate',repairPaths:['a']}});});await assert.rejects(finishFolder('candidate',async()=>controller.abort(),controller.signal),{name:'AbortError'});assert.equal(checks,1);
+});
+test('REST directory imports refetch only damaged files and reject repair paths outside the pinned manifest',async()=>{
+ enable();immediateTransport();beginGithubOperation();localStorage.setItem('gitvault_git_service_v1',JSON.stringify({mode:'rest',url:''}));
+ const contents=new Map([['a',Buffer.from('first')],['b',Buffer.from('second')]]),manifest=[...contents].map(([path,bytes])=>({path,size:bytes.length,sha:sha(bytes),mode:'100644',type:'blob'}));let blobs:string[]=[],checks=0;
+ globalThis.fetch=async input=>{const path=String(input);if(path.endsWith('/repos/source/project'))return new Response(JSON.stringify({id:77,default_branch:'main'}));if(path.includes('/commits/'))return new Response(JSON.stringify({sha:'pinned',commit:{tree:{sha:'tree'},author:{}}}));if(path.includes('/git/trees/'))return new Response(JSON.stringify({tree:manifest}));const entry=manifest.find(entry=>path.endsWith('/git/blobs/'+entry.sha));assert.ok(entry,path);blobs.push(entry.path);return new Response(JSON.stringify({content:contents.get(entry.path)!.toString('base64')}));};
+ mock.method(folderBridge,'finish',async()=>{if(++checks===1)throw Object.assign(new Error('missing a'),{code:'FOLDER_REPAIR',data:{version:'version',repairPaths:['a']}});return{};});
+ const result=await githubClient.fetchRepo('source/project');assert.equal(result.files.length,2);assert.deepEqual(blobs.sort(),['a','a','b']);assert.equal(checks,2);
+ blobs=[];checks=0;mock.method(folderBridge,'finish',async()=>{throw Object.assign(new Error('bad request'),{code:'FOLDER_REPAIR',data:{version:'version',repairPaths:['../outside']}});});
+ await assert.rejects(githubClient.fetchRepo('source/project'),/快照外路径/);assert.equal(blobs.length,2);
 });

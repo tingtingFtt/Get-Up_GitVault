@@ -1,4 +1,4 @@
-import {usesNativeFolder, beginFolder, putFolderFile, folderBridge, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, type FolderFiles} from './nativeFolder';
+import {usesNativeFolder, beginFolder, putFolderFile, finishFolder, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, type FolderFiles} from './nativeFolder';
 import { gitBlobSha, gitTreeSha } from './gitFiles';
 export { gitBlobSha } from './gitFiles';
 import { transferCache, uploadCache } from './localCache';
@@ -257,7 +257,11 @@ export const githubClient = {
     if (lfsPointers.length) throw new Error(`项目包含 Git LFS 文件（${lfsPointers.slice(0, 3).join('、')}），当前无法完整保存其大文件内容`);
     trace.phase('验证完整快照');
     progress(`文件已校验 ${files.size}/${entries.length}，正在保存缓存…`, options);
-    if(folder&&!nativeFolderFinished)await folderBridge.finish({version:folder.id});
+    if(folder&&!nativeFolderFinished)await finishFolder(folder.id,async paths=>{
+      const manifest=new Map(entries.map(entry=>[entry.path,entry]));
+      if(paths.some(path=>!manifest.has(path)))throw new Error('目录修复请求包含快照外路径，已停止并保留文件');
+      await mapConcurrent(paths,2,async path=>{signal.throwIfAborted();const entry=manifest.get(path)!;const blob=await json(`${root(owner,repo)}/git/blobs/${entry.sha}`,token,{},signal);await storeFile(await cachedFile(entry,bytesFromBase64(blob.content)));});
+    },signal);
     const completedFiles=entries.map(e=>files.get(e.path)!) as FolderFiles;
     if(folder)completedFiles.nativeSnapshot={version:folder.id,dirty:false};
     return {

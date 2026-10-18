@@ -1,6 +1,7 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import type { PluginListenerHandle } from '@capacitor/core';
 import type { CachedFile } from './localCache';
+import {noteFolderRepair} from './nativeFolder';
 export interface NativeGitFile { path: string; sha: string; mode: string; size?: number; encoding: 'base64'; content: string; nativeRef?: CachedFile['nativeRef'] }
 export interface NativeFetchOptions { onFile?: (file: NativeGitFile) => Promise<void>; paths?: string[] }
 interface NativeGit {
@@ -73,6 +74,7 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
   const result=await nativeGitBridge.transfer({...identity,action,id,token});signal.throwIfAborted();
   if(!result.chunked||!Array.isArray(result.files))throw new Error('原生 Git 分块协议不匹配，请更新 APK');
   if(result.folder){
+   noteFolderRepair(payload.folderVersion||'',Number.isSafeInteger(result.repairedFiles)?result.repairedFiles:0);
    if(options.onFile)for(const file of result.files){signal.throwIfAborted();await options.onFile(file);}
    return {...result,streamed:!!options.onFile};
   }

@@ -2,6 +2,7 @@ import {Capacitor} from '@capacitor/core';
 import {androidPlugin} from './androidPlugin';
 import {appDialog} from './appDialog';
 import {gitBlobSha} from './gitFiles';
+import {appendOperationLog} from './operationLog';
 import type {CachedFile} from './localCache';
 export const folderBridge={
  discard:(value:any)=>androidPlugin.folderDiscard(value),export:(value:any)=>androidPlugin.folderExport(value),file:(value:any)=>androidPlugin.folderFile(value),status:(value:any)=>androidPlugin.folderStatus(value),begin:(value:any)=>androidPlugin.folderBegin(value),list:(value:any)=>androidPlugin.folderList(value),read:(value:any)=>androidPlugin.folderRead(value),put:(value:any)=>androidPlugin.folderPut(value),copy:(value:any)=>androidPlugin.folderCopy(value),finish:(value:any)=>androidPlugin.folderFinish(value),attach:(value:any)=>androidPlugin.folderAttach(value),clear:(value:any)=>androidPlugin.folderClear(value),cleanTemporary:(value:any)=>androidPlugin.folderCleanTemporary(value),archive:(value:any)=>androidPlugin.folderArchive(value),
@@ -14,7 +15,25 @@ export async function withFolderConfirmation<T>(run:(force:boolean)=>Promise<T>,
  try{return await run(false);}catch(error){if((error as {code?:string}).code!=='LOCAL_CHANGES')throw error;if(!await appDialog.confirm(`${message}\n${(error as Error).message}\n确认后继续；取消会保留现有文件。`))throw new DOMException('目录操作已取消','AbortError');return run(true);}
 }
 export async function beginFolder(key:string,ref:string,label:string,files:Array<{path:string;sha:string;mode:string;size?:number}>){
- return withFolderConfirmation(force=>folderBridge.begin({root:folderRoot(),key,ref,label,files,allowChanged:force}),'指定目录中检测到本地变动，是否允许拉取远端版本？');
+ const state=await withFolderConfirmation(force=>folderBridge.begin({root:folderRoot(),key,ref,label,files,allowChanged:force}),'指定目录中检测到本地变动，是否允许拉取远端版本？');
+ if(state.pathMappings&&Object.keys(state.pathMappings).length){
+  const message='检测到大小写或 Unicode 名称冲突，已使用兼容目录名保存；上传及 ZIP 导出保留原始路径。\n'+Object.entries(state.pathMappings).map(([path,name])=>`${path} → ${name}`).join('\n');
+  try{appendOperationLog({action:'目录兼容',status:'success',project:label,stage:'规划本地文件名',message});}catch{}
+  window.dispatchEvent(new CustomEvent('gitvault-progress',{detail:'检测到名称冲突，正在使用兼容目录保存，仓库原始名称保留…'}));
+ }
+ return state;
+}
+export function noteFolderRepair(version:string,count:number){if(!count)return;try{appendOperationLog({action:'目录修复',status:'success',project:version,stage:'补齐缺失或损坏文件',message:`已修复 ${count} 个文件，完整目录校验通过；原快照和额外文件保留。`});}catch{}}
+/** Only an unbound download candidate may request one bounded repair pass. */
+export async function finishFolder(version:string,repair?:(paths:string[])=>Promise<void>,signal?:AbortSignal){
+ signal?.throwIfAborted();
+ try{return await folderBridge.finish({version});}catch(error){
+  const problem=error as {code?:string;data?:{version?:string;repairPaths?:unknown}};
+  if(problem.code!=='FOLDER_REPAIR'||!repair||problem.data?.version!==version||!Array.isArray(problem.data.repairPaths)||!problem.data.repairPaths.length||!problem.data.repairPaths.every(path=>typeof path==='string'))throw error;
+  const paths=[...new Set(problem.data.repairPaths as string[])];signal?.throwIfAborted();
+  window.dispatchEvent(new CustomEvent('gitvault-progress',{detail:`正在补拉 ${paths.length} 个缺失／损坏文件，已验证的其他文件保留…`}));
+  await repair(paths);signal?.throwIfAborted();const result=await folderBridge.finish({version});signal?.throwIfAborted();noteFolderRepair(version,paths.length);return result;
+ }
 }
 const CHUNK=384*1024;
 function encode(bytes:Uint8Array){let value='';for(let i=0;i<bytes.length;i+=8192)value+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(value);}

@@ -70,6 +70,7 @@ public class GitVaultGitPlugin extends Plugin {
                         if(!folderVersion.isEmpty()){
                             JSObject stored=new ManagedFolderStore(getContext()).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
                             result.put("files",stored.getJSONArray("files"));result.put("folder",true);result.put("folderVersion",folderVersion);result.put("streamed",true);
+                            result.put("repairedFiles",stored.optInt("repairedFiles",0));
                             timings.put("folderMs",android.os.SystemClock.elapsedRealtime()-phaseStart);
                         }else retain=true;
                     } else {
@@ -105,7 +106,7 @@ public class GitVaultGitPlugin extends Plugin {
                     result.put("timings",timings);
                     check(stop);call.resolve(result);
                 }
-            }catch(Exception exception){String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}
+            }catch(Exception exception){String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");if(exception instanceof ManagedFolderStore.Verification)call.reject(message,"FOLDER_STORAGE",((ManagedFolderStore.Verification)exception).details);else call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}
             finally {if(!retain)releaseSession(id);}
         });
     }

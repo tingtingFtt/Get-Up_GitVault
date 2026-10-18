@@ -128,7 +128,7 @@ public class GitVaultNativePlugin extends Plugin {
         });
     }
     private interface FolderTask { JSObject run(ManagedFolderStore store)throws Exception; }
-    private void folderTask(PluginCall call,FolderTask task){io.execute(()->{try{call.resolve(task.run(new ManagedFolderStore(getContext())));}catch(Exception error){call.reject(error.getMessage(),error instanceof ManagedFolderStore.Changed?"LOCAL_CHANGES":"FOLDER_STORAGE");}});}
+    private void folderTask(PluginCall call,FolderTask task){io.execute(()->{try{call.resolve(task.run(new ManagedFolderStore(getContext())));}catch(Exception error){if(error instanceof ManagedFolderStore.Verification){ManagedFolderStore.Verification problem=(ManagedFolderStore.Verification)error;call.reject(error.getMessage(),problem.repairable?"FOLDER_REPAIR":"FOLDER_STORAGE",problem.details);}else call.reject(error.getMessage(),error instanceof ManagedFolderStore.Changed?"LOCAL_CHANGES":"FOLDER_STORAGE");}});}
     @PluginMethod public void folderStatus(PluginCall call){folderTask(call,store->store.status(call.getString("root","")));}
     @PluginMethod public void folderBegin(PluginCall call){folderTask(call,store->store.begin(call.getString("root",""),call.getString("key",""),call.getString("ref",""),call.getString("label","project"),call.getArray("files",new com.getcapacitor.JSArray()),call.getBoolean("allowChanged",false)));}
     @PluginMethod public void folderList(PluginCall call){folderTask(call,store->store.describe(call.getString("version",""),call.getBoolean("scan",false),null));}
