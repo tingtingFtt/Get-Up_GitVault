@@ -103,7 +103,7 @@ public class GitVaultGitPlugin extends Plugin {
                                 for(PushResult pushedResult:pushed)for(RemoteRefUpdate update:pushedResult.getRemoteUpdates())if(update.getStatus()!=RemoteRefUpdate.Status.OK&&update.getStatus()!=RemoteRefUpdate.Status.UP_TO_DATE)throw new IOException("Git 推送拒绝："+update.getStatus());
                             }catch(Exception exception){failure=exception;}
                             String actual=remoteHead(remote,branch,credentials);check(stop);
-                            if(actual.equals(commit.name())) {result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",expectedRepoId);result.put("verified",true);break;}
+                            if(actual.equals(commit.name())) {pinInternalRef(git.getRepository(),"refs/gitvault/target",commit);result=new JSObject();result.put("commitSha",commit.name());result.put("treeSha",tree.name());result.put("branch",branch);result.put("repoId",expectedRepoId);result.put("verified",true);break;}
                             if(call.getBoolean("rebaseOnConflict",false)&&!actual.equals(parent==null?"":parent.name())&&attempt<2)continue;
                             if(failure!=null)throw failure;throw new IOException("目标分支在推送期间变化；本地文件保留，不会强推");
                         }

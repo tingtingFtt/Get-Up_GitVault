@@ -71,6 +71,8 @@ public class GitObjectCacheTest {
                     assertEquals(run==2?"0eac81e38a73452529108ba3654317062d12be3c":"93654ba0fcbc4533e6c68803976ca279978dc4ff",store.describe(commit).getString("treeSha"));
                     GitVaultGitPlugin.pinInternalRef(git.getRepository(),"refs/gitvault/source",ObjectId.fromString(commit));
                     assertEquals(commit,git.getRepository().resolve("refs/gitvault/source").name());
+                    if(run==0)GitVaultGitPlugin.pinInternalRef(git.getRepository(),"refs/gitvault/target",ObjectId.fromString(commit));
+                    assertEquals("20bcc4da49f82080513540befc663799fd707fa4",git.getRepository().resolve("refs/gitvault/target").name());
                     benchmark("GITVAULT_FETCH_BENCHMARK cacheHit="+lease.reused+" fetchMs="+(android.os.SystemClock.elapsedRealtime()-start));
                 }cache.release(lease);
             }
