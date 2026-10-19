@@ -27,11 +27,12 @@ beforeEach(async()=>{
   if(path.includes('/git/commits/'+head))return reply({tree:{sha:tree}});
   if(path.includes('/commits/'))return reply({sha:commit,commit:{tree:{sha:tree},message:'source',author:{}}});
   if(path.includes('/git/trees/'))return reply({tree:entries});
+  if(path.endsWith('/git/blobs/'+entries[1].sha))return reply({encoding:'base64',content:''});
   throw new Error('Unexpected REST '+path);
  };
 });
 afterEach(()=>{globalThis.fetch=originalFetch;mock.restoreAll();localStorage.clear();});
-test('native client checkpoints verified files and resumes without reading them again',async()=>{
+test('native client resumes verified files through only the missing blob without another cold pack',async()=>{
  const read=nativeGitBridge.readChunk;let failed=false;
  mock.method(nativeGitBridge,'readChunk',async(value:Record<string,unknown>)=>{if(value.path==='empty.txt'&&!failed){failed=true;throw new Error('interrupted');}return read(value);});
  await assert.rejects(githubClient.fetchRepo('source/project'),/interrupted/);
@@ -39,7 +40,7 @@ test('native client checkpoints verified files and resumes without reading them 
  const result=await githubClient.fetchRepo('source/project');assert.equal(result.files.length,2);assert.equal(paths.filter(path=>path==='资源/large.bin').length,firstReads);
  await localCache.saveProjectFiles('saved',result.files,result.latestCommitSha);
  assert.equal((await localCache.getProjectFiles('saved'))[0].sha,entries[0].sha);assert.equal((await transferCache.load(`source/project@${commit}`)).length,0);
- assert.ok(!apiCalls.some(path=>path.includes('/git/blobs/')||path.includes('/zipball/')));assert.equal(released,2);
+ assert.deepEqual(apiCalls.filter(path=>path.includes('/git/blobs/')),[`/repos/source/project/git/blobs/${entries[1].sha}`]);assert.ok(!apiCalls.some(path=>path.includes('/zipball/')));assert.equal(released,1);
 });
 test('native push stages file chunks before a metadata-only transfer and verifies the matching branch',async()=>{
  let chunks=0;mock.method(nativeGitBridge,'prepareUpload',async()=>{});mock.method(nativeGitBridge,'appendChunk',async(value:Record<string,unknown>)=>{assert.ok(Buffer.from(String(value.content),'base64').length<=NATIVE_CHUNK_BYTES);chunks++;});

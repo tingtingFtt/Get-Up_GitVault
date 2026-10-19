@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {shouldUseArchive} from '../src/utils/transferPlan';
+import {shouldUseArchive,shouldUseNativeBlobDelta} from '../src/utils/transferPlan';
 test('download plans favor large initial archives and preserve small incremental downloads',()=>{
  const mib=1024*1024;const huge={size:400*mib},small=Array.from({length:32},()=>({size:100}));
  assert.equal(shouldUseArchive([huge,...small],small),false);
@@ -15,4 +15,14 @@ test('existing snapshots transfer only changed bodies even when a small archive 
  const entries=Array.from({length:32},()=>({size:100}));
  assert.equal(shouldUseArchive(entries,entries.slice(0,16),true),false);
  assert.equal(shouldUseArchive(entries,entries,true),true);
+});
+
+test('native small deltas avoid a cold full pack while large, unknown-size and initial transfers remain streamed',()=>{
+ const entries=Array.from({length:100},()=>({size:1024*1024}));
+ assert.equal(shouldUseNativeBlobDelta(entries,entries.slice(0,4)),true);
+ assert.equal(shouldUseNativeBlobDelta(entries,entries.slice(0,17)),false);
+ assert.equal(shouldUseNativeBlobDelta(entries,[]),false);
+ assert.equal(shouldUseNativeBlobDelta(entries,entries),false);
+ assert.equal(shouldUseNativeBlobDelta(entries,[{}]),false);
+ assert.equal(shouldUseNativeBlobDelta(entries,Array.from({length:33},()=>({size:0}))),false);
 });

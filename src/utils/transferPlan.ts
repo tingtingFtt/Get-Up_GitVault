@@ -28,3 +28,10 @@ export function planFileChanges(previous: FileIdentity[], next: FileIdentity[]) 
   }
   plan.removed.push(...old.keys()); return plan;
 }
+
+/** With no retained Git objects, a shallow fetch can still transfer an entire
+ * pack. Small pinned deltas use the shared REST queue instead, with bounded
+ * aggregate bodies. Larger transfers retain native Git streaming. */
+export function shouldUseNativeBlobDelta(entries:SizedEntry[],missing:SizedEntry[]) {
+ return missing.length>0&&missing.length<entries.length&&missing.length<=32&&missing.every(file=>Number.isSafeInteger(file.size)&&file.size!>=0)&&missing.reduce((sum,file)=>sum+file.size!,0)<=16*1024*1024;
+}

@@ -110,3 +110,14 @@ test('verified ready directory references win over older cached handles and stil
  mock.method(folderBridge,'finish',async()=>{checks++;return{};});
  const result=await githubClient.fetchRepo('source/project',undefined,undefined,{cachedFiles:[{...entry,content:'',isBase64:true,nativeRef:{version:'old',path:'a'}}]});assert.equal(result.files[0].nativeRef?.version,'version');assert.equal(checks,1);
 });
+
+test('native directory small updates fetch only missing pinned blobs without downloading a cold Git pack',async()=>{
+ enable();immediateTransport();beginGithubOperation();const unchanged=Buffer.from('already local'),changed=Buffer.from('new content');
+ const manifest=[{path:'a',sha:sha(unchanged),size:unchanged.length,type:'blob',mode:'100644'},{path:'b',sha:sha(changed),size:changed.length,type:'blob',mode:'100644'}];const blobs:string[]=[];
+ mock.method(folderBridge,'begin',async()=>({id:'version',state:'staging',files:[nativeFile({...manifest[0],content:'',isBase64:true})]}));
+ mock.method(folderBridge,'copy',async()=>assert.fail('Old files were already prepared natively'));
+ mock.method(nativeGitBridge,'transfer',async()=>assert.fail('Small delta must not fetch a full Git pack'));
+ globalThis.fetch=async input=>{const path=String(input);if(path.endsWith('/repos/source/project'))return new Response(JSON.stringify({id:77,default_branch:'main'}));if(path.includes('/commits/'))return new Response(JSON.stringify({sha:'a'.repeat(40),commit:{tree:{sha:'b'.repeat(40)},author:{}}}));if(path.includes('/git/trees/'))return new Response(JSON.stringify({tree:manifest}));assert.ok(path.endsWith('/git/blobs/'+manifest[1].sha),path);blobs.push(path);return new Response(JSON.stringify({content:changed.toString('base64')}));};
+ const result=await githubClient.fetchRepo('source/project','main','token',{cachedFiles:manifest.map(file=>({...nativeFile({...file,content:'',isBase64:true}),nativeRef:{version:'old',path:file.path}}))});
+ assert.equal(blobs.length,1);assert.deepEqual(documents.get('b'),changed);assert.equal(documents.has('a'),false);assert.equal(result.files.length,2);assert.ok(result.files.every(file=>file.nativeRef?.version==='version'));
+});

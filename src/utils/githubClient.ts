@@ -3,7 +3,7 @@ import { gitBlobSha, gitTreeSha } from './gitFiles';
 import {beginGithubOperation, cancelGithubOperation, operationSignal, cooperate} from './operation';
 export {beginGithubOperation, cancelGithubOperation, operationSignal} from './operation';
 import {verifiedBlobSha, rememberVerifiedFile} from './verifiedFiles';
-import {planFileChanges} from './transferPlan';
+import {planFileChanges,shouldUseNativeBlobDelta} from './transferPlan';
 export { gitBlobSha } from './gitFiles';
 import { transferCache, uploadCache } from './localCache';
 import type { CachedFile } from './localCache';
@@ -143,6 +143,28 @@ async function cachedFile(entry: RepoEntry, bytes: Uint8Array): Promise<CachedFi
   } catch { content = base64FromBytes(bytes); isBase64 = true; }
   return rememberVerifiedFile({ path: entry.path, content, isBase64, sha: entry.sha, mode: entry.mode, size: bytes.length },entry.sha,bytes.length);
 }
+/** Small native deltas still use the shared admission/rate-limit policy. Read
+ * their bounded JSON bodies with an idle deadline, not a total 45-second timer. */
+async function deltaBlob(owner:string,repo:string,entry:RepoEntry,token:string|undefined,signal:AbortSignal) {
+  return githubTransport.stream(`https://api.github.com${root(owner,repo)}/git/blobs/${entry.sha}`,{headers:headers(token)},signal,async(response,touch,downloadSignal)=>{
+    if(!response.body)throw markTransferFailure(new Error('变化文件响应没有正文'),'network');
+    const reader=response.body.getReader(),decoder=new TextDecoder(),parts:string[]=[];
+    const limit=Math.ceil(((entry.size||0)+2)/3)*4+1024*1024;let received=0,lastReport=0;
+    try{
+      for(;;){downloadSignal.throwIfAborted();let chunk;
+        try{chunk=await reader.read();}catch(error){downloadSignal.throwIfAborted();throw markTransferFailure(error,'network');}
+        if(chunk.done)break;touch();received+=chunk.value.length;
+        if(received>limit)throw markTransferFailure(new Error('变化文件响应超过预期大小：'+entry.path),'validation');
+        parts.push(decoder.decode(chunk.value,{stream:true}));
+        if(Date.now()-lastReport>500){lastReport=Date.now();progress(`正在接收变化文件 ${entry.path} · ${(received/1048576).toFixed(1)} MiB`);}
+      }
+      parts.push(decoder.decode());let value;
+      try{value=JSON.parse(parts.join(''));}catch(error){throw markTransferFailure(error,'validation');}
+      if(value.encoding&&value.encoding!=='base64'||typeof value.content!=='string')throw markTransferFailure(new Error('变化文件编码无效：'+entry.path),'validation');
+      return value.content as string;
+    }finally{await reader.cancel().catch(()=>{});reader.releaseLock();}
+  });
+}
 export async function mapConcurrent<T, R>(items: T[], concurrency: number, task: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
@@ -210,7 +232,9 @@ export const githubClient = {
     }
     trace.phase('获取、校验并保存文件（含排队等待）');
     trace.count('复用文件',done);
-    if (gitServiceConfig().mode !== 'rest' && missing.length) {
+    const transport=gitServiceConfig(),nativeDelta=transport.mode==='native'&&shouldUseNativeBlobDelta(entries,missing);
+    if(nativeDelta)progress(`增量更新：仅补拉 ${missing.length} 个变化文件，跳过完整 Git 对象包…`,options);
+    if (transport.mode !== 'rest' && missing.length && !nativeDelta) {
       if (!Number.isSafeInteger(meta.id) || meta.id <= 0) throw new Error('来源仓库缺少可信 ID，未开始 Git 传输');
       progress('正在通过 Git 获取选定提交的完整项目…', options);
       const expected = new Map(entries.map(entry => [entry.path, entry]));
@@ -242,7 +266,7 @@ export const githubClient = {
     // decision across reloads and fill only missing blobs for the same commit.
     const archiveRecovery = checkpoint ? await checkpoint.archiveRecovery(transfer) : undefined;
     if (archiveRecovery && missing.length) progress('恢复上次下载：复用已校验文件，仅补齐缺失内容…', options);
-    if (!archiveRecovery && shouldUseArchive(entries,missing.filter(entry=>!files.has(entry.path)),!!options.cachedFiles?.length)) {
+    if (!nativeDelta && !archiveRecovery && shouldUseArchive(entries,missing.filter(entry=>!files.has(entry.path)),!!options.cachedFiles?.length)) {
       const archiveUrls = [`https://api.github.com${root(owner, repo)}/zipball/${commit.sha}`];
       if (!token) archiveUrls.push(`https://codeload.github.com/${owner}/${repo}/zip/${commit.sha}`);
       const { readArchive } = await import('./archiveDownload');
@@ -288,7 +312,7 @@ export const githubClient = {
       const entry = aliases[0];
       const reused = reusableBlobs.get(entry.sha);
       if(!reused)trace.count('补拉文件',1);
-      const file = reused || await cachedFile(entry, bytesFromBase64((await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal)).content));
+      const file = reused || await cachedFile(entry, bytesFromBase64(nativeDelta?await deltaBlob(owner,repo,entry,token,signal):(await json(`${root(owner, repo)}/git/blobs/${entry.sha}`, token, {}, signal)).content));
       for (const alias of aliases) { if (alias.size !== undefined && alias.size !== file.size) throw new Error('相同内容的文件大小不一致：' + alias.path); const copy={ ...file, path: alias.path, mode: alias.mode };if(!copy.nativeRef)rememberVerifiedFile(copy,entry.sha,file.size!);await storeFile(copy); done++; }
       progress(`正在下载并校验 ${done}/${entries.length}：${entry.path}`, options);
     }); } finally { await flushParts(); }
