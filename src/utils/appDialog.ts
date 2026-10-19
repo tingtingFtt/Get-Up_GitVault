@@ -1,16 +1,18 @@
 export type DialogRequest = { id: number; kind: 'confirm' | 'prompt'; message: string; value: string; secret: boolean; accept: string; cancel: string };
 export type Notice = { id: number; message: string; error: boolean };
-type Options = { secret?: boolean; accept?: string; cancel?: string };
+type Options = { signal?:AbortSignal; secret?: boolean; accept?: string; cancel?: string };
 let sequence = 0;
 let active: DialogRequest | null = null;
 let notices: Notice[] = [];
 const listeners = new Set<() => void>();
-const queue: Array<{ request: DialogRequest; resolve: (value: string | boolean | null) => void }> = [];
+const queue: Array<{ request: DialogRequest; resolve: (value: string | boolean | null) => void; cleanup?:()=>void }> = [];
 const emit = () => listeners.forEach(listener => listener());
 function ask(kind: DialogRequest['kind'], message: string, value = '', options: Options = {}) {
-  return new Promise<string | boolean | null>(resolve => {
-    queue.push({ request: { id: ++sequence, kind, message, value, secret: options.secret ?? /token|PAT|令牌/i.test(message), accept: options.accept || '确定', cancel: options.cancel || '取消' }, resolve });
-    active = queue[0].request; emit();
+  options.signal?.throwIfAborted();
+  return new Promise<string | boolean | null>((resolve,reject) => {
+    const entry:typeof queue[number]={ request: { id: ++sequence, kind, message, value, secret: options.secret ?? /token|PAT|令牌/i.test(message), accept: options.accept || '确定', cancel: options.cancel || '取消' }, resolve };
+    if(options.signal){const signal=options.signal;const abort=()=>{const at=queue.indexOf(entry);if(at<0)return;queue.splice(at,1);entry.cleanup?.();active=queue[0]?.request||null;emit();reject(signal.reason);};entry.cleanup=()=>signal.removeEventListener('abort',abort);signal.addEventListener('abort',abort,{once:true});}
+    queue.push(entry);active = queue[0].request; emit();
   });
 }
 export const appDialog = {
@@ -24,7 +26,7 @@ export const appDialog = {
   dismiss(id: number) { notices = notices.filter(notice => notice.id !== id); emit(); },
   answer(value: string | boolean | null) {
     const entry = queue.shift(); if (!entry) return;
-    active = queue[0]?.request || null; entry.resolve(value); emit();
+    active = queue[0]?.request || null;entry.cleanup?.(); entry.resolve(value); emit();
   },
   cancelActive() { if (!active) return false; appDialog.answer(active.kind === 'confirm' ? false : null); return true; },
   subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },

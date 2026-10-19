@@ -560,7 +560,8 @@ test('all-branch synchronization replaces file snapshots and appends target hist
     if (path === '/repos/me/mine') return response({ id: 77, fork: true, parent: { owner: { login: 'author' }, name: 'template' } });
     if (path === '/repos/author/template') return response({ default_branch: 'main' });
     if (path.includes('/branches?')) return response([{ name: 'main' }, { name: 'feature/demo' }]);
-    if (path.startsWith('/repos/author/template/commits/')) return response({ sha: 'upstream-' + path.split('/').pop(), commit: { tree: { sha: 'source-tree' }, message: 'upstream', author: {} } });
+    if (path.startsWith('/repos/author/template/commits/')) {const ref=decodeURIComponent(path.split('/').pop()!);return response({ sha: ref.startsWith('upstream-')?ref:'upstream-'+ref, commit: { tree: { sha: 'source-tree' }, message: 'upstream', author: {} } });}
+    if (path.startsWith('/repos/me/mine/commits/')) return response({sha:heads[decodeURIComponent(path.split('/').pop()!)],commit:{tree:{sha:'old-tree'}}});
     if (path.includes('/author/template/git/trees/')) return response({ tree: [{ path: 'a.txt', type: 'blob', mode: '100644', sha: sha('new'), size: 3 }] });
     if (path.includes('/author/template/git/blobs/')) return response({ encoding: 'base64', content: Buffer.from('new').toString('base64') });
     if (path.includes('/me/mine/git/blobs/')) return response({ encoding: 'base64', content: Buffer.from('new').toString('base64'), sha: sha('new') });
@@ -634,4 +635,26 @@ test('first uploads combine medium UTF-8 files into a verified tree instead of s
  const treeSha=await gitTreeSha(files.map(f=>({path:f.path,mode:f.mode!,sha:f.sha!})));destination();const base=handler;
  handler=(path,init)=>path.endsWith('/git/trees')?response({sha:treeSha}):path.endsWith('/git/commits/new-commit')?response({tree:{sha:treeSha}}):base(path,init);
  const result=await githubClient.push('me','backup','release','token',files,'first');assert.ok(result.verified);assert.equal(calls.filter(call=>call.path.endsWith('/git/blobs')).length,0);assert.equal(calls.filter(call=>call.path.endsWith('/git/trees')).length,1);
+});
+
+test('unchanged full Fork branches compare immutable trees and skip source download and remote writes',async()=>{
+ const sourceSha='a'.repeat(40),targetSha='b'.repeat(40),tree='c'.repeat(40);
+ handler=path=>{
+  if(path==='/repos/me/copy')return response({id:77,fork:true,parent:{owner:{login:'upstream'},name:'template'}});
+  if(path==='/repos/upstream/template')return response({id:42,default_branch:'main'});
+  if(path.includes('/branches?'))return response([{name:'main'}]);
+  if(path==='/repos/upstream/template/commits/main')return response({sha:sourceSha,commit:{tree:{sha:tree}}});
+  if(path==='/repos/me/copy/commits/main')return response({sha:targetSha,commit:{tree:{sha:tree}}});
+  throw new Error('Unchanged Fork must not download files: '+path);
+ };
+ const receipt=await githubClient.syncAllForkBranches('me','copy','token');assert.equal(receipt[0].success,true);assert.equal(receipt[0].sourceSha,sourceSha);assert.equal(receipt[0].commitSha,targetSha);
+ assert.ok(calls.every(call=>!call.init.method));assert.ok(calls.every(call=>!call.path.includes('/git/blobs/')&&!call.path.includes('/zipball/')));
+});
+test('full Fork skip verification still rejects a deleted and recreated target with the same name',async()=>{
+ let identities=0;const tree='c'.repeat(40);
+ handler=path=>path==='/repos/me/copy'?response({id:++identities===1?77:88,fork:true,parent:{owner:{login:'upstream'},name:'template'}})
+  :path==='/repos/upstream/template'?response({id:42,default_branch:'main'})
+  :path.includes('/branches?')?response([{name:'main'}])
+  :response({sha:'a'.repeat(40),commit:{tree:{sha:tree}}});
+ const receipt=await githubClient.syncAllForkBranches('me','copy','token');assert.equal(receipt[0].success,false);assert.match(receipt[0].error!,/身份已变化/);assert.ok(calls.every(call=>!call.init.method));
 });

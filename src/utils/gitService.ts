@@ -43,6 +43,6 @@ export async function gitServiceTransfer(action: 'fetch' | 'push', payload: { ow
   if (!token) throw new GitServiceError('Git 服务模式需要先填写 GitHub Token', 401);
   await testGitService(config.url, signal); signal.throwIfAborted();
   // The external JSON service is optional; native mode streams document handles directly.
-  if(payload.files?.some(file=>file.nativeRef)){const hydrated:CachedFile[]=[];for(const file of payload.files){signal.throwIfAborted();hydrated.push(await hydrateFile(file));}payload={...payload,files:hydrated};}
+  if(payload.files?.some(file=>file.nativeRef)){const hydrated:CachedFile[]=[];for(const file of payload.files){signal.throwIfAborted();hydrated.push(await hydrateFile(file,Infinity,signal));}payload={...payload,files:hydrated};}
   return (await call(config.url, action, token, payload, signal)).result;
 }

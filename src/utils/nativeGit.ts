@@ -33,9 +33,7 @@ const report=(message:string)=>window.dispatchEvent(new CustomEvent('gitvault-pr
 export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:string;repo:string;expectedRepoId:number;ref?:string;branch?:string;files?:CachedFile[];message?:string;rebaseOnConflict?:boolean;totalBytes?:number;folderVersion?:string},token:string,signal:AbortSignal,options:NativeFetchOptions={}){
  if(!hasNativeGit())throw new Error('当前安装包不含原生 Git，请更新 APK 或选择 REST');
  signal.throwIfAborted();const id=crypto.randomUUID();
- let rejectAbort!: (reason: unknown)=>void;
- const aborted=new Promise<never>((_resolve,reject)=>{rejectAbort=reject;});
- const abort=()=>{void nativeGitBridge.cancel({id}).catch(()=>{});rejectAbort(signal.reason);};
+ const abort=()=>{void nativeGitBridge.cancel({id}).catch(()=>{});};
  const listener=await nativeGitBridge.addListener('progress',event=>{if(event.id===id||!event.id)report(event.message);});
  signal.addEventListener('abort',abort,{once:true});
  const work=async()=>{
@@ -97,6 +95,7 @@ export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:str
   }
   return options.onFile?{...result,streamed:true}:{...result,files:received};
  };
- try {const result=await Promise.race([work(),aborted]);signal.throwIfAborted();return result;}
- finally {signal.removeEventListener('abort',abort);void nativeGitBridge.release({id}).catch(()=>{});await listener.remove().catch(()=>{});}
+ try {const result=await work();signal.throwIfAborted();return result;}
+ catch(error){signal.throwIfAborted();throw error;}
+ finally {signal.removeEventListener('abort',abort);await nativeGitBridge.release({id}).catch(()=>{});await listener.remove().catch(()=>{});}
 }

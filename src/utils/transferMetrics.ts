@@ -6,7 +6,7 @@ export interface TransferTrace {
   phase: (name: string) => void;
   native: (timings: unknown) => void;
   branch: (name: string) => void;
-  count: (name:'复用文件'|'ZIP 尝试'|'ZIP 失败'|'ZIP 接收字节'|'补拉文件',amount:number) => void;
+  count: (name:'新增文件'|'修改文件'|'删除文件'|'复用文件'|'ZIP 尝试'|'ZIP 失败'|'ZIP 接收字节'|'补拉文件',amount:number) => void;
   recovery: (error: unknown) => void;
 }
 

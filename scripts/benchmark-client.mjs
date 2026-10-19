@@ -7,7 +7,7 @@ import {performance} from 'node:perf_hooks';
 import {createHash} from 'node:crypto';
 import {zipSync} from 'fflate';
 import {JSDOM} from 'jsdom';
-import {indexedDB} from 'fake-indexeddb';
+import {indexedDB,IDBObjectStore} from 'fake-indexeddb';
 import {gitBlobSha,gitTreeSha} from '../src/utils/gitFiles.ts';
 
 export async function benchmarkClient(original){
@@ -24,6 +24,9 @@ export async function benchmarkClient(original){
  localStorage.setItem('gitvault_git_service_v1',JSON.stringify({mode:'rest',url:''}));
  let source=original,sourceCommit='source-1',sequence=0,partialZip=false,dropRead=false,dropWriteAt=0,blobWrites=0;
  let stats,handlerFailure;
+ const originalDigest=crypto.subtle.digest.bind(crypto.subtle),originalPut=IDBObjectStore.prototype.put;
+ crypto.subtle.digest=async(...args)=>{if(stats)stats.hashCalls++;return originalDigest(...args);};
+ IDBObjectStore.prototype.put=function(...args){if(stats&&this.name==='file_contents')stats.bodyWrites++;return originalPut.apply(this,args);};
  const empty=await gitTreeSha([]),trees=new Map([[empty,[]]]),commits=new Map([['seed',{tree:{sha:empty},parents:[]}]]),blobs=new Map();
  const targets=new Map([['target',{id:77,refs:new Map([['main','seed']])}],['resume-target',{id:78,refs:new Map([['main','seed']])}]]);
  const manifest=files=>files.map(({path,sha,mode,size})=>({path,sha,mode,size,type:'blob'}));
@@ -68,7 +71,7 @@ export async function benchmarkClient(original){
  globalThis.fetch=(url,init)=>{const parsed=new URL(String(url));assert.equal(parsed.hostname,'api.github.com');return originalFetch(address+parsed.pathname+parsed.search,init);};
  const results=[];
  const measure=async(scenario,run,expectedError=false)=>{
-  stats={requests:0,mutations:0,requestBytes:0,responseBytes:0,archives:0,blobReads:0,blobWrites:0,interruptions:0};beginGithubOperation();const start=performance.now();let value,error;
+  stats={hashCalls:0,bodyWrites:0,requests:0,mutations:0,requestBytes:0,responseBytes:0,archives:0,blobReads:0,blobWrites:0,interruptions:0};beginGithubOperation();const start=performance.now();let value,error;
   try{value=await run();}catch(e){error=e;}
   assert.equal(!!error,expectedError,error?.stack);if(error)assert.equal(transferFailureKind(error),'network',error.stack);if(handlerFailure)throw handlerFailure;
   results.push({scenario,...stats,totalMs:Math.round((performance.now()-start)*100)/100,...(error?{failure:transferFailureKind(error)}:{})});return value;
@@ -84,6 +87,11 @@ export async function benchmarkClient(original){
   const unchanged=await measure('unchanged-pull',()=>githubClient.fetchRepo('source/project',undefined,'benchmark-placeholder',{cachedFiles:first.files}));await check(unchanged.files);assert.equal(results.at(-1).blobReads+results.at(-1).archives,0);
   const initial=await measure('first-upload',()=>push('target',cached(source)));assert.equal(initial.treeSha,await gitTreeSha(source));
   const unchangedUpload=await measure('unchanged-upload',()=>push('target',cached(source)));assert.equal(unchangedUpload.commitSha,initial.commitSha);assert.equal(results.at(-1).mutations,0);
+  const pipeline=await measure('pull-save-unchanged-upload',async()=>{
+   const fetched=await githubClient.fetchRepo('source/project',undefined,'benchmark-placeholder',{cachedFiles:first.files});
+   await localCache.saveProjectFiles('source',fetched.files,sourceCommit);
+   return push('target',fetched.files);
+  });assert.equal(pipeline.commitSha,initial.commitSha);assert.equal(results.at(-1).mutations,0);
   source=await Promise.all(original.map(async(file,i)=>{if(i>=4)return file;const bytes=file.bytes.slice();bytes[0]^=255;return{...file,bytes,sha:await gitBlobSha(bytes)};}));sourceCommit='source-2';await refresh();
   const small=await measure('small-update-pull',()=>githubClient.fetchRepo('source/project',undefined,'benchmark-placeholder',{cachedFiles:first.files}));await check(small.files);assert.equal(results.at(-1).blobReads,4);assert.equal(results.at(-1).archives,0);
   const updated=await measure('small-update-upload',()=>push('target',cached(source)));assert.equal(commits.get(updated.commitSha).parents[0],initial.commitSha);assert.equal(results.at(-1).blobWrites,4);
@@ -102,6 +110,7 @@ export async function benchmarkClient(original){
   assert.equal(targets.get('target').refs.get('main'),'seed');assert.equal(targets.get('resume-target').refs.get('main'),'seed');
   return{note:'Production REST client, fake IndexedDB + localhost HTTP, 15 ms per response; request/write pacing disabled for repeatable latency. Normal GitHub write pacing/limits still apply. These are not device or Internet speed promises.',results};
  }finally{
+  crypto.subtle.digest=originalDigest;IDBObjectStore.prototype.put=originalPut;
   globalThis.fetch=originalFetch;Object.assign(githubTransport,savedTransport);server.close();server.closeAllConnections();dom.window.close();
   for(const [name,descriptor]of globals){if(descriptor)Object.defineProperty(globalThis,name,descriptor);else delete globalThis[name];}
  }

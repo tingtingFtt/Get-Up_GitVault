@@ -36,6 +36,40 @@ public class ManagedFolderStoreTest {
         File content(String id,String path)throws Exception{return new File(root,store.describe(id,false,null).getString("location")+"/"+path);}
         public void close(){remove(home);}
     }
+    @Test public void deltaPreparationSeedsOnlyVerifiedUnchangedBodiesAndPreservesOldHistory()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] same="shared".getBytes(StandardCharsets.UTF_8),before="before".getBytes(StandardCharsets.UTF_8),after="after".getBytes(StandardCharsets.UTF_8);
+            JSArray oldManifest=new JSArray();oldManifest.put(entry("same",same));oldManifest.put(entry("changed",before));oldManifest.put(entry("deleted",before));
+            String old=f.begin("old",oldManifest).getString("id");for(int i=0;i<oldManifest.length();i++){JSONObject file=oldManifest.getJSONObject(i);byte[] bytes=file.getString("path").equals("same")?same:before;f.store.write(old,file.getString("path"),bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);}f.store.finish(old);f.store.attach(old,"owner","old",false);
+            JSArray next=new JSArray();next.put(entry("same",same));next.put(entry("changed",after));next.put(entry("added",after));
+            JSObject stage=f.store.begin("content://test/tree/root","[77,\"dev\"]","next","project",next,false,old);String id=stage.getString("id");assertNotEquals(old,id);assertEquals(1,stage.getJSONArray("files").length());assertEquals("same",stage.getJSONArray("files").getJSONObject(0).getString("path"));assertArrayEquals(before,Files.readAllBytes(f.content(old,"changed").toPath()));
+            for(String path:Arrays.asList("changed","added"))f.store.write(id,path,after.length,hash(after),"100644",new ByteArrayInputStream(after),null);
+            f.store.finish(id);f.store.attach(old,"owner","old",true);f.store.attach(id,"owner","next",false);
+            assertFalse(f.content(id,"deleted").exists());assertTrue(f.content(old,"deleted").exists());assertFalse(f.store.describe(old,true,null).getBoolean("dirty"));
+        }
+    }
+    @Test public void newCommitWithIdenticalManifestReusesDirectoryWithoutWritingAnotherCopy()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes="same".getBytes(StandardCharsets.UTF_8);JSArray manifest=new JSArray();manifest.put(entry("a",bytes));String id=f.begin("one",manifest).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);f.store.attach(id,"owner","one",false);
+            JSObject reused=f.store.begin("content://test/tree/root","[77,\"dev\"]","two","project",manifest,false,id);assertEquals(id,reused.getString("id"));assertTrue(reused.getBoolean("reusedReady"));f.store.attach(id,"owner","two",false);assertEquals(1,f.store.clear("owner","two",false).getInt("versions"));assertArrayEquals(bytes,Files.readAllBytes(f.content(id,"a").toPath()));f.store.clear("owner","one",false);assertTrue(f.store.describe(id,false,null).getBoolean("missing"));
+        }
+    }
+    @Test public void retainedHistoricalEditsDoNotTriggerRepeatedScansDuringAnotherCurrentUpdate()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes="history".getBytes(StandardCharsets.UTF_8),current="current".getBytes(StandardCharsets.UTF_8),next="next".getBytes(StandardCharsets.UTF_8);
+            JSArray manifest=new JSArray();manifest.put(entry("a",bytes));String history=f.begin("history",manifest).getString("id");f.store.write(history,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(history);f.store.attach(history,"owner","history",true);
+            manifest=new JSArray();manifest.put(entry("a",current));String id=f.begin("current",manifest).getString("id");f.store.write(id,"a",current.length,hash(current),"100644",new ByteArrayInputStream(current),null);f.store.finish(id);f.store.attach(id,"owner","current",false);Files.write(f.content(history,"a").toPath(),next);
+            JSArray expected=new JSArray();expected.put(entry("a",next));JSObject stage=f.store.begin("content://test/tree/root","[77,\"dev\"]","next","project",expected,false,id);assertEquals("staging",stage.getString("state"));assertArrayEquals(next,Files.readAllBytes(f.content(history,"a").toPath()));
+        }
+    }
+    @Test public void cancellationDuringDirectoryScanStopsBeforePublishingAnyNewCandidate()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes=new byte[1024*1024];JSArray manifest=new JSArray();manifest.put(entry("a",bytes));String id=f.begin("one",manifest).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);f.store.attach(id,"owner","one",false);
+            AtomicBoolean stop=new AtomicBoolean();f.store.task(stop,message->stop.set(true));
+            try{f.store.begin("content://test/tree/root","[77,\"dev\"]","two","project",manifest,false,id);fail("Scan must acknowledge cancellation");}catch(IOException expected){assertTrue(expected.getMessage().contains("取消"));}
+            f.store.task(null,null);assertEquals(1,f.store.status("content://test/tree/root").getInt("versions"));assertEquals("ready",f.store.describe(id,false,null).getString("state"));assertArrayEquals(bytes,Files.readAllBytes(f.content(id,"a").toPath()));
+        }
+    }
     @Test public void candidatesVerifyBeforeSwitchAndCleanupNeverTouchesUnmanagedSiblings()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] first="old".getBytes(StandardCharsets.UTF_8),second="new".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("目录/a",first));

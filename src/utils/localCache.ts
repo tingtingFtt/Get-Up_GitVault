@@ -1,3 +1,5 @@
+import {verifiedBlobSha,rememberVerifiedFile} from './verifiedFiles';
+import {cooperate} from './operation';
 /** Durable, version-aware project cache. File contents are shared by Git blob SHA. */
 import { gitBlobSha } from './gitFiles';
 import { clearNativeGitCache } from './nativeGitCache';
@@ -130,25 +132,26 @@ export const uploadCache = {
   },
 };
 export const localCache = {
-  async saveProjectFiles(repoId: string, files: CachedFile[], ref = 'legacy', options: { history?: boolean; storageKey?: string; label?: string } = {}): Promise<void> {
+  async saveProjectFiles(repoId: string, files: CachedFile[], ref = 'legacy', options: { history?: boolean; storageKey?: string; label?: string; signal?:AbortSignal } = {}): Promise<void> {
+    const signal=options.signal;signal?.throwIfAborted();
     const inherited = (files as FolderFiles).nativeSnapshot?.version || files.find(file => file.nativeRef)?.nativeRef?.version;
     if (usesNativeFolder() || inherited) {
       let version = inherited;
       if (!version || files.some(file => !file.nativeRef || file.nativeRef.version !== version)) {
         const metadata: Array<{path:string;sha:string;mode:string;size?:number}> = [];
         for (const file of files) {
-          if(file.sha&&file.size!==undefined){metadata.push({path:file.path,sha:file.sha,mode:file.mode||'100644',size:file.size});continue;}
-          const body=await hydrateFile(file),bytes=body.isBase64?Uint8Array.from(atob(body.content.replace(/\s/g,'')),c=>c.charCodeAt(0)):new TextEncoder().encode(body.content);
+          await cooperate(signal);if(file.sha&&file.size!==undefined){metadata.push({path:file.path,sha:file.sha,mode:file.mode||'100644',size:file.size});continue;}
+          const body=await hydrateFile(file,Infinity,signal),bytes=body.isBase64?Uint8Array.from(atob(body.content.replace(/\s/g,'')),c=>c.charCodeAt(0)):new TextEncoder().encode(body.content);
           const sha=await gitBlobSha(bytes);if(file.sha&&sha!==file.sha)throw new Error('迁移文件校验失败：'+file.path);
           metadata.push({path:file.path,sha,mode:file.mode||'100644',size:bytes.length});
         }
-        const stage = await beginFolder(options.storageKey || JSON.stringify([repoId, 'main']), ref, options.label || repoId, metadata);
+        const stage = await beginFolder(options.storageKey || JSON.stringify([repoId, 'main']), ref, options.label || repoId, metadata,signal);
         version = stage.id; const handles: CachedFile[] = [];
-        for(let i=0;i<files.length;i++)handles.push(await putFolderFile(version!,{...files[i],...metadata[i]}));
+        for(let i=0;i<files.length;i++)handles.push(await putFolderFile(version!,{...files[i],...metadata[i]},signal));
         const originals=new Map(files.map((file,i)=>[file.path,{...file,...metadata[i]}]));
-        await finishFolder(version!,async paths=>{for(const path of paths){const original=originals.get(path);if(!original)throw new Error('目录修复请求包含迁移清单外路径');await putFolderFile(version!,original);}});files = handles;
+        await finishFolder(version!,async paths=>{for(const path of paths){const original=originals.get(path);if(!original)throw new Error('目录修复请求包含迁移清单外路径');await putFolderFile(version!,original,signal);}},signal);files = handles;
       }
-      await withDB(async db => { const tx = db.transaction([SNAPSHOTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite'), done = completed(tx);
+      signal?.throwIfAborted();await withDB(async db => { const tx = db.transaction([SNAPSHOTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite'), done = completed(tx);
         tx.objectStore(SNAPSHOTS).put({ id: snapshotId(repoId, ref), repoId, ref, files: files.map(({ content, ...file }) => file), nativeVersion: version, savedAt: new Date().toISOString() });
         if(!options.history)tx.objectStore(LEGACY).put({ repoId, currentRef: ref });
         await clearDownloadState(tx, ref);
@@ -161,10 +164,8 @@ export const localCache = {
     }
     const prepared: CachedFile[] = [];
     for (const file of files) {
-      const bytes = file.isBase64 ? Uint8Array.from(atob(file.content.replace(/\s/g, '')), c => c.charCodeAt(0)) : new TextEncoder().encode(file.content);
-      const sha = await gitBlobSha(bytes);
-      if (file.sha && file.sha !== sha) throw new Error(`缓存文件内容与版本不一致: ${file.path}`);
-      prepared.push({ ...file, sha, size: bytes.length });
+      const {sha,size}=await verifiedBlobSha(file,signal);
+      prepared.push(rememberVerifiedFile({ ...file, sha, size },sha,size));
     }
     await withDB(async db => {
       // Commit bounded content batches before publishing the snapshot reference.
@@ -172,13 +173,16 @@ export const localCache = {
       let batch: CachedFile[] = [], bytes = 0;
       const flush = async () => {
         if (!batch.length) return;
-        const tx = db.transaction(CONTENTS, 'readwrite'), done = completed(tx);
-        for (const file of batch) tx.objectStore(CONTENTS).put({ sha: file.sha, content: file.content, isBase64: file.isBase64 });
+        await cooperate(signal);batch=[...new Map(batch.map(file=>[file.sha,file])).values()];
+        const tx = db.transaction(CONTENTS, 'readwrite'), done = completed(tx),store=tx.objectStore(CONTENTS);
+        // Content addressed bodies are immutable. Do not rewrite large unchanged blobs.
+        const present=await Promise.all(batch.map(file=>read(store.getKey(file.sha!))));
+        batch.forEach((file,i)=>{if(present[i]===undefined)store.put({ sha: file.sha, content: file.content, isBase64: file.isBase64 });});
         await done; batch = []; bytes = 0;
       };
       for (const file of prepared) { batch.push(file); bytes += file.size || 0; if (bytes >= 4 * 1024 * 1024 || batch.length >= 32) await flush(); }
       await flush();
-      const tx = db.transaction([SNAPSHOTS, CONTENTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite');
+      signal?.throwIfAborted();const tx = db.transaction([SNAPSHOTS, CONTENTS, LEGACY, TRANSFERS, RECOVERY], 'readwrite');
       const done = completed(tx);
       // A different tab may have pruned an old snapshot between batches.
       const present = await Promise.all(prepared.map(file => read(tx.objectStore(CONTENTS).getKey(file.sha!))));
@@ -189,7 +193,7 @@ export const localCache = {
       await done;
     });
   },
-  async getProjectFiles(repoId: string, ref?: string): Promise<FolderFiles> {
+  async getProjectFiles(repoId: string, ref?: string, options:{scan?:boolean;signal?:AbortSignal}={}): Promise<FolderFiles> {
     const cached = await withDB(async db => {
       const tx = db.transaction([LEGACY, SNAPSHOTS, CONTENTS], 'readonly');
       const legacy = await read<any>(tx.objectStore(LEGACY).get(repoId));
@@ -208,7 +212,7 @@ export const localCache = {
       return files as CachedFile[];
     });
     if (!Array.isArray(cached)) {
-      const actual=await folderFiles(cached.nativeVersion);const selected=actual.filter(file=>cached.paths.includes(file.path)||file.nativeRef?.added) as FolderFiles;selected.nativeSnapshot=actual.nativeSnapshot;return selected;
+      const actual=await folderFiles(cached.nativeVersion,options.scan!==false,options.signal);const paths=new Set(cached.paths);const selected=actual.filter(file=>paths.has(file.path)||file.nativeRef?.added) as FolderFiles;selected.nativeSnapshot=actual.nativeSnapshot;return selected;
     }
     return cached;
   },
@@ -262,11 +266,11 @@ export const localCache = {
     const metadata = await withDB(async db => read<Snapshot | undefined>(db.transaction(SNAPSHOTS, 'readonly').objectStore(SNAPSHOTS).get(snapshotId(repoId, ref))));
     if (!metadata) return;
     if(metadata.nativeVersion){const existing=await folderBridge.list({version:metadata.nativeVersion,scan:false});if(!existing.missing&&existing.root===folderRoot())return;}
-    const stage = await beginFolder(storageKey, ref, label, metadata.files.map(file => ({ path: file.path, sha: file.sha!, mode: file.mode || '100644', size: file.size })));
+    const stage = await beginFolder(storageKey, ref, label, metadata.files.map(file => ({ path: file.path, sha: file.sha!, mode: file.mode || '100644', size: file.size })),signal);
     const files: CachedFile[] = [];
     for (const entry of metadata.files) { signal?.throwIfAborted(); const file = entry.nativeRef?{...entry,content:''}:await localCache.getProjectFile(repoId, entry.path, ref); if (!file) throw new Error('旧缓存不完整，尚未切换主存储'); files.push(await putFolderFile(stage.id, file,signal)); }
     const originals=new Map(metadata.files.map(file=>[file.path,file]));
-    await finishFolder(stage.id,async paths=>{for(const path of paths){signal?.throwIfAborted();const entry=originals.get(path);if(!entry)throw new Error('目录修复请求包含迁移清单外路径');const original=entry.nativeRef?{...entry,content:''}:await localCache.getProjectFile(repoId,path,ref);if(!original)throw new Error('旧缓存不完整，尚未切换主存储');await putFolderFile(stage.id,original,signal);}},signal);await localCache.saveProjectFiles(repoId, files, ref);
+    await finishFolder(stage.id,async paths=>{for(const path of paths){signal?.throwIfAborted();const entry=originals.get(path);if(!entry)throw new Error('目录修复请求包含迁移清单外路径');const original=entry.nativeRef?{...entry,content:''}:await localCache.getProjectFile(repoId,path,ref);if(!original)throw new Error('旧缓存不完整，尚未切换主存储');await putFolderFile(stage.id,original,signal);}},signal);await localCache.saveProjectFiles(repoId, files, ref,{signal});
     await withDB(async db=>{const tx=db.transaction(SNAPSHOTS,'readwrite'),done=completed(tx),store=tx.objectStore(SNAPSHOTS);for(const old of await read<Snapshot[]>(store.index('repoId').getAll(repoId)))if(!old.nativeVersion&&old.ref!==ref)store.delete(old.id);await done;});
     await localCache.pruneBodies();
   },

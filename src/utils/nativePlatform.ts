@@ -1,4 +1,4 @@
-import {hydrateFile,folderBridge} from './nativeFolder';
+import {hydrateFile,folderBridge,folderTask} from './nativeFolder';
 import { Capacitor } from '@capacitor/core';
 import { androidPlugin } from './androidPlugin';
 import type { CachedFile } from './localCache';
@@ -42,11 +42,11 @@ export async function exportProjectDirectory(directory: string, project: { owner
   if(files.length&&files.every(file=>file.nativeRef)){
     signal?.throwIfAborted();
     const prefix='GitVault-exports/'+[project.owner,project.repo,project.branch,project.latestCommitSha+'-'+crypto.randomUUID().slice(0,8)].map(safeSegment).join('/');
-    await folderBridge.export({directory,prefix,project:{owner:project.owner,repo:project.repo,branch:project.branch,latestCommitSha:project.latestCommitSha},files:files.map(({path,sha,size,mode,nativeRef})=>({path,sha,size,mode,nativeRef}))});signal?.throwIfAborted();return;
+    await folderTask(folderBridge.export,{directory,prefix,project:{owner:project.owner,repo:project.repo,branch:project.branch,latestCommitSha:project.latestCommitSha},files:files.map(({path,sha,size,mode,nativeRef})=>({path,sha,size,mode,nativeRef}))},signal,true);signal?.throwIfAborted();return;
   }
   const prefix = [project.owner, project.repo, project.branch, project.latestCommitSha].map(safeSegment).join('/');
   for (const handle of files) {
-    const file=await hydrateFile(handle);
+    const file=await hydrateFile(handle,Infinity,signal);
     signal?.throwIfAborted(); safeRelativePath(file.path);
     const data = file.isBase64 ? file.content.replace(/\s/g, '') : bytesToBase64(new TextEncoder().encode(file.content));
     await nativeBridge.writeDocument({ directory, path: `${prefix}/files/${file.path}`, data });
@@ -57,8 +57,8 @@ export async function exportProjectDirectory(directory: string, project: { owner
 }
 
 /** Stream chunks to app-private staging, then let Android choose the destination. */
-export async function saveDownload(blob: Blob, name: string) {
-  if (!isNativeAndroid()) {
+export async function saveDownload(blob: Blob, name: string,signal?:AbortSignal) {
+  signal?.throwIfAborted();if (!isNativeAndroid()) {
     const url = URL.createObjectURL(blob), anchor = document.createElement('a');
     anchor.href = url; anchor.download = name; document.body.appendChild(anchor); anchor.click(); anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000); return;
@@ -67,8 +67,8 @@ export async function saveDownload(blob: Blob, name: string) {
   const { id } = await nativeBridge.beginDownload({ name, mime: blob.type || 'application/octet-stream' });
   try {
     for (let offset = 0; offset < blob.size; offset += 256 * 1024) {
-      await nativeBridge.appendDownload({ id, data: bytesToBase64(new Uint8Array(await blob.slice(offset, offset + 256 * 1024).arrayBuffer())) });
+      signal?.throwIfAborted();await nativeBridge.appendDownload({ id, data: bytesToBase64(new Uint8Array(await blob.slice(offset, offset + 256 * 1024).arrayBuffer())) });
     }
-    await nativeBridge.finishDownload({ id });
+    signal?.throwIfAborted();await nativeBridge.finishDownload({ id });
   } catch (error) { await nativeBridge.abortDownload({ id }).catch(() => {}); throw error; }
 }

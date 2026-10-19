@@ -25,6 +25,12 @@ final class ManagedFolderStore {
         Verification(String message,JSObject details,boolean repairable){super(message);this.details=details;this.repairable=repairable;}
     }
     interface Progress { void update(String message); }
+    private AtomicBoolean taskStop;
+    private Progress taskProgress;
+    private long progressAt;
+    ManagedFolderStore task(AtomicBoolean stop,Progress progress){taskStop=stop;taskProgress=progress;return this;}
+    void checkTask()throws IOException{check(null);}
+    private void progress(String message){long now=android.os.SystemClock.elapsedRealtime();if(taskProgress!=null&&now-progressAt>=200){progressAt=now;taskProgress.update(message);}}
     private final Context context;
     private final File registry;
     private final DocumentFile testRoot;
@@ -93,7 +99,7 @@ final class ManagedFolderStore {
             ExportPath.validate(path);String[] segments=names.physical(path).split("/");DocumentFile dir=directory;
             for(int i=0;i<segments.length;i++){
                 String name=segments[i];Map<String,DocumentFile> entries=children(dir);DocumentFile next=entries.get(name);boolean last=i==segments.length-1;
-                if(next==null&&create){next=last?createFile(dir,name):dir.createDirectory(name);if(next==null)throw new IOException("无法创建目录："+name);if(!name.equals(next.getName()))throw new IOException("目录提供者改变了名称："+path+" → "+next.getName());entries.put(name,next);}
+                check(null);if(next==null&&create){next=last?createFile(dir,name):dir.createDirectory(name);if(next==null)throw new IOException("无法创建目录："+name);if(!name.equals(next.getName()))throw new IOException("目录提供者改变了名称："+path+" → "+next.getName());entries.put(name,next);}
                 if(next==null)return null;if(last){if(!next.isFile())throw new IOException("文件路径被目录占用："+path);return next;}
                 if(!next.isDirectory())throw new IOException("目录被同名文件占用："+name);dir=next;
             }return null;
@@ -107,17 +113,17 @@ final class ManagedFolderStore {
     ReadBatch readBatch(){return new ReadBatch();}
     private InputStream input(DocumentFile doc)throws IOException{return ManagedDocumentInput.open(context.getContentResolver(),doc.getUri());}
     private OutputStream output(DocumentFile doc)throws IOException{OutputStream stream=context.getContentResolver().openOutputStream(doc.getUri(),"wt");if(stream==null)throw new IOException("无法写入项目文件");return stream;}
-    private static void check(AtomicBoolean stop)throws IOException{if(stop!=null&&(stop.get()||Thread.currentThread().isInterrupted()))throw new IOException("目录任务已取消，已完成的文件保留");}
+    private void check(AtomicBoolean stop)throws IOException{if(Thread.currentThread().isInterrupted()||stop!=null&&stop.get()||taskStop!=null&&taskStop.get())throw new IOException("目录任务已取消，已完成的文件保留");}
     private static String hex(byte[] bytes){StringBuilder text=new StringBuilder();for(byte value:bytes)text.append(String.format(Locale.ROOT,"%02x",value&255));return text.toString();}
     private static final class ContentDigest {final String sha;final long size;ContentDigest(String sha,long size){this.sha=sha;this.size=size;}}
     private ContentDigest digest(DocumentFile doc,long hint,AtomicBoolean stop)throws Exception{
         MessageDigest digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+hint+"\0").getBytes(StandardCharsets.UTF_8));long count=0;
-        try(InputStream stream=input(doc)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);digest.update(buffer,0,n);count+=n;}}
-        if(count!=hint){long actual=count;digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+actual+"\0").getBytes(StandardCharsets.UTF_8));count=0;try(InputStream stream=input(doc)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);digest.update(buffer,0,n);count+=n;}}if(count!=actual)throw new IOException("文件在读取期间变化，请重试");}
+        try(InputStream stream=input(doc)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);digest.update(buffer,0,n);count+=n;progress("正在读取、校验文件 "+String.format(Locale.ROOT,"%.1f",count/1048576.0)+" MiB");}}
+        if(count!=hint){long actual=count;digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+actual+"\0").getBytes(StandardCharsets.UTF_8));count=0;try(InputStream stream=input(doc)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);digest.update(buffer,0,n);count+=n;progress("正在读取、校验文件 "+String.format(Locale.ROOT,"%.1f",count/1048576.0)+" MiB");}}if(count!=actual)throw new IOException("文件在读取期间变化，请重试");}
         return new ContentDigest(hex(digest.digest()),count);
     }
     private String hash(DocumentFile doc,AtomicBoolean stop)throws Exception{return digest(doc,doc.length(),stop).sha;}
-    private void enumerate(DocumentFile dir,String prefix,Map<String,DocumentFile> files)throws Exception{if(dir==null)return;for(DocumentFile doc:dir.listFiles()){String name=doc.getName();if(name==null)throw new IOException("无法读取文件名");String path=prefix+name;ExportPath.validate(path);if(doc.isDirectory())enumerate(doc,path+"/",files);else if(doc.isFile())files.put(path,doc);}}
+    private void enumerate(DocumentFile dir,String prefix,Map<String,DocumentFile> files)throws Exception{if(dir==null)return;check(null);for(DocumentFile doc:dir.listFiles()){check(null);String name=doc.getName();if(name==null)throw new IOException("无法读取文件名");String path=prefix+name;ExportPath.validate(path);if(doc.isDirectory())enumerate(doc,path+"/",files);else if(doc.isFile())files.put(path,doc);}}
     private JSObject reference(JSONObject value,JSONObject entry,boolean dirty)throws Exception{JSObject file=new JSObject(entry.toString());file.remove("uri");file.put("content","");file.put("isBase64",true);file.put("encoding","base64");JSObject ref=new JSObject();ref.put("version",value.getString("id"));ref.put("path",entry.getString("path"));ref.put("dirty",dirty);ref.put("added",entry.optBoolean("added"));file.put("nativeRef",ref);return file;}
     private Map<String,JSONObject> registered(JSONObject value)throws Exception{Map<String,JSONObject> result=new LinkedHashMap<>();JSONObject files=value.getJSONObject("files");for(Iterator<String> it=files.keys();it.hasNext();){String path=it.next();result.put(path,files.getJSONObject(path));}return result;}
     private JSObject inspect(JSONObject value,Map<String,JSONObject> baseline,boolean includeExtras,AtomicBoolean stop)throws Exception{
@@ -126,7 +132,7 @@ final class ManagedFolderStore {
         else{
             enumerate(dir,"",physical);Set<String> found=new HashSet<>();List<JSONObject> entries=new ArrayList<>();
             for(Map.Entry<String,DocumentFile> item:physical.entrySet()){
-                check(stop);String path=names.logical(item.getKey());if(!found.add(path))throw new IOException("目录映射发生冲突，原文件保留："+path+"（磁盘路径："+item.getKey()+"）");
+                check(stop);progress("正在扫描并校验目录 "+(found.size()+1)+"/"+physical.size()+"："+names.logical(item.getKey()));String path=names.logical(item.getKey());if(!found.add(path))throw new IOException("目录映射发生冲突，原文件保留："+path+"（磁盘路径："+item.getKey()+"）");
                 JSONObject previous=baseline.get(path);DocumentFile doc=item.getValue();
                 if(previous==null){differences.put(new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","extra"));if(!includeExtras)continue;}
                 ContentDigest actual;try{actual=digest(doc,previous!=null&&previous.has("size")?previous.getLong("size"):doc.length(),stop);}catch(IOException error){check(stop);if(includeExtras)throw new IOException("无法校验目录文件："+path+"；"+error.getMessage(),error);differences.put(new JSONObject().put("path",path).put("physicalPath",item.getKey()).put("type","unreadable").put("reason",String.valueOf(error.getMessage())));continue;}
@@ -148,22 +154,49 @@ final class ManagedFolderStore {
         }
     }
     JSObject begin(String root,String key,String ref,String label,JSArray expected,boolean allowChanged)throws Exception{
-        synchronized(LOCK){root(root);List<String> paths=new ArrayList<>();for(int i=0;i<expected.length();i++)paths.add(expected.getJSONObject(i).getString("path"));FolderPathLayout planned=FolderPathLayout.plan(paths);for(JSONObject old:all())if(old.getString("root").equals(root)&&old.getString("key").equals(key)&&old.getString("state").equals("ready")&&old.getJSONObject("owners").length()>0){JSObject state=describe(old.getString("id"),true,null);if(state.optBoolean("dirty")&&!allowChanged)throw new Changed("项目目录有本地修改／新增／缺失文件："+state.getJSONArray("changes").toString()+"。是否允许以远端快照替换？");if(!state.optBoolean("dirty")&&old.getString("ref").equals(ref)&&matches(state,expected)){state.put("reusedReady",true);return state;}}
-            for(JSONObject value:all())if(value.getString("root").equals(root)&&value.getString("key").equals(key)&&value.getString("ref").equals(ref)&&value.getString("state").equals("staging")&&value.getJSONArray("expected").toString().equals(expected.toString())&&layout(value).aliases().equals(planned.aliases())){
-                JSONObject valid=new JSONObject();FolderAccess access=new FolderAccess(value,true);for(int i=0;i<expected.length();i++){JSONObject entry=expected.getJSONObject(i);String path=entry.getString("path");DocumentFile doc=access.file(path,false);if(doc!=null&&doc.exists()){ContentDigest actual=digest(doc,entry.optLong("size",doc.length()),null);if(actual.sha.equals(entry.getString("sha")))valid.put(path,new JSONObject(entry.toString()).put("size",actual.size));}}
-                value.put("files",valid);save(value);return describe(value.getString("id"),false,null);
+        return begin(root,key,ref,label,expected,allowChanged,"");
+    }
+    JSObject begin(String root,String key,String ref,String label,JSArray expected,boolean allowChanged,String previousVersion)throws Exception{
+        synchronized(LOCK){check(null);root(root);List<String> paths=new ArrayList<>();for(int i=0;i<expected.length();i++)paths.add(expected.getJSONObject(i).getString("path"));FolderPathLayout planned=FolderPathLayout.plan(paths);JSObject previousState=null;for(JSONObject old:previousCandidates(root,key,previousVersion)){JSObject state=describe(old.getString("id"),true,null);previousState=state;if(state.optBoolean("dirty")&&!allowChanged)throw new Changed("项目目录有本地修改／新增／缺失文件："+state.getJSONArray("changes").toString()+"。是否允许以远端快照替换？");if(!state.optBoolean("dirty")&&matches(state,expected)){state.put("reusedReady",true);return state;}}
+            for(JSONObject value:all())if(value.getString("root").equals(root)&&value.getString("key").equals(key)&&value.getString("ref").equals(ref)&&(value.getString("state").equals("staging")||value.getString("state").equals("ready")&&value.getJSONObject("owners").length()==0)&&value.getJSONArray("expected").toString().equals(expected.toString())&&layout(value).aliases().equals(planned.aliases())){
+                JSONObject valid=new JSONObject();FolderAccess access=new FolderAccess(value,true);for(int i=0;i<expected.length();i++){check(null);progress("正在恢复并校验目录 "+(i+1)+"/"+expected.length());JSONObject entry=expected.getJSONObject(i);String path=entry.getString("path");DocumentFile doc=access.file(path,false);if(doc!=null&&doc.exists()){ContentDigest actual=digest(doc,entry.optLong("size",doc.length()),null);if(actual.sha.equals(entry.getString("sha")))valid.put(path,new JSONObject(entry.toString()).put("size",actual.size));}}
+                value.put("files",valid);if(valid.length()!=expected.length())value.put("state","staging");save(value);seedValidated(value,previousState);return describe(value.getString("id"),false,null);
             }
             String id=UUID.randomUUID().toString().replace("-","");JSONObject value=new JSONObject();value.put("id",id);value.put("root",root);value.put("key",key);value.put("ref",ref);value.put("state","staging");value.put("files",new JSONObject());value.put("owners",new JSONObject());value.put("expected",expected);value.put("allowChanged",allowChanged);value.put("pathMappings",new JSONObject(planned.aliases()));value.put("layoutVersion",2);value.put("createdAt",System.currentTimeMillis());
             String safe=label.replaceAll("[^A-Za-z0-9_.-]","_");if(safe.length()>48)safe=safe.substring(0,48);String group=hex(MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8))).substring(0,12);
-            value.put("relative","GitVault-"+instance().substring(0,12)+"/"+safe+"-"+group+"/"+ref.substring(0,Math.min(12,ref.length()))+"-"+id.substring(0,8));expected(value);filesDir(value,true);save(value);return describe(id,false,null);
+            value.put("relative","GitVault-"+instance().substring(0,12)+"/"+safe+"-"+group+"/"+ref.substring(0,Math.min(12,ref.length()))+"-"+id.substring(0,8));expected(value);filesDir(value,true);save(value);seedValidated(value,previousState);return describe(id,false,null);
         }
+    }
+    /** Reuse the existing indexed native I/O path in one download preparation
+     * call. No per-file bridge calls or repeated directory lookups for old blobs. */
+    private void seedValidated(JSONObject value,JSObject previous)throws Exception{
+        if(previous==null||previous.optBoolean("missing"))return;
+        JSONObject source=load(previous.getString("id"));if(source==null)return;
+        Map<String,JSONObject> verified=new HashMap<>();JSONArray files=previous.getJSONArray("files");
+        for(int i=0;i<files.length();i++){JSONObject file=files.getJSONObject(i);verified.put(file.getString("path"),file);}
+        FolderAccess from=new FolderAccess(source,false),to=new FolderAccess(value,true);int reused=0;
+        for(JSONObject entry:expected(value).values()){
+            check(null);String path=entry.getString("path");JSONObject old=verified.get(path);
+            if(value.getJSONObject("files").has(path)||old==null||!old.getString("sha").equals(entry.getString("sha")))continue;
+            DocumentFile doc=from.file(path,false);if(doc==null)continue;
+            progress("正在原生复用未变化文件 "+(++reused)+"："+path);
+            try(InputStream input=input(doc)){write(value.getString("id"),path,old.getLong("size"),entry.getString("sha"),entry.getString("mode"),input,null,to);}
+        }
+    }
+    private List<JSONObject> previousCandidates(String root,String key,String previousVersion)throws Exception{
+        List<JSONObject> ready=new ArrayList<>();
+        for(JSONObject old:all())if(old.getString("root").equals(root)&&old.getString("key").equals(key)&&old.getString("state").equals("ready")&&old.getJSONObject("owners").length()>0)ready.add(old);
+        ready.sort((a,b)->Long.compare(b.optLong("createdAt"),a.optLong("createdAt")));
+        for(JSONObject old:ready)if(old.getString("id").equals(previousVersion))return Collections.singletonList(old);
+        for(JSONObject old:ready){JSONObject owners=old.getJSONObject("owners");for(Iterator<String> it=owners.keys();it.hasNext();)if(!owners.getJSONObject(it.next()).optBoolean("history"))return Collections.singletonList(old);}
+        return Collections.emptyList();
     }
     private void checkpoint(JSONObject value,JSONObject entry)throws Exception{try(FileOutputStream stream=new FileOutputStream(new File(registry,value.getString("id")+".journal"),true)){stream.write((entry.toString()+"\n").getBytes(StandardCharsets.UTF_8));}value.getJSONObject("files").put(entry.getString("path"),entry);}
     void write(String id,String path,long size,String sha,String mode,InputStream stream,AtomicBoolean stop)throws Exception{
         write(id,path,size,sha,mode,stream,stop,null);
     }
     private void write(String id,String path,long size,String sha,String mode,InputStream stream,AtomicBoolean stop,FolderAccess access)throws Exception{
-        synchronized(LOCK){JSONObject value=load(id);if(value==null||!value.getString("state").equals("staging"))throw new IOException("目录下载任务已结束");JSONObject trusted=expected(value).get(path);if(trusted==null||!trusted.getString("sha").equals(sha)||!trusted.getString("mode").equals(mode)||trusted.has("size")&&trusted.getLong("size")!=size)throw new IOException("写入文件与固定快照不一致："+path);DocumentFile target=access==null?file(value,path,true):access.file(path,true);if(target==null)throw new IOException("无法创建项目文件："+path);
+        synchronized(LOCK){check(stop);JSONObject value=load(id);if(value==null||!value.getString("state").equals("staging"))throw new IOException("目录下载任务已结束");JSONObject trusted=expected(value).get(path);if(trusted==null||!trusted.getString("sha").equals(sha)||!trusted.getString("mode").equals(mode)||trusted.has("size")&&trusted.getLong("size")!=size)throw new IOException("写入文件与固定快照不一致："+path);DocumentFile target=access==null?file(value,path,true):access.file(path,true);if(target==null)throw new IOException("无法创建项目文件："+path);
             MessageDigest digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));long count=0;
             try(OutputStream output=output(target)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);output.write(buffer,0,n);digest.update(buffer,0,n);count+=n;}}
             if(count!=size||!hex(digest.digest()).equals(sha)){target.delete();throw new IOException("项目文件校验失败："+path);}
@@ -206,15 +239,27 @@ final class ManagedFolderStore {
     }
     InputStream open(String id,String path)throws Exception{synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录快照已清理");DocumentFile doc=file(value,path,false);if(doc==null||!doc.exists())throw new IOException("本地文件已移动或删除："+path);return input(doc);}}
     JSObject describeFile(String id,String path)throws Exception{synchronized(LOCK){JSONObject value=load(id);if(value==null)throw new IOException("目录快照已清理");DocumentFile doc=file(value,path,false);if(doc==null||!doc.exists())throw new IOException("目录文件已移动或删除："+path);JSONObject old=value.getJSONObject("files").optJSONObject(path),entry=new JSONObject();entry.put("path",path);ContentDigest actual=digest(doc,old==null?doc.length():old.optLong("size",doc.length()),null);entry.put("sha",actual.sha);entry.put("size",actual.size);entry.put("mode",old==null?"100644":old.getString("mode"));entry.put("added",old==null);return reference(value,entry,old==null||!old.getString("sha").equals(entry.getString("sha")));}}
-    JSObject readChunk(String id,String path,long offset)throws Exception{synchronized(LOCK){if(offset<0)throw new IOException("读取偏移无效");try(InputStream input=open(id,path)){long left=offset;while(left>0){long n=input.skip(left);if(n<=0)throw new IOException("文件在读取期间变化");left-=n;}byte[] buffer=new byte[CHUNK];int count=0,n;while(count<buffer.length&&(n=input.read(buffer,count,buffer.length-count))>0)count+=n;JSObject result=new JSObject();result.put("data",android.util.Base64.encodeToString(Arrays.copyOf(buffer,count),android.util.Base64.NO_WRAP));result.put("bytes",count);result.put("done",count<CHUNK);return result;}}}
+    JSObject readChunk(String id,String path,long offset)throws Exception{synchronized(LOCK){if(offset<0)throw new IOException("读取偏移无效");try(InputStream input=open(id,path)){long left=offset;while(left>0){check(null);long n=input.skip(left);if(n<=0)throw new IOException("文件在读取期间变化");left-=n;}byte[] buffer=new byte[CHUNK];int count=0,n;while(count<buffer.length&&(n=input.read(buffer,count,buffer.length-count))>0){check(null);count+=n;}JSObject result=new JSObject();result.put("data",android.util.Base64.encodeToString(Arrays.copyOf(buffer,count),android.util.Base64.NO_WRAP));result.put("bytes",count);result.put("done",count<CHUNK);return result;}}}
     private boolean sameBranch(String a,String b){try{return new JSONArray(a).getString(1).equals(new JSONArray(b).getString(1));}catch(Exception ignored){return a.equals(b);}}
+    private List<JSONObject> ownerReferences(JSONObject binding)throws Exception{
+        List<JSONObject> result=new ArrayList<>();if(binding==null)return result;JSONArray references=binding.optJSONArray("references");
+        if(references==null)result.add(new JSONObject(binding.toString()));else for(int i=0;i<references.length();i++)result.add(new JSONObject(references.getJSONObject(i).toString()));return result;
+    }
+    private JSONObject ownerBinding(List<JSONObject> references)throws Exception{
+        JSONObject primary=references.get(references.size()-1);for(JSONObject binding:references)if(!binding.optBoolean("history"))primary=binding;
+        JSONObject result=new JSONObject(primary.toString());JSONArray all=new JSONArray();for(JSONObject binding:references)all.put(binding);result.put("references",all);return result;
+    }
+    private List<JSONObject> keepReferences(JSONObject value,String owner,String ref)throws Exception{
+        List<JSONObject> keep=new ArrayList<>();if(ref.isEmpty())return keep;for(JSONObject binding:ownerReferences(value.getJSONObject("owners").optJSONObject(owner)))if(!binding.getString("ref").equals(ref))keep.add(binding);return keep;
+    }
+    private boolean hasReference(JSONObject binding,String ref)throws Exception{for(JSONObject item:ownerReferences(binding))if(ref.isEmpty()||item.getString("ref").equals(ref))return true;return false;}
     JSObject attach(String id,String owner,String ref,boolean history)throws Exception{
-        synchronized(LOCK){JSONObject value=load(id);if(value==null||!value.getString("state").equals("ready"))throw new IOException("目录文件尚未就绪，原缓存保留");JSONObject binding=new JSONObject();binding.put("ref",ref);binding.put("history",history);value.getJSONObject("owners").put(owner,binding);save(value);JSONArray retained=new JSONArray();
-            if(!history)for(JSONObject old:all())if(!old.getString("id").equals(id)&&sameBranch(old.getString("key"),value.getString("key"))){JSONObject previous=old.getJSONObject("owners").optJSONObject(owner);if(previous!=null&&!previous.optBoolean("history")){old.getJSONObject("owners").remove(owner);if(old.getJSONObject("owners").length()==0){try{erase(old,false);}catch(Exception error){old.getJSONObject("owners").put(owner,previous);save(old);retained.put(error.getMessage());}}else save(old);}}
+        synchronized(LOCK){JSONObject value=load(id);if(value==null||!value.getString("state").equals("ready"))throw new IOException("目录文件尚未就绪，原缓存保留");List<JSONObject> references=ownerReferences(value.getJSONObject("owners").optJSONObject(owner));List<JSONObject> next=new ArrayList<>();for(JSONObject existing:references)if(!existing.getString("ref").equals(ref)){if(!history)existing.put("history",true);next.add(existing);}JSONObject binding=new JSONObject();binding.put("ref",ref);binding.put("history",history);next.add(binding);value.getJSONObject("owners").put(owner,ownerBinding(next));save(value);JSONArray retained=new JSONArray();
+            if(!history)for(JSONObject old:all())if(!old.getString("id").equals(id)&&sameBranch(old.getString("key"),value.getString("key"))){JSONObject previous=old.getJSONObject("owners").optJSONObject(owner);if(previous!=null&&!previous.optBoolean("history")){List<JSONObject> histories=new ArrayList<>();for(JSONObject existing:ownerReferences(previous))if(existing.optBoolean("history"))histories.add(existing);if(!histories.isEmpty()){old.getJSONObject("owners").put(owner,ownerBinding(histories));save(old);continue;}old.getJSONObject("owners").remove(owner);if(old.getJSONObject("owners").length()==0){try{erase(old,false);}catch(Exception error){old.getJSONObject("owners").put(owner,previous);save(old);retained.put(error.getMessage());}}else save(old);}}
             JSObject result=new JSObject();result.put("retained",retained);return result;
         }
     }
-    private void deleteTree(DocumentFile doc,List<String> failures){if(doc==null)return;if(doc.isDirectory())for(DocumentFile child:doc.listFiles())deleteTree(child,failures);if(!doc.delete())failures.add(String.valueOf(doc.getName()));}
+    private void deleteTree(DocumentFile doc,List<String> failures)throws IOException{check(null);if(doc==null)return;if(doc.isDirectory())for(DocumentFile child:doc.listFiles())deleteTree(child,failures);if(!doc.delete())failures.add(String.valueOf(doc.getName()));}
     private void erase(JSONObject value,boolean force)throws Exception{
         if(!force){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty"))throw new Changed("检测到本地修改或额外文件："+state.getJSONArray("changes").toString());}
         List<String> failures=new ArrayList<>();DocumentFile directory=versionDir(value,false);if(directory!=null){deleteTree(directory.findFile("files"),failures);for(String markerName:Arrays.asList(".gitvault-snapshot.json",".gitvault-diagnostic.json")){DocumentFile marker=directory.findFile(markerName);if(marker!=null&&!marker.delete())failures.add(markerName);}if(directory.listFiles().length==0&&!directory.delete())failures.add("版本目录");}
@@ -226,21 +271,21 @@ final class ManagedFolderStore {
         for(int i=0;i<files.length();i++){JSONObject file=files.getJSONObject(i),entry=byPath.get(file.getString("path"));if(entry==null||!entry.getString("sha").equals(file.getString("sha"))||!entry.optString("mode","100644").equals(file.getString("mode"))||entry.has("size")&&entry.getLong("size")!=file.getLong("size"))return false;}return true;
     }
     JSObject clear(String owner,String ref,boolean force,JSONArray verified)throws Exception{
-        synchronized(LOCK){List<JSONObject> targets=new ArrayList<>();Set<String> approved=new HashSet<>();Set<String> keys=new HashSet<>();for(JSONObject value:all()){JSONObject binding=value.getJSONObject("owners").optJSONObject(owner);if(binding!=null&&(ref.isEmpty()||ref.equals(binding.getString("ref")))){if(value.getJSONObject("owners").length()==1&&!force){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty")){if(!ref.isEmpty()&&matches(state,verified))approved.add(value.getString("id"));else throw new Changed("清理将包含本地修改或额外文件："+state.getJSONArray("changes").toString());}else approved.add(value.getString("id"));}targets.add(value);keys.add(value.getString("key"));}}
+        synchronized(LOCK){List<JSONObject> targets=new ArrayList<>();Set<String> approved=new HashSet<>();Set<String> keys=new HashSet<>();for(JSONObject value:all()){JSONObject binding=value.getJSONObject("owners").optJSONObject(owner);if(binding!=null&&hasReference(binding,ref)){if(value.getJSONObject("owners").length()==1&&keepReferences(value,owner,ref).isEmpty()&&!force){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty")){if(!ref.isEmpty()&&matches(state,verified))approved.add(value.getString("id"));else throw new Changed("清理将包含本地修改或额外文件："+state.getJSONArray("changes").toString());}else approved.add(value.getString("id"));}targets.add(value);keys.add(value.getString("key"));}}
             for(JSONObject value:all())if(value.getJSONObject("owners").length()==0&&keys.contains(value.getString("key"))&&(ref.isEmpty()||ref.equals(value.getString("ref"))))targets.add(value);
             // A legacy failed candidate can contain merged/corrupt paths. Check
             // every candidate before deleting the current, verified directory.
             if(!force)for(JSONObject value:targets)if(value.getJSONObject("owners").length()==0){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty")){if(!ref.isEmpty()&&matches(state,verified))approved.add(value.getString("id"));else throw new Changed("旧临时下载目录有变化，尚未开始清理项目文件；可先使用清理临时缓存："+state.getJSONArray("changes").toString());}else approved.add(value.getString("id"));}
             JSONArray ids=new JSONArray();for(JSONObject value:targets)ids.put(value.getString("id"));
-            for(JSONObject value:targets){if(value.getJSONObject("owners").length()<=1)erase(value,force||approved.contains(value.getString("id")));else{value.getJSONObject("owners").remove(owner);save(value);}}JSObject result=new JSObject();result.put("versions",targets.size());result.put("ids",ids);return result;
+            for(JSONObject value:targets){List<JSONObject> keep=keepReferences(value,owner,ref);if(!keep.isEmpty()){value.getJSONObject("owners").put(owner,ownerBinding(keep));save(value);}else if(value.getJSONObject("owners").length()<=1)erase(value,force||approved.contains(value.getString("id")));else{value.getJSONObject("owners").remove(owner);save(value);}}JSObject result=new JSObject();result.put("versions",targets.size());result.put("ids",ids);return result;
         }
     }
     JSObject discard(String id)throws Exception{synchronized(LOCK){JSONObject value=load(id);JSObject result=new JSObject();JSONArray ids=new JSONArray();if(value!=null&&value.getJSONObject("owners").length()==0){erase(value,false);ids.put(id);}result.put("versions",ids.length());result.put("ids",ids);return result;}}
     JSObject cleanTemporary(boolean force)throws Exception{synchronized(LOCK){int count=0;JSONArray ids=new JSONArray();for(JSONObject value:all())if(value.getJSONObject("owners").length()==0){erase(value,force);ids.put(value.getString("id"));count++;}JSObject result=new JSObject();result.put("versions",count);result.put("ids",ids);return result;}}
     JSObject exportFiles(String uri,String prefix,JSArray entries,JSONObject project)throws Exception{
         synchronized(LOCK){DocumentFile destination=walk(root(uri),prefix,true);List<String> paths=new ArrayList<>();for(int i=0;i<entries.length();i++)paths.add(entries.getJSONObject(i).getString("path"));FolderPathLayout exportLayout=FolderPathLayout.plan(paths);for(int i=0;i<entries.length();i++){
-            JSONObject entry=entries.getJSONObject(i),ref=entry.getJSONObject("nativeRef");String path=exportLayout.physical(entry.getString("path"));ExportPath.validate(path);DocumentFile folder=walk(destination,"files",true);int slash=path.lastIndexOf('/');if(slash>=0)folder=walk(folder,path.substring(0,slash),true);DocumentFile target=createFile(folder,path.substring(slash+1));if(target==null)throw new IOException("无法创建导出文件："+path);
-            long size=entry.getLong("size"),count=0;MessageDigest hash=MessageDigest.getInstance("SHA-1");hash.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));try(InputStream input=open(ref.getString("version"),ref.getString("path"));OutputStream output=output(target)){byte[] bytes=new byte[65536];int n;while((n=input.read(bytes))!=-1){output.write(bytes,0,n);hash.update(bytes,0,n);count+=n;}}
+            check(null);progress("正在导出 "+(i+1)+"/"+entries.length());JSONObject entry=entries.getJSONObject(i),ref=entry.getJSONObject("nativeRef");String path=exportLayout.physical(entry.getString("path"));ExportPath.validate(path);DocumentFile folder=walk(destination,"files",true);int slash=path.lastIndexOf('/');if(slash>=0)folder=walk(folder,path.substring(0,slash),true);DocumentFile target=createFile(folder,path.substring(slash+1));if(target==null)throw new IOException("无法创建导出文件："+path);
+            long size=entry.getLong("size"),count=0;MessageDigest hash=MessageDigest.getInstance("SHA-1");hash.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));try(InputStream input=open(ref.getString("version"),ref.getString("path"));OutputStream output=output(target)){byte[] bytes=new byte[65536];int n;while((n=input.read(bytes))!=-1){check(null);output.write(bytes,0,n);hash.update(bytes,0,n);count+=n;}}
             if(count!=size||!hex(hash.digest()).equals(entry.getString("sha")))throw new IOException("目录文件在导出期间变化："+path);
         }DocumentFile marker=createFile(destination,".gitvault-export.json");if(marker==null)throw new IOException("无法写入导出完成标识");JSONObject receipt=new JSONObject(project.toString());receipt.put("files",entries);receipt.put("pathMappings",new JSONObject(exportLayout.aliases()));receipt.put("layoutVersion",2);receipt.put("completedAt",System.currentTimeMillis());try(OutputStream output=output(marker)){output.write(receipt.toString().getBytes(StandardCharsets.UTF_8));}JSObject result=new JSObject();result.put("location",prefix);return result;}
     }

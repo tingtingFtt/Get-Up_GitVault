@@ -10,3 +10,9 @@ test('download plans favor large initial archives and preserve small incremental
  assert.equal(shouldUseArchive(small,[]),false);
  assert.equal(shouldUseArchive([{size:0}],[{size:0}]),false);
 });
+
+test('existing snapshots transfer only changed bodies even when a small archive would be cheaper in requests',()=>{
+ const entries=Array.from({length:32},()=>({size:100}));
+ assert.equal(shouldUseArchive(entries,entries.slice(0,16),true),false);
+ assert.equal(shouldUseArchive(entries,entries,true),true);
+});
