@@ -1479,3 +1479,70 @@ for(const scenario of ['deleted','recreated'] as const)test(`HTTP fresh B retain
     assert.ok(!server.sent.slice(before).some(request=>request.path.startsWith('/repos/destination/fixed-copy/commits/')||request.path.startsWith('/repos/destination/fixed-copy/git/')));
   }
 });
+
+test('quick selections replace checked rows, respect search, and populate only the selected batch queue', async () => {
+  const fresh = { ...repo(), id: 'fresh', repo: 'fresh-app', remark: 'fresh' };
+  const fork = { ...boundProject(), id: 'fork', forkScope: 'full', forkTarget: { id: 77, owner: 'destination', repo: 'backup', branch: 'release', htmlUrl: '' } };
+  const current = { ...boundProject(), id: 'current', forkScope: 'current', uploadTarget: { ...boundProject().uploadTarget, id: 88, repo: 'single-branch' } };
+  const update = { ...repo(), id: 'update', repo: 'update-app', hasUpdate: true };
+  await reloadProjects([fresh, fork, current, update]);
+  await click('仓库已有项目 (4)');
+  await click('全选所有');
+  await click('仅选未上传');
+  assert.ok(document.querySelector('.batch-selection')!.textContent!.includes('已选定 2 / 4 个项目'));
+  await click('仅选未分叉');
+  await click('批量分叉');
+  assert.equal(document.querySelectorAll('[aria-label^="目标名称 "]').length, 2);
+  assert.ok(document.querySelector('[role="dialog"]')!.textContent!.includes('source/fresh-app'));
+  assert.ok(!document.querySelector('[role="dialog"]')!.textContent!.includes('destination/backup'));
+  await click('关闭');
+  await click('仅选有更新');
+  assert.ok(document.querySelector('.batch-selection')!.textContent!.includes('已选定 1 / 4 个项目'));
+  await click('仅选可分叉同步');
+  assert.ok(document.querySelector('.batch-selection')!.textContent!.includes('已选定 2 / 4 个项目'));
+  await click('批量分叉同步');
+  const dialog = document.querySelector('[role="dialog"]')!;
+  assert.ok(!dialog.textContent!.includes('source/fresh-app'));
+  assert.ok(!dialog.textContent!.includes('source/update-app'));
+  await click('关闭');
+  await input('搜索项目名称、备注、详细描述或标签...', 'fresh');
+  assert.equal(buttons().find(button => button.textContent === '仅选可分叉同步')!.disabled, true);
+  await click('仅选未上传');
+  assert.ok(document.querySelector('.batch-selection')!.textContent!.includes('已选定 1 / 1 个项目'));
+  assert.equal(buttons().find(button => button.textContent === '取消全选')!.disabled, false);
+});
+
+test('select all checks visible identities even when an equally sized previous selection is hidden by search', async () => {
+  const first = { ...repo(), id: 'first', repo: 'alpha', remark: 'alpha' };
+  const second = { ...repo(), id: 'second', repo: 'beta', remark: 'beta' };
+  await reloadProjects([first, second]);
+  await click('仓库已有项目 (2)');
+  await input('搜索项目名称、备注、详细描述或标签...', 'alpha'); await click('全选所有');
+  await input('搜索项目名称、备注、详细描述或标签...', 'beta');
+  assert.ok(buttons().some(button => button.textContent?.trim() === '全选所有'));
+  await click('全选所有'); await click('批量分叉');
+  assert.ok(document.querySelector('[role="dialog"]')!.textContent!.includes('source/beta'));
+  assert.ok(!document.querySelector('[role="dialog"]')!.textContent!.includes('source/alpha'));
+});
+
+test('quick selection honors tag scope and uses hidden same-source bindings without making network requests', async () => {
+  const original = { ...repo(), id: 'original', tags: ['待处理'] };
+  const managed = { ...boundProject(), id: 'managed', owner: 'destination', repo: 'backup', origin: { owner: 'source', repo: 'project', url: repo().url, branch: 'develop' }, tags: ['已归档'] };
+  const fresh = { ...repo(), id: 'fresh', repo: 'fresh-app', tags: ['待处理'] };
+  await reloadProjects([original, managed, fresh]);
+  await click('仓库已有项目 (3)'); await click('#待处理');
+  requests.length = 0;
+  await click('仅选未上传');
+  assert.equal(requests.length, 0);
+  assert.ok(document.querySelector('.batch-selection')!.textContent!.includes('已选定 1 / 2 个项目'));
+  await click('批量上传至私人仓库');
+  const dialog = [...document.querySelectorAll('h3')].find(heading => heading.textContent!.includes('批量上传项目至个人私人仓库'))!.closest('.rounded-3xl')!;
+  assert.ok(dialog.textContent!.includes('fresh-app'));
+  assert.equal(dialog.querySelectorAll('.font-mono').length, 1);
+  assert.equal(requests.length, 0);
+  await click('关闭');
+  await input('搜索项目名称、备注、详细描述或标签...', 'nothing-matches');
+  for (const label of ['仅选未上传', '仅选未分叉', '仅选有更新', '仅选可分叉同步']) {
+    assert.equal(buttons().find(button => button.textContent === label)!.disabled, true);
+  }
+});

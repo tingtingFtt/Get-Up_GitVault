@@ -124,6 +124,13 @@ function inspect(doc, width, scenario) {
       const doc = frame.contentDocument;
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
         await click(doc,'仓库已有项目 (1)');
+        if (scenario === 'projects') {
+          for (const text of ['仅选未上传','仅选未分叉','仅选有更新','仅选可分叉同步']) {
+            if (!buttons(doc).some(button => button.textContent.trim() === text)) throw new Error('Missing quick selection: ' + text);
+          }
+          inspect(doc,width,'projects-unselected');
+          await click(doc,'仅选未上传');
+        }
         if (scenario.startsWith('batch-')) { await click(doc,'全选所有'); await click(doc,{'batch-fork':'批量分叉','batch-update':'批量更新','batch-sync':'批量分叉同步','batch-upload':'批量上传至私人仓库'}[scenario] || '批量上传至私人仓库'); }
       } else if (['workbench','history','changelog','private','fork','push','folders','metadata','storage'].includes(scenario)) {
         await click(doc,'工作台');

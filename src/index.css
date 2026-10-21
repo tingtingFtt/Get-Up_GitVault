@@ -37,6 +37,7 @@ html, body, #root { width: 100%; min-width: 0; margin: 0; }
 .app-shell :where(.workbench-actions, .batch-actions) > button { width: 100%; padding: .45rem .6rem; font-size: .6875rem; min-height: 2.125rem; justify-content: center; }
 .app-shell .batch-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .app-shell .workbench-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .batch-selection button { padding: .35rem .6rem; font-size: .6875rem; min-height: 2rem; }
 .app-shell .batch-secondary { display: flex; flex-wrap: wrap; gap: .5rem; }
 .app-shell .batch-secondary button { padding: .35rem .6rem; font-size: .6875rem; }
 .app-shell .batch-results { display: flex; flex-direction: column; gap: .5rem; overflow-y: auto; min-height: 0; max-height: 45dvh; }

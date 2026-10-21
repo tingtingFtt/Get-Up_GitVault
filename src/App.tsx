@@ -24,6 +24,7 @@ import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import {reportProgress,cooperate} from './utils/operation';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
+import { projectSelections } from './utils/projectSelection';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
 import { accountRegistry, AccountRecordPendingError, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject, type TargetHistory } from './utils/accountRegistry';
 import { appendOperationLog, readOperationLogs, clearOperationLogs, type OperationLog } from './utils/operationLog';
@@ -2269,7 +2270,7 @@ export default config;
   };
 
   const handleSelectAllProjects = () => {
-    if (selectedProjectIds.length === filteredRepos.length) {
+    if (allVisibleProjectsSelected) {
       setSelectedProjectIds([]);
     } else {
       setSelectedProjectIds(filteredRepos.map(r => r.id));
@@ -2683,6 +2684,9 @@ export default config;
     const matchTag = selectedTagFilter === 'all' || repo.tags.includes(selectedTagFilter);
     return matchSearch && matchTag;
   });
+
+  const quickProjectSelections = projectSelections(filteredRepos, repos);
+  const allVisibleProjectsSelected = filteredRepos.length > 0 && filteredRepos.every(repo => selectedProjectIds.includes(repo.id));
 
   const activeTree = viewingBackup ? viewingBackup.tree : (activeRepo?.tree || []);
   const heatmapData = useMemo(() => {
@@ -3250,13 +3254,13 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
             {/* BATCH ACTION TOOLBAR */}
             <div className="batch-toolbar bg-[#FAF8F5] border border-[#E5DFD7] rounded-2xl p-3 md:p-4 flex flex-col gap-3 shadow-xs">
-              <div className="flex flex-row items-center gap-2 flex-wrap whitespace-nowrap">
+              <div className="batch-selection flex flex-row items-center gap-2 flex-wrap whitespace-nowrap" role="group" aria-label="项目批量选择">
                 <button
                   onClick={handleSelectAllProjects}
                   className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#EFECE6] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <CheckSquare className="w-3.5 h-3.5 text-[#8E9F8B] shrink-0" />
-                  <span>{selectedProjectIds.length === filteredRepos.length && filteredRepos.length > 0 ? '取消全选' : '全选所有'}</span>
+                  <span>{allVisibleProjectsSelected ? '取消全选' : '全选所有'}</span>
                 </button>
                 <button
                   onClick={handleInvertSelectProjects}
@@ -3264,7 +3268,14 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 >
                   反选
                 </button>
-                <button type="button" onClick={() => setSelectedProjectIds(filteredRepos.filter(repo => repo.hasUpdate).map(repo => repo.id))} disabled={!filteredRepos.some(repo => repo.hasUpdate)} className="px-3 py-1.5 bg-[#FFFFFF] border border-[#DFD8CE] rounded-xl text-xs text-[#5D6F5A] disabled:opacity-40">仅选有更新</button>
+                {([
+                  ['unuploaded', '仅选未上传', '选择当前筛选中尚无上传或分叉关系的项目；已有固定目标、同源目标和待完成记录会跳过'],
+                  ['unforked', '仅选未分叉', '选择当前筛选中尚无分叉或上传关系的项目；已有目标应使用更新或同步'],
+                  ['updates', '仅选有更新', '选择当前筛选中已检测到新版本的项目；可先点“全部检测”刷新状态'],
+                  ['sync', '仅选可分叉同步', '选择当前筛选中已绑定分叉或单分支副本的项目；跳过目标异常和待创建、待切换项目，同一完整分叉只选择一次'],
+                ] as const).map(([kind, label, title]) => (
+                  <button key={kind} type="button" title={title} onClick={() => setSelectedProjectIds(quickProjectSelections[kind])} disabled={!quickProjectSelections[kind].length} className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#EFECE6] border border-[#DFD8CE] rounded-xl text-xs text-[#5D6F5A] disabled:opacity-40">{label}</button>
+                ))}
                 {selectedProjectIds.length > 0 && (
                   <button
                     onClick={handleClearSelectProjects}
@@ -3278,6 +3289,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   已选定 {selectedProjectIds.length} / {filteredRepos.length} 个项目
                 </span>
               </div>
+
+              <p className="text-[11px] text-[#7A7367]">快捷选择只替换当前勾选，不立即执行。范围跟随搜索和标签；未上传／未分叉会跳过已有目标，远端关系在执行时再次核验。</p>
 
               {/* Batch Action Buttons */}
               <div className="batch-actions">
