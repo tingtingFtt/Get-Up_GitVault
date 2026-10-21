@@ -236,5 +236,7 @@ try {
   }
   const report = JSON.parse(decodeURIComponent(match[1]));
   console.log(JSON.stringify(report, null, 2));
-  if (report.failures.length || report.checks !== widths.length * scenarios.length) process.exitCode = 1;
+  // The projects scene checks both the initial toolbar and its selected state.
+  const expectedChecks = widths.length * (scenarios.length + 1);
+  if (report.failures.length || report.checks !== expectedChecks) process.exitCode = 1;
 } finally { server.closeAllConnections(); server.close(); await rm(profile, { recursive: true, force: true }); }
