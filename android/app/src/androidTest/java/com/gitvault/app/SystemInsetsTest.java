@@ -38,6 +38,34 @@ public class SystemInsetsTest {
             assertEquals("Actual JavaScript/Capacitor/disk chunk transfer failed","ok",result.get());
         }
     }
+    @Test public void largeEncryptedProjectRecordsReloadWithoutAWebViewStorageMirror() throws Exception {
+        android.content.Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        android.content.SharedPreferences preferences = context.getSharedPreferences("gitvault_secure", 0);
+        String originalData = preferences.getString("data", null), originalIv = preferences.getString("iv", null);
+        try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
+            waitForPage(scenario);
+            AtomicReference<String> result = new AtomicReference<>("pending");
+            String script = "(async()=>{try{const native=window.Capacitor.Plugins.GitVaultNative,project={id:'large-record-test',owner:'fixture',repo:'records',url:'https://github.com/fixture/records',branch:'main',remark:'large-record-test',tags:[],checkInterval:0,latestCommitSha:'fixture',commitMessage:'fixture',commitAuthor:'fixture',commitDate:'2026-10-26',lastSyncedAt:'2026-10-26',repoMeta:{},tree:[],backups:[],isCachePurged:true,retainedData:'x'.repeat(6*1024*1024)};localStorage.setItem('gitvault_repos_v8',JSON.stringify([{id:'stale-mirror'}]));await native.writeVault({value:JSON.stringify({gitvault_repos_v8:JSON.stringify([project])})});const saved=JSON.parse((await native.readVault()).value);if(JSON.parse(saved.gitvault_repos_v8)[0].retainedData.length!==6*1024*1024)throw Error('Large record changed');window.__recordsResult='ok';}catch(error){window.__recordsResult='error: '+error.message;}})()";
+            scenario.onActivity(activity -> activity.getBridge().getWebView().evaluateJavascript(script, null));
+            for (int attempt=0; attempt<400 && result.get().equals("pending"); attempt++) {
+                scenario.onActivity(activity -> activity.getBridge().getWebView().evaluateJavascript("window.__recordsResult||'pending'", value -> result.set(value == null ? "pending" : value.replace("\"", ""))));
+                if (result.get().equals("pending")) Thread.sleep(100);
+            }
+            assertEquals("Large encrypted metadata did not round trip through the native bridge", "ok", result.get());
+            scenario.recreate();
+            waitForPage(scenario);
+            result.set("pending");
+            scenario.onActivity(activity -> activity.getBridge().getWebView().evaluateJavascript("localStorage.getItem('gitvault_repos_v8')===null&&document.body.textContent.includes('large-record-test')", result::set));
+            for (int attempt=0; attempt<100 && result.get().equals("pending"); attempt++) Thread.sleep(100);
+            assertEquals("Startup must load the encrypted project and remove the stale WebView mirror", "true", result.get());
+        } finally {
+            android.content.SharedPreferences.Editor restore = preferences.edit().clear();
+            if (originalData != null) restore.putString("data", originalData);
+            if (originalIv != null) restore.putString("iv", originalIv);
+            assertTrue("Restore original encrypted test data", restore.commit());
+        }
+    }
+
     private void waitForPage(ActivityScenario<MainActivity> scenario) throws Exception {
         AtomicBoolean ready = new AtomicBoolean(false);
         for (int attempt = 0; attempt < 100 && !ready.get(); attempt++) {

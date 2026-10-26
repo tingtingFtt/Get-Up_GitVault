@@ -8,6 +8,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { localCache } from '../src/utils/localCache';
 import { beginGithubOperation, githubClient, githubApi, GitHubError } from '../src/utils/githubClient';
 import App from '../src/App';
+import { initializeCredentials, readCredentialValue, writeCredentialValue, flushCredentials } from '../src/utils/credentialStorage';
 import { appDialog } from '../src/utils/appDialog';
 import { checkpoint } from '../src/utils/taskJournal';
 import { immediateTransport } from './transportFixture';
@@ -80,6 +81,8 @@ beforeEach(async () => {
   accountRegistry.save = async () => ({} as any);
   accountRegistry.remove = async () => ({} as any);
   accountRegistry.reserve = async (source, name, kind, _token, _signal, explicit) => ({ source, target: explicit || {owner:'destination',repo:name}, kind, state:'reserved',createdByApp:true,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:'' });
+  await flushCredentials().catch(() => {});
+  await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase('GitVault_Records_v1'); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
   beginGithubOperation(); localStorage.clear(); document.body.innerHTML = '<div id="root"></div>';
   await new Promise<void>((resolve, reject) => { const request = indexedDB.deleteDatabase('GitVault_Storage_v1'); request.onsuccess = () => resolve(); request.onerror = () => reject(request.error); });
   alerts = []; requests = []; uploadedContents = []; failUpload = false; rejectionStatus = 403;
@@ -113,10 +116,11 @@ beforeEach(async () => {
   localStorage.setItem('gitvault_repos_v8', JSON.stringify([repo()]));
   await localCache.saveProjectFiles('tracked', [file('old')], 'v1');
   await localCache.saveProjectFiles('tracked', [file('new')], 'v2');
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => { root.render(React.createElement(App)); });
 });
-afterEach(async () => { await act(async () => root.unmount()); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); mock.restoreAll(); });
+afterEach(async () => { await act(async () => root.unmount()); await flushCredentials().catch(() => {}); globalThis.fetch = originalFetch; Object.assign(accountRegistry, registryMethods); mock.restoreAll(); });
 
 test('reopening a saved task does not write remotely and a changed branch blocks retry', async () => {
   checkpoint({ kind: 'projects', action: 'update', items: [{ id: 'tracked', label: 'source/project', name: 'project', status: 'running', source: 'https://github.com/source/project', branch: 'other' }] });
@@ -157,7 +161,7 @@ test('archive publishing with keep-source preserves files and saves each complet
   await waitFor(() => JSON.parse(localStorage.getItem('gitvault_tasks_v1')!)[0].items[0].status === 'success');
 });
 
-const storedProjects = () => JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+const storedProjects = () => JSON.parse(readCredentialValue('gitvault_repos_v8')!);
 const targetManager = () => document.querySelector('[aria-label="管理远端目标"]');
 function deletedTargetFixture(options: { recreate?: boolean; restoreSource?: boolean; missingSource?: boolean } = {}) {
   const base = globalThis.fetch; let recreated = false;
@@ -264,9 +268,9 @@ test('detaching a missing target clears its shared branch and Fork bindings whil
 });
 test('refusing detach confirmation keeps every binding intact', async () => {
   await reloadProject(boundProject()); deletedTargetFixture(); await openDeletedTargetManager();
-  const before = localStorage.getItem('gitvault_repos_v8');
+  const before = readCredentialValue('gitvault_repos_v8');
   (globalThis as any).confirm = () => false; await click('解除此目标的所有绑定');
-  assert.equal(localStorage.getItem('gitvault_repos_v8'), before);
+  assert.equal(readCredentialValue('gitvault_repos_v8'), before);
 });
 test('after detaching a deleted upload users can recreate the same repository name with a new ID and upload only the source branch', async () => {
   const saved = boundProject(); saved.privateRepoUrl = 'https://github.com/destination/backup';
@@ -317,9 +321,9 @@ test('a deleted full Fork can be detached and recreated from the original upstre
 
 test('matching link waits for a choice, compares target files, reuses its fixed name and preserves old history before later upload', async () => {
   await reloadProject(boundProject()); importAssociationFixture();
-  const before = localStorage.getItem('gitvault_repos_v8');
+  const before = readCredentialValue('gitvault_repos_v8');
   await beginMatchingImport();
-  assert.equal(localStorage.getItem('gitvault_repos_v8'), before);
+  assert.equal(readCredentialValue('gitvault_repos_v8'), before);
   assert.ok(!requests.some(r => r.path.includes('/zipball/') || r.path.includes('/git/blobs/')));
   assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
   await click('对比此项目');
@@ -327,7 +331,7 @@ test('matching link waits for a choice, compares target files, reuses its fixed 
   assert.ok(importDialog()?.textContent?.includes('develop → release'));
   assert.ok(requests.every(r => r.payload === null));
   await click('沿用上传目标'); await waitFor(() => !importDialog() && alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.length, 1); assert.equal(saved[0].id, 'tracked'); assert.equal(saved[0].uploadTarget.id, 77);
   assert.equal(saved[0].uploadTarget.repo, 'backup'); assert.equal(saved[0].uploadTarget.branch, 'release');
   assert.equal(saved[0].latestCommitSha, 'import-new'); assert.equal(saved[0].backups.length, 2);
@@ -335,14 +339,14 @@ test('matching link waits for a choice, compares target files, reuses its fixed 
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.equal((await localCache.getProjectFiles('tracked', 'import-new'))[0].content, 'latest');
   await enterWorkbench(); await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
-  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.commitSha === 'uploaded');
+  await waitFor(() => JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot?.commitSha === 'uploaded');
   assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
 });
 test('choosing independent import never inherits an upload or Fork binding or changes the existing project', async () => {
   await reloadProject(boundProject()); importAssociationFixture();
-  const previous = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const previous = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   await beginMatchingImport(); await click('独立导入，不关联'); await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.length, 2); assert.equal(saved[0].uploadTarget, undefined); assert.equal(saved[0].forkTarget, undefined);
   assert.deepEqual(saved.find((project: any) => project.id === 'tracked'), previous);
   assert.ok(requests.every(r => r.payload === null));
@@ -357,7 +361,7 @@ test('importing the destination URL can explicitly resume the original source in
   await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
   assert.ok(importDialog()?.textContent?.includes('本次导入来源：source/project'));
   await click('沿用上传目标'); await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.length, 1); assert.equal(saved[0].url, 'https://github.com/source/project');
   assert.equal(saved[0].owner, 'source'); assert.equal(saved[0].branch, 'develop');
   assert.equal(saved[0].latestCommitSha, 'import-new'); assert.equal(saved[0].uploadTarget.branch, 'release');
@@ -373,7 +377,7 @@ test('importing another source branch reuses the destination repository but plan
   await click('确认拉取进入本地'); await waitFor(() => !!importDialog());
   await click('对比此项目'); await waitFor(() => importDialog()?.textContent?.includes('后续上传时新建') === true);
   await click('沿用上传目标'); await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.length, 2);
   const feature = saved.find((project: any) => project.branch === 'feature/demo');
   assert.equal(feature.uploadTarget.repo, 'backup'); assert.equal(feature.uploadTarget.branch, 'feature/demo'); assert.equal(feature.branchUploadPending, true);
@@ -382,13 +386,13 @@ test('importing another source branch reuses the destination repository but plan
 });
 test('failed identity comparison cannot be accepted and skipping leaves all project records unchanged', async () => {
   await reloadProject(boundProject()); importAssociationFixture({ changedId: true });
-  const previous = localStorage.getItem('gitvault_repos_v8');
+  const previous = readCredentialValue('gitvault_repos_v8');
   await beginMatchingImport(); await click('对比此项目');
   await waitFor(() => importDialog()?.textContent?.includes('身份已变化') === true);
   assert.equal(buttons().find(b => b.textContent === '沿用上传目标')?.disabled, true);
   await click('跳过此链接'); await waitFor(() => !importDialog());
-  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')), withoutTargetHealth(previous));
-  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].targetHealth['id:77'].status, 'identity-changed');
+  assert.equal(withoutTargetHealth(readCredentialValue('gitvault_repos_v8')), withoutTargetHealth(previous));
+  assert.equal(JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].targetHealth['id:77'].status, 'identity-changed');
   assert.ok(!requests.some(r => r.path.endsWith('/commits/release')));
   assert.ok(!requests.some(r => r.path.includes('/zipball/') || r.path.includes('/git/blobs/')));
 });
@@ -400,7 +404,7 @@ test('batch import waits for each existing target decision, then continues the r
   await click('对比此项目'); await waitFor(() => buttons().some(b => b.textContent === '沿用上传目标' && !b.disabled));
   await click('沿用上传目标');
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 0 · 失败 0 · 取消 0');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.length, 2); assert.equal(saved.find((p: any) => p.id === 'tracked').remark, '新备注');
   assert.deepEqual(saved.find((p: any) => p.id === 'tracked').tags, ['保留已有标签']);
   assert.equal(saved.find((p: any) => p.owner === 'demo').remark, '');
@@ -408,13 +412,13 @@ test('batch import waits for each existing target decision, then continues the r
 });
 test('cancelling a single import is a neutral status without URL or Token advice and can restart',async()=>{
   await reloadProject(boundProject());importAssociationFixture();
-  const before=withoutTargetHealth(localStorage.getItem('gitvault_repos_v8'));
+  const before=withoutTargetHealth(readCredentialValue('gitvault_repos_v8'));
   await beginMatchingImport();await click('取消本次导入');
   await waitFor(()=>!importDialog()&&!!document.body.textContent?.includes('导入已取消'));
   assert.ok(!document.body.textContent?.includes('拉取项目失败提示：'));
   assert.ok(!document.body.textContent?.includes('支持格式：'));
   assert.ok(!document.body.textContent?.includes('signal is aborted'));
-  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')),before);
+  assert.equal(withoutTargetHealth(readCredentialValue('gitvault_repos_v8')),before);
   assert.equal(JSON.parse(localStorage.getItem('gitvault_operation_logs_v1')!)[0].status,'cancelled');
   await click('确认拉取进入本地');await waitFor(()=>!!importDialog());
   await click('跳过此链接');await waitFor(()=>!importDialog());
@@ -433,12 +437,12 @@ test('a raw WebView AbortError is classified as cancellation even without an abo
 });
 test('cancelling during comparison stops the batch and leaves both links retryable without stale bindings', async () => {
   await reloadProject(boundProject()); importAssociationFixture({ delayedComparison: true });
-  const previous = localStorage.getItem('gitvault_repos_v8');
+  const previous = readCredentialValue('gitvault_repos_v8');
   await beginMatchingImport(true); await click('对比此项目');
   await waitFor(() => requests.some(r => r.path.endsWith('/commits/release')));
   await click('取消本次导入');
   await waitFor(() => !importDialog() && document.querySelector('[role=status]')?.textContent === '成功 0 · 跳过 0 · 失败 0 · 取消 2');
-  assert.equal(withoutTargetHealth(localStorage.getItem('gitvault_repos_v8')), withoutTargetHealth(previous));
+  assert.equal(withoutTargetHealth(readCredentialValue('gitvault_repos_v8')), withoutTargetHealth(previous));
   assert.ok(!requests.some(r => r.path === '/repos/demo/other'));
   importAssociationFixture(); await click('重试未完成链接'); await waitFor(() => !!importDialog());
   await click('跳过此链接');
@@ -450,7 +454,7 @@ test('native Fork reuse verifies the upstream and routes subsequent all-branch s
   await beginMatchingImport(); await click('对比此项目');
   await waitFor(() => buttons().some(b => b.textContent === '沿用分叉同步' && !b.disabled));
   await click('沿用分叉同步'); await waitFor(() => alerts.length > 0);
-  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const updated = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(updated.forkTarget.repo, 'backup'); assert.equal(updated.forkScope, 'full');
   assert.deepEqual(updated.forkTarget.branches, ['develop', 'other']);
   assert.ok(requests.every(r => r.payload === null));
@@ -519,7 +523,7 @@ test('historical file view reads its exact version rather than current cache', a
 test('verified upload with keep option retains cache and records remote commit', async () => {
   await enterWorkbench(); await upload(false);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.ok(saved.remoteSnapshot, JSON.stringify({ alerts, requests }));
   assert.equal(saved.remoteSnapshot.commitSha, 'uploaded');
   assert.equal(saved.uploadTarget.branch, 'release');
@@ -531,14 +535,14 @@ test('verified upload with purge removes only selected contents and keeps manife
   await waitFor(() => storedProjects()[0].isCachePurged === true);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2')).length, 0);
   assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.isCachePurged, true); assert.equal(saved.tree.length, 1); assert.equal(saved.backups[0].tree.length, 1);
 });
 
 test('rejected upload preserves local files even when cleanup is selected', async () => {
   failUpload = true; await enterWorkbench(); await upload(true);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
-  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
+  assert.equal(JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
   assert.ok(alerts.some(text => text.includes('上传未完成')));
 });
 
@@ -546,7 +550,8 @@ test('upstream synchronization uses the stored Fork identity', async () => {
   const saved = repo() as any;
   saved.forkTarget = { owner: 'me', repo: 'project-fork', branch: 'develop', htmlUrl: 'https://github.com/me/project-fork' };
   await act(async () => { root.unmount(); });
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify([saved]));
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
   await enterWorkbench(); await click('同步上游');
@@ -558,7 +563,7 @@ test('updates save new content, retain old version, and upload to the remembered
   const saved = repo() as any;
   saved.uploadTarget = { owner: 'destination', repo: 'backup', branch: 'release', purgeAfterUpload: false, token: 'target-token' };
   await act(async () => root.unmount());
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify([saved]));
   const baseFetch = globalThis.fetch;
   globalThis.fetch = async (input, init = {}) => {
     const path = String(input);
@@ -568,11 +573,12 @@ test('updates save new content, retain old version, and upload to the remembered
     if (path.includes('/repos/source/project/git/blobs/')) return ok({ content: Buffer.from('newest').toString('base64') });
     return baseFetch(input, init);
   };
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
   await enterWorkbench(); await click('一键更新');
   await waitFor(() => alerts.length > 0);
-  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const updated = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(updated.latestCommitSha, 'v3');
   assert.equal(updated.remoteSnapshot.sourceSha, 'v3');
   assert.equal(updated.backups[0].commitSha, 'v2');
@@ -592,7 +598,7 @@ test('history upload sends old bytes and purges only that selected version', asy
   assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
   assert.equal((await localCache.getProjectFiles('tracked', 'v1')).length, 0);
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
-  const stored = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const stored = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(stored.backups[0].remoteSnapshot.sourceSha, 'v1'); assert.equal(stored.backups[0].tree.length, 1);
 });
 
@@ -602,12 +608,13 @@ test('purged files are read from the saved destination commit rather than source
   saved.isCachePurged = true; saved.cachedFilesCount = 0;
   await localCache.deleteProjectFiles('tracked', 'v2');
   await act(async () => root.unmount());
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify([saved]));
   const baseFetch = globalThis.fetch;
   globalThis.fetch = async (input, init = {}) => {
     if (String(input).includes('/repos/destination/backup/contents/a.txt?ref=uploaded')) return ok({ type: 'file', sha: sha('new'), encoding: 'base64', content: Buffer.from('new').toString('base64') });
     return baseFetch(input, init);
   };
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
   await enterWorkbench();
@@ -621,7 +628,8 @@ test('file list can reveal entries beyond the original 150 item limit', async ()
   const saved = repo();
   saved.tree = Array.from({ length: 160 }, (_, i) => ({ ...entry('new'), path: `file-${i}.txt` }));
   await act(async () => root.unmount());
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify([saved]));
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
   await enterWorkbench();
@@ -678,12 +686,13 @@ test('non-fast-forward rejection never clears the selected local snapshot', asyn
   await waitFor(() => alerts.length > 0);
   assert.ok(alerts.some(message => message.includes('非快进更新')));
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
-  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
+  assert.equal(JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot, undefined);
 });
 
 async function reloadProject(saved: any) {
   await act(async () => root.unmount());
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify([saved]));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify([saved]));
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
 }
@@ -702,7 +711,7 @@ test('batch first upload skips an already bound target and never pushes files', 
   (globalThis as any).confirm = () => false;
   await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量上传至私人仓库'); await click('开始批量上传');
   await waitFor(() => document.body.textContent?.includes('已跳过') === true);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'release');
   assert.equal(saved.remoteSnapshot, undefined);
   assert.ok(!requests.some(r => r.path.includes('/git/')));
@@ -718,7 +727,7 @@ test('single re-upload locks the chosen name and reuses the exact bound branch w
   await click('更新已绑定仓库（保留历史）');
   // Submitting through the button triggers the form's default action in jsdom.
   await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'release');
   assert.ok(!requests.some(r => r.path === '/user/repos' || r.path === '/user'));
   assert.ok(alerts.some(message => message.includes('完整上传')));
@@ -767,7 +776,7 @@ test('rename button changes the existing repository and rewrites historical link
   (globalThis as any).prompt = () => 'renamed';
   await enterWorkbench(); await click('分叉与私有仓'); await click('修改项目名称');
   await waitFor(() => alerts.length > 0);
-  const renamed = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const renamed = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(renamed.uploadTarget.repo, 'renamed'); assert.equal(renamed.repo, 'project');
   assert.equal(renamed.backups[0].remoteSnapshot.repo, 'renamed'); assert.equal(renamed.backups[0].remoteSnapshot.commitSha, 'old-target');
 });
@@ -777,7 +786,7 @@ test('restoring a version creates a new target commit with old bytes and retains
   await enterWorkbench(); await click('版本归档库 (1)'); await click('恢复此版本');
   await waitFor(() => alerts.length > 0);
   assert.ok(uploadedContents.includes('old')); assert.ok(!uploadedContents.includes('new'));
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.latestCommitSha, 'v2'); assert.equal(saved.remoteSnapshot.sourceSha, 'v1');
   assert.equal(saved.remoteSnapshot.commitSha, 'uploaded');
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
@@ -790,7 +799,7 @@ test('upload after a restore archives the restored manifest with its matching so
   await reloadProject(saved); identifyDestination();
   await enterWorkbench(); await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
   await waitFor(() => alerts.length > 0);
-  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const updated = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   const archived = updated.backups.find((item: any) => item.remoteSnapshot?.commitSha === 'restored-old');
   assert.equal(archived.commitSha, 'v1'); assert.equal(archived.tree[0].sha, sha('old'));
   assert.equal(updated.latestCommitSha, 'v2'); assert.equal(updated.remoteSnapshot.sourceSha, 'v2');
@@ -802,7 +811,7 @@ test('current-branch copy saves exact downloaded version and adds a separate man
   await input('project', 'backup');
   await click('保存当前分支并加入我的项目');
   await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   const managed = saved.find((item: any) => item.origin);
   assert.ok(managed, alerts.join(' ')); assert.equal(saved.length, 2);
   assert.equal(managed.origin.branch, 'develop'); assert.equal(managed.uploadTarget.repo, 'backup');
@@ -847,7 +856,7 @@ test('complete Fork uses original repository, verifies all branches, and adds it
   const select = [...document.querySelectorAll('select')].find(item => [...item.options].some(option => option.value === 'full'))!;
   await act(async () => { select.value = 'full'; select.dispatchEvent(new Event('change', { bubbles: true })); });
   await click('完整分叉并加入我的项目'); await waitFor(() => alerts.length > 0);
-  const records = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const records = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   const managed = records.find((item: any) => item.forkScope === 'full');
   assert.ok(managed, alerts.join(' ')); assert.equal(managed.owner, 'me'); assert.equal(managed.forkTarget.branches.length, 2);
   assert.equal(managed.isCachePurged, true); assert.equal(managed.origin.url, 'https://github.com/source/project');
@@ -887,7 +896,7 @@ async function switchBranch(branch: string) {
   // for the actual control to become usable instead of clicking it while busy.
   await waitFor(() => buttons().some(button => button.textContent === '切换并重新拉取' && !button.disabled));
   await click('切换并重新拉取');
-  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].branch === branch || !!document.querySelector('[role=alert]'));
+  await waitFor(() => JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].branch === branch || !!document.querySelector('[role=alert]'));
 }
 
 test('workbench switch downloads the slash branch and uploads only to its matching branch in the bound repository', async () => {
@@ -895,18 +904,18 @@ test('workbench switch downloads the slash branch and uploads only to its matchi
   await enterWorkbench(); await click('获取可切换分支');
   await waitFor(() => !!document.querySelector('select[aria-label="工作台分支"]'));
   await switchBranch('feature/demo');
-  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  let saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.branch, 'feature/demo'); assert.equal(saved.uploadTarget.repo, 'backup'); assert.equal(saved.uploadTarget.branch, 'feature/demo');
   assert.equal(saved.branchTargets.develop.branch, 'release'); assert.equal(saved.backups[0].branch, 'develop');
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.equal((await localCache.getProjectFiles('tracked', 'feature-v1'))[0].content, 'feature content');
   await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
-  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
+  await waitFor(() => JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
   assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
   assert.ok(!requests.some(r => r.path.endsWith('/git/refs/heads/release')));
-  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   await reloadProject(saved); await enterWorkbench(); await switchBranch('develop');
-  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.uploadTarget.branch, 'release'); assert.equal(saved.branchTargets['feature/demo'].branch, 'feature/demo');
   assert.ok(requests.filter(r => r.path === '/repos/source/project/commits/develop').length > 0);
 });
@@ -914,7 +923,7 @@ test('workbench switch downloads the slash branch and uploads only to its matchi
 test('failed branch switch retains the current branch, files and existing upload binding', async () => {
   await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench();
   await switchBranch('missing');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.branch, 'develop'); assert.equal(saved.latestCommitSha, 'v2'); assert.equal(saved.uploadTarget.branch, 'release');
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.ok(document.querySelector('[role=alert]')?.textContent?.includes('切换未完成'));
@@ -930,16 +939,16 @@ test('a branch cannot overwrite another source branch binding and switching back
   const dialog = buttons().find(b => b.textContent === '更新已绑定仓库（保留历史）')!.closest('form')!.parentElement!;
   await act(async () => { dialog.querySelector<HTMLButtonElement>('button')!.click(); });
   await switchBranch('develop');
-  assert.equal(JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].uploadTarget.branch, 'release');
+  assert.equal(JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].uploadTarget.branch, 'release');
   await click('分叉与私有仓'); await click('更新已绑定仓库（保留历史）');
-  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'release');
+  await waitFor(() => JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'release');
 });
 
 test('restoring a historical branch never redirects it into the branch currently shown in the workbench', async () => {
   await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
   await click('版本归档库 (2)'); await click('恢复此版本');
   await waitFor(() => alerts.some(message => message.includes('历史版本已恢复')));
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.branch, 'feature/demo'); assert.equal(saved.latestCommitSha, 'feature-v1'); assert.equal(saved.uploadTarget.branch, 'feature/demo');
   assert.equal(saved.backups[0].remoteSnapshot.branch, 'release');
   assert.ok(requests.some(r => r.path.endsWith('/git/refs/heads/release')));
@@ -962,7 +971,7 @@ test('batch import needs only links, uses repository default branches, skips dup
   assert.ok(!document.querySelector('input[placeholder="例如: 生产核心源码 / 模块A"]'));
   await click('开始批量导入');
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 1 · 失败 2 · 取消 0');
-  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  let saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   const imported = saved.find((item: any) => item.owner === 'demo');
   assert.equal(imported.branch, 'master'); assert.equal(imported.remark, '带 空格的备注'); assert.equal(imported.files, undefined);
   assert.equal((await localCache.getProjectFiles(imported.id, imported.latestCommitSha))[0].content, 'one');
@@ -970,7 +979,7 @@ test('batch import needs only links, uses repository default branches, skips dup
   const oneReads = requests.filter(r => r.path === '/repos/demo/one').length;
   failed = false; await click('重试失败链接');
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 2 · 跳过 1 · 失败 1 · 取消 0');
-  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 2);
   assert.equal(saved.find((item: any) => item.repo === 'two').remark, '');
   assert.equal(requests.filter(r => r.path === '/repos/demo/one').length, oneReads);
@@ -995,7 +1004,7 @@ test('cancelling a batch keeps completed projects and leaves remaining links ava
   await click('开始批量导入'); await waitFor(() => requests.some(r => r.path === '/repos/demo/two'));
   await click('取消');
   await waitFor(() => document.querySelector('[role=status]')?.textContent === '成功 1 · 跳过 0 · 失败 0 · 取消 2');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.owner === 'demo').length, 1);
   assert.ok(!requests.some(r => r.path === '/repos/demo/three'));
   assert.ok(buttons().some(b => b.textContent === '重试未完成链接'));
@@ -1007,7 +1016,7 @@ test('workbench metadata can be edited without pulling files or altering branch 
   await setField(form.querySelector<HTMLInputElement>('input')!, 'new remark');
   await setField(form.querySelector<HTMLTextAreaElement>('textarea')!, 'new description');
   await click('保存修改'); await waitFor(() => alerts.length > 0);
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.remark, 'new remark'); assert.equal(saved.description, 'new description');
   assert.equal(saved.uploadTarget.branch, 'release'); assert.equal(saved.latestCommitSha, 'v2');
   assert.ok(requests.every(request => request.path === '/repos/destination/backup' && request.payload === null));
@@ -1017,10 +1026,10 @@ test('batch update after switching uses the matching slash branch and preserves 
   await reloadProject(boundProject()); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
   (globalThis as any).confirm = () => false;
   await click('仓库已有项目 (1)'); await click('全选所有'); await click('批量更新'); await click('开始批量更新');
-  await waitFor(() => JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
+  await waitFor(() => JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].remoteSnapshot?.branch === 'feature/demo');
   assert.ok(requests.some(r => r.payload?.ref === 'refs/heads/feature/demo'));
   assert.ok(!requests.some(r => r.path.endsWith('/git/refs/heads/release')));
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(saved.branchTargets.develop.branch, 'release'); assert.equal(saved.branchTargets['feature/demo'].repo, 'backup');
 });
 
@@ -1048,7 +1057,7 @@ test('manual copy mode cannot bypass another branch binding in the same uploaded
 test('managed copies switch their original source branch while keeping the destination identity and name', async () => {
   const saved = { ...boundProject(), owner: 'destination', repo: 'backup', url: 'https://github.com/destination/backup', repoMeta: { htmlUrl: 'https://github.com/destination/backup' }, origin: { owner: 'source', repo: 'project', url: 'https://github.com/source/project', branch: 'develop' }, forkScope: 'current' };
   await reloadProject(saved); identifyDestination(); branchFixtures(); await enterWorkbench(); await switchBranch('feature/demo');
-  const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!)[0];
+  const updated = JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0];
   assert.equal(updated.owner, 'destination'); assert.equal(updated.repo, 'backup'); assert.equal(updated.repoMeta.htmlUrl, saved.url);
   assert.equal(updated.origin.branch, 'feature/demo'); assert.equal(updated.uploadTarget.branch, 'feature/demo');
   assert.ok(requests.some(r => r.path === '/repos/source/project/commits/feature%2Fdemo'));
@@ -1056,7 +1065,8 @@ test('managed copies switch their original source branch while keeping the desti
 
 async function reloadProjects(saved: any[]) {
   await act(async () => root.unmount());
-  localStorage.setItem('gitvault_repos_v8', JSON.stringify(saved));
+  writeCredentialValue('gitvault_repos_v8', JSON.stringify(saved));
+  await initializeCredentials();
   root = createRoot(document.getElementById('root')!);
   await act(async () => root.render(React.createElement(App)));
 }
@@ -1069,7 +1079,7 @@ test('complete batch Fork creates one verified destination and associates duplic
   await reloadProjects([repo(), { ...repo(), id: 'second', branch: 'other' }]); completeForkFixture();
   await openBatch('批量分叉', 2); await click('开始批量分叉');
   await waitFor(() => batchStatus() === '成功 1 · 失败 0 · 跳过 1 · 取消 0');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved.filter((item: any) => item.forkScope === 'full').length, 1);
   assert.equal(saved.find((item: any) => item.id === 'second').forkTarget.repo, 'project');
   assert.equal(requests.filter(r => r.path.endsWith('/forks')).length, 1);
@@ -1084,7 +1094,7 @@ test('batch current-branch copies use the exact cached source snapshot and corre
   await setField(document.querySelector<HTMLInputElement>('[aria-label="批量操作 Token"]')!, 'test-target-token');
   await click('开始批量分叉');
   await waitFor(() => batchStatus() === '成功 1 · 失败 0 · 跳过 0 · 取消 0');
-  const saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  const saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   const copy = saved.find((item: any) => item.forkScope === 'current');
   assert.equal(copy.uploadTarget.branch, 'develop'); assert.equal(copy.remoteSnapshot.sourceSha, 'v2');
   assert.ok(uploadedContents.includes('new')); assert.ok(!requests.some(r => r.path.endsWith('/forks')));
@@ -1112,14 +1122,14 @@ test('batch updates retain successful uploads, preserve files on a failing proje
   };
   await click('仓库已有项目 (2)'); await click('仅选有更新'); await click('批量更新'); await click('开始批量更新');
   await waitFor(() => batchStatus() === '成功 1 · 失败 1 · 跳过 0 · 取消 0');
-  let saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  let saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved[0].remoteSnapshot.branch, 'release'); assert.equal(saved[0].latestCommitSha, 'v3');
   assert.equal(saved[1].latestCommitSha, 'v2');
   assert.equal((await localCache.getProjectFiles('second', 'v2'))[0].content, 'new');
   const firstReads = requests.filter(r => r.path.startsWith('/repos/source/project')).length;
   failSecond = false; await click('重试失败项目');
   await waitFor(() => batchStatus() === '成功 2 · 失败 0 · 跳过 0 · 取消 0');
-  saved = JSON.parse(localStorage.getItem('gitvault_repos_v8')!);
+  saved = JSON.parse(readCredentialValue('gitvault_repos_v8')!);
   assert.equal(saved[1].latestCommitSha, 'v3'); assert.equal(requests.filter(r => r.path.startsWith('/repos/source/project')).length, firstReads);
   assert.equal(alerts.length, 0);
 });
@@ -1162,7 +1172,7 @@ test('batch sync shares complete-Fork transfers but refreshes every selected man
     await openBatch('批量分叉同步', 2); await click('开始批量同步');
     await waitFor(() => batchStatus() === '成功 2 · 失败 0 · 跳过 0 · 取消 0');
     assert.equal(transfers, 1);
-    const updated = JSON.parse(localStorage.getItem('gitvault_repos_v8')!).find((item: any) => item.id === 'managed');
+    const updated = JSON.parse(readCredentialValue('gitvault_repos_v8')!).find((item: any) => item.id === 'managed');
     assert.equal(updated.latestCommitSha, 'source-new'); assert.equal(updated.remoteSnapshot.commitSha, 'target-new'); assert.equal(updated.isCachePurged, true);
   } finally { githubClient.syncAllForkBranches = original; }
 });
@@ -1385,7 +1395,7 @@ function accountHttpFixture() {
   Object.assign(accountRegistry,createAccountRegistry(githubApi));
   return {repositories,sent,documents,trees,commits,setSource:(sha:string)=>{sourceHead=sha;},failRecords:(value:boolean)=>{failRegistry=value;},document:()=>{const stored=documents.get('registry');return stored?JSON.parse(Buffer.from(stored.content,'base64').toString()):undefined;}};
 }
-async function freshDevice() {localStorage.clear();localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);}
+async function freshDevice() {await waitFor(()=>!document.querySelector('span[title].whitespace-pre-wrap'));await flushCredentials();localStorage.clear();localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);}
 async function importSourceLink(){await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');}
 test('HTTP A upload -> fresh B same-name compare -> auto-bind -> tag save -> branch-only update without registry mocks',async()=>{
   const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot?.commitSha);
@@ -1545,4 +1555,22 @@ test('quick selection honors tag scope and uses hidden same-source bindings with
   for (const label of ['仅选未上传', '仅选未分叉', '仅选有更新', '仅选可分叉同步']) {
     assert.equal(buttons().find(button => button.textContent === label)!.disabled, true);
   }
+});
+
+test('failed record persistence exposes retry and export, then retry preserves the edited metadata after reload', async () => {
+  await enterWorkbench(); await click('编辑备注与描述');
+  const form=buttons().find(button=>button.textContent==='保存修改')!.closest('form')!;
+  await setField(form.querySelector<HTMLInputElement>('input')!,'unsaved-new-remark');
+  const failing=mock.method(IDBObjectStore.prototype,'put',function(){throw new DOMException('disk full','QuotaExceededError');});
+  await click('保存修改');
+  await waitFor(()=>buttons().some(button=>button.textContent==='重试保存记录'));
+  assert.ok(buttons().some(button=>button.textContent==='导出当前记录备份'));
+  assert.equal(localStorage.getItem('gitvault_repos_v8'),null);
+  const persisted=await (await import('../src/utils/projectRecordStore')).createProjectRecordStore().initialize({});
+  assert.equal((persisted.projects[0] as any).remark,'test project');
+  failing.mock.restore();await click('重试保存记录');
+  await waitFor(()=>!buttons().some(button=>button.textContent==='重试保存记录'));
+  await act(async()=>root.unmount());await initializeCredentials();
+  root=createRoot(document.getElementById('root')!);await act(async()=>root.render(React.createElement(App)));
+  assert.equal(storedProjects()[0].remark,'unsaved-new-remark');
 });

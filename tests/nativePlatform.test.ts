@@ -19,7 +19,7 @@ test('Android migration strips all nested project Tokens from WebView storage af
   nativeBridge.writeVault = async ({ value }) => { persisted = value; };
   await initializeCredentials();
   assert.equal(localStorage.getItem('gitvault_global_token'), null);
-  assert.ok(!localStorage.getItem('gitvault_repos_v8')!.includes('token'));
+  assert.equal(localStorage.getItem('gitvault_repos_v8'), null);
   assert.equal(JSON.parse(readCredentialValue('gitvault_repos_v8')!)[0].uploadTarget.token, 'target-token');
   assert.ok(persisted.includes('global-token'));
   writeCredentialValue('gitvault_global_token', 'replacement-token'); await flushCredentials();

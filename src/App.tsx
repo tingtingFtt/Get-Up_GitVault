@@ -33,7 +33,7 @@ import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from 
 import AppDialogs from './components/AppDialogs';
 import { appDialog } from './utils/appDialog';
 import { isNativeAndroid, hasNativeFiles, nativeBridge, exportProjectDirectory, saveDownload } from './utils/nativePlatform';
-import { readCredentialValue, writeCredentialValue, flushCredentials } from './utils/credentialStorage';
+import { readCredentialValue, writeCredentialValue, flushCredentials, readProjectRecords, writeProjectRecords, retryCredentialWrites, hasUnflushedCredentials } from './utils/credentialStorage';
 import { checkpoint, readTasks, interruptedTask, forgetTask, hasUnfinished, type SavedTask } from './utils/taskJournal';
 import { App as NativeApp } from '@capacitor/app';
 import { gitServiceConfig, saveGitServiceConfig, testGitService, GitServiceError } from './utils/gitService';
@@ -172,17 +172,7 @@ function publicProjectRecord({ token, uploadTarget, branchTargets, forkTarget, .
 function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
 export default function App() {
-  const [repos, setRepos] = useState<TrackedRepo[]>(() => {
-    try {
-      const saved = readCredentialValue('gitvault_repos_v8');
-      if (saved) return JSON.parse(saved);
-      const oldSaved = readCredentialValue('gitvault_repos_v7');
-      if (oldSaved) return JSON.parse(oldSaved);
-      return [];
-    } catch {
-      return [];
-    }
-  });
+  const [repos, setRepos] = useState<TrackedRepo[]>(() => readProjectRecords<TrackedRepo>());
 
   // Global settings state
   const [globalToken, setGlobalToken] = useState<string>(() => {
@@ -386,6 +376,8 @@ export default function App() {
   const [loadingText, setLoadingText] = useState('');
   const [isCancelling,setIsCancelling]=useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [recordStorageError, setRecordStorageError] = useState('');
+  const [recordStorageRetrying, setRecordStorageRetrying] = useState(false);
   const [importCancelled, setImportCancelled] = useState(false);
   const [importMatch, setImportMatch] = useState<{ source: ProjectSource; sha: string; tree: RepoTreeItem[]; candidates: ImportCandidate[]; token: string; comparisons: Record<string, ImportComparison> } | null>(null);
   const importResolver = useRef<((choice: ImportChoice) => void) | null>(null);
@@ -442,7 +434,7 @@ export default function App() {
 
   // Persist a reviewable record before deleting any local source content.
   const persistRepos = (next: TrackedRepo[]) => {
-    writeCredentialValue('gitvault_repos_v8', JSON.stringify(next));
+    writeProjectRecords(next);
     reposRef.current = next;
     setRepos(next);
   };
@@ -745,6 +737,7 @@ export default function App() {
       const refreshed = reposRef.current.find(item => item.id === repo.id)!;
       setSingleUploadTargetRepo(refreshed); setSingleUploadRepoName(next.repo);
       if (refreshed.uploadTarget) await publishAccountRecord(refreshed, accountRecord(refreshed, refreshed.uploadTarget, refreshed.forkScope === 'full' ? 'full' : refreshed.uploadTarget.kind || 'upload', sourceOf(refreshed).branch, refreshed.uploadTarget.branch, refreshed.remoteSnapshot?.sourceSha, refreshed.remoteSnapshot?.commitSha), token);
+      await flushCredentials();
       logOperation('修改项目名称', 'success', refreshed, `固定目标已更名为 ${next.repo}`);
       appDialog.notify('项目名称已修改，仓库身份和历史记录保持不变。');
     } catch (error) { logOperation('修改项目名称', 'error', repo, (error as Error).message, '修改名称或账号记录', error); appDialog.notify('修改名称失败：' + (error as Error).message); }
@@ -754,10 +747,14 @@ export default function App() {
   useEffect(() => {
     const resized = () => document.documentElement.style.setProperty('--app-visible-height', `${window.visualViewport?.height || window.innerHeight}px`);
     resized(); window.visualViewport?.addEventListener('resize', resized);
-    const failure = () => appDialog.notify('Android 安全存储未完成，请重新保存设置；清理源码前会再次检查。');
+    const failure = (event: Event) => setRecordStorageError((event as CustomEvent<string>).detail || '项目记录保存未完成，请重试保存或导出备份。');
+    const saved = () => setRecordStorageError('');
+    const leaving = (event: BeforeUnloadEvent) => { if (hasUnflushedCredentials()) { event.preventDefault(); event.returnValue = ''; } };
+    window.addEventListener('gitvault-storage-saved', saved);
+    window.addEventListener('beforeunload', leaving);
     window.addEventListener('gitvault-secure-storage-error', failure);
     try { readTasks(); } catch (error) { appDialog.notify((error as Error).message); }
-    return () => { window.visualViewport?.removeEventListener('resize', resized); window.removeEventListener('gitvault-secure-storage-error', failure); };
+    return () => { window.visualViewport?.removeEventListener('resize', resized); window.removeEventListener('gitvault-secure-storage-error', failure); window.removeEventListener('gitvault-storage-saved', saved); window.removeEventListener('beforeunload', leaving); };
   }, []);
   useEffect(() => {
     if (!isApkEnvironment) return;
@@ -783,12 +780,6 @@ export default function App() {
     registration.then(listener => { if (disposed) void listener.remove(); }).catch(() => appDialog.notify('Android 返回键监听失败，请重新打开应用'));
     return () => { disposed = true; void registration.then(listener => listener.remove()); };
   }, [isApkEnvironment, currentView, isLoading, isBatchPublishing]);
-
-  // Save to localStorage
-  useEffect(() => {
-    try { writeCredentialValue('gitvault_repos_v8', JSON.stringify(repos)); }
-    catch (error) { setErrorMsg('项目记录保存失败，请导出备份并检查浏览器存储空间'); }
-  }, [repos]);
 
   // Validate GitHub Token on mount or when changed
   useEffect(() => {
@@ -1163,11 +1154,13 @@ export default config;
     const repo=reposRef.current.find(item=>item.id===projectSettingsTarget.id);if(!repo)return;
     const tags=projectTags.split(',').map(tag=>tag.trim()).filter(Boolean);
     const next={...repo,remark:projectRemark.trim(),description:projectDescription.trim(),tags:tags.length?tags:['默认'],token:projectToken.trim()||undefined,checkInterval:Number(projectCheckInterval)};
+    let localSaved=false;
     try {
       patchRepo(repo.id,next);
+      await flushCredentials();localSaved=true;
       if(next.uploadTarget){beginGithubOperation();const token=next.uploadTarget.token||globalToken||next.token||'';await publishAccountRecord(next,accountRecord(next,next.uploadTarget,next.forkScope==='full'?'full':next.uploadTarget.kind||'upload',sourceOf(next).branch,next.uploadTarget.branch,next.remoteSnapshot?.sourceSha,next.remoteSnapshot?.commitSha),token);}
       setIsProjectSettingsModalOpen(false);appDialog.notify('项目设置已成功保存！');
-    } catch(error){logOperation('保存项目标签与资料','partial',next,(error as Error).message,'保存账号资料',error);appDialog.notify('本设备资料已保存，跨设备记录待重试：'+(error as Error).message);}
+    } catch(error){logOperation('保存项目标签与资料','partial',next,(error as Error).message,'保存账号资料',error);appDialog.notify((localSaved?'本设备资料已保存，跨设备记录待重试：':'本设备项目记录尚未保存，请重试或导出当前备份：')+(error as Error).message);}
   };
 
   // Scheduled polling for auto status checks
@@ -2050,7 +2043,7 @@ export default config;
     const token = repo.forkTarget?.token || repo.uploadTarget?.token || globalToken || repo.token || (await appDialog.prompt('请输入 GitHub Token：'))?.trim();
     if (!token) return;
     startOperation();
-    try { const message = await syncProjectUpstream(repo, token); logOperation('同步', 'success', repo, message); appDialog.notify(message); }
+    try { const message = await syncProjectUpstream(repo, token); await flushCredentials(); logOperation('同步', 'success', repo, message); appDialog.notify(message); }
     catch (error) { logOperation('同步', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '同步上游', error); appDialog.notify('同步上游未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
@@ -2125,6 +2118,7 @@ export default config;
       const updated: TrackedRepo = { ...repo, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree, repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl }, backups: repo.latestCommitSha === 'HEAD' ? repo.backups : [old, ...repo.backups], remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString(), hasUpdate: true };
       // Persist the newly downloaded version even if its subsequent upload fails.
       patchRepo(repo.id, { latestCommitSha: updated.latestCommitSha, commitMessage: updated.commitMessage, commitAuthor: updated.commitAuthor, commitDate: updated.commitDate, tree: updated.tree, repoMeta: updated.repoMeta, backups: updated.backups, remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: updated.lastSyncedAt, hasUpdate: false, latestRemoteCommit: undefined });
+      await flushCredentials();
       let message = '新版本已完整保存，旧版本已归档。请使用现有上传入口选择目标仓库。';
       if (repo.primarySource && !syncOrigin && repo.uploadTarget) {
         await recordUpload(updated,{verified:true,repoId:repo.uploadTarget.id,repoPrivate:repo.uploadTarget.private,owner:repo.uploadTarget.owner,repo:repo.uploadTarget.repo,branch:repo.uploadTarget.branch,commitSha:data.latestCommitSha,htmlUrl:`https://github.com/${repo.uploadTarget.owner}/${repo.uploadTarget.repo}/tree/${repo.uploadTarget.branch}`},repo.uploadTarget.purgeAfterUpload,undefined,{},token);
@@ -2141,7 +2135,7 @@ export default config;
   };
   const handleOneClickUpdate = async (repo: TrackedRepo) => {
     startOperation(); setErrorMsg('');
-    try { const message = await updateProject(repo); logOperation('更新', 'success', repo, message); appDialog.notify(message); }
+    try { const message = await updateProject(repo); await flushCredentials(); logOperation('更新', 'success', repo, message); appDialog.notify(message); }
     catch (error) { logOperation('更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '拉取或上传', error); appDialog.notify('更新未完成，已下载的版本会保留，可重新上传：' + (error as Error).message); }
     finally { setIsLoading(false); }
   };
@@ -2317,6 +2311,7 @@ export default config;
       try{await publishAccountRecord(next,accountRecord(next,next.uploadTarget,next.forkScope==='full'?'full':next.uploadTarget.kind||'upload',sourceOf(next).branch,next.uploadTarget.branch,next.remoteSnapshot?.sourceSha,next.remoteSnapshot?.commitSha),next.uploadTarget.token||globalToken||next.token||'');}
       catch(error){failed++;logOperation('批量保存标签','partial',next,(error as Error).message,'保存账号资料',error);}
     }
+    try { await flushCredentials(); } catch(error) { appDialog.notify('标签记录尚未保存，请重试保存或导出当前备份：'+(error as Error).message); return; }
     setIsBatchTagModalOpen(false);appDialog.notify(`已保存 ${selected.length} 个项目的本地标签${failed?`，${failed} 个账号记录待重试`: '及已绑定项目的跨设备资料'}。`);
   };
 
@@ -2386,6 +2381,7 @@ export default config;
     if (!selectedProjectIds.length || !(await appDialog.confirm('清理所选项目的本地源码和软件管理的目录文件？项目快照和 GitHub 历史会保留。'))) return;
     try {
       for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true}); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
+      await flushCredentials();
       setSelectedProjectIds([]); appDialog.notify('本地源码已清理，快照已保留。');
     } catch (error) { logOperation('批量清理缓存','error',undefined,(error as Error).message,'删除目录文件',error);appDialog.notify('缓存清理未完成：' + (error as Error).message); }
   };
@@ -2625,12 +2621,8 @@ export default config;
         })
       });
 
-      setRepos(prev => prev.map(r => {
-        if (r.id === activeRepo.id) {
-          return { ...r, aiChangelog: data.changelog };
-        }
-        return r;
-      }));
+      patchRepo(activeRepo.id, { aiChangelog: data.changelog });
+      await flushCredentials();
     } catch (err) {
       appDialog.notify('日志生成失败：' + (err as Error).message);
     } finally {
@@ -2917,6 +2909,13 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
           <button type="button" onClick={() => openRecoveredTask(task)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl">查看并继续</button>
           <button type="button" onClick={async () => { if (await appDialog.confirm('移除这个任务的恢复记录？已下载文件、仓库绑定和远端提交仍会保留。')) { forgetTask(task.kind); setRecoveryTasks(items => items.filter(item => item.kind !== task.kind)); } }} className="px-3 py-2 text-[#8C5D54]">移除恢复记录</button>
         </div>)}
+      </div>}
+      {recordStorageError && <div role="alert" className="mx-3 mt-3 rounded-2xl border border-[#DFD8CE] bg-[#FAF8F5] p-3 text-xs text-[#8C5D54]">
+        <p>{recordStorageError}</p>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button type="button" disabled={recordStorageRetrying} className="px-3 py-2 border border-[#DFD8CE] rounded-xl disabled:opacity-40" onClick={async () => { setRecordStorageRetrying(true); try { await retryCredentialWrites(); setRecordStorageError(''); } catch (error) { setRecordStorageError((error as Error).message); } finally { setRecordStorageRetrying(false); } }}>{recordStorageRetrying ? '正在保存…' : '重试保存记录'}</button>
+          <button type="button" className="px-3 py-2 border border-[#DFD8CE] rounded-xl" onClick={handleExportSystemBackup}>导出当前记录备份</button>
+        </div>
       </div>}
       <AppUpdates />
       {/* Top Navbar */}

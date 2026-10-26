@@ -16,7 +16,7 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release', 'records-storage-error', 'records-large'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
@@ -42,6 +42,7 @@ if (new URLSearchParams(location.search).has('audit-import') || new URLSearchPar
   const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
   fixture.url = 'https://github.com/' + fixture.owner + '/' + fixture.repo;
   fixture.uploadTarget = target;
+  window.__auditTarget = target;
   const switchScene=new URLSearchParams(location.search).get('audit-switch');
   if(switchScene==='switch-pending')fixture.pendingSwitch={reservationId:'audit',sourceSha:fixture.latestCommitSha,sourceBranch:fixture.branch,oldTarget:target,request:{mode:'existing',name:target.owner+'/new-'+target.repo,branch:target.branch,purge:false},result:{verified:true,repoId:99,owner:target.owner,repo:'new-'+target.repo,branch:target.branch,commitSha:'saved-new',htmlUrl:'https://github.com/example/new'}};
   if(switchScene==='switch-history')fixture.targetHistory=[{target:{id:98,owner:target.owner,repo:'old-'+target.repo},kind:'upload',bindings:{main:{branch:'release',updatedAt:'2026-10-16T00:00:00Z'}},changedAt:'2026-10-16T00:00:00Z'}];
@@ -109,6 +110,7 @@ function inspect(doc, width, scenario) {
 (async () => {
   for (const width of widths) for (const scenario of scenarios) {
     document.documentElement.dataset.layoutProgress = encodeURIComponent(JSON.stringify({width,scenario,checks,failures}));
+    await new Promise((resolve,reject) => { const request=indexedDB.deleteDatabase('GitVault_Records_v1'); request.onsuccess=resolve; request.onerror=()=>reject(request.error); request.onblocked=()=>reject(new Error('Previous layout fixture still holds the records database')); });
     localStorage.setItem('gitvault_repos_v8', JSON.stringify([fixture]));
     localStorage.removeItem('gitvault_operation_logs_v1');
     localStorage.removeItem('gitvault_tasks_v1');
@@ -121,7 +123,7 @@ function inspect(doc, width, scenario) {
     document.body.appendChild(frame);
     try {
       await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
-      const doc = frame.contentDocument;
+      let doc = frame.contentDocument;
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
         await click(doc,'仓库已有项目 (1)');
         if (scenario === 'projects') {
@@ -145,7 +147,7 @@ function inspect(doc, width, scenario) {
         const dialog=doc.querySelector('[aria-label="另存并切换固定仓库"]');if(!dialog)throw new Error('Missing save and switch dialog');
         if(scenario==='switch-existing'||scenario==='switch-error') {
           const set=(field,value,kind='input')=>{Object.getOwnPropertyDescriptor(kind==='select'?frame.contentWindow.HTMLSelectElement.prototype:frame.contentWindow.HTMLInputElement.prototype,'value').set.call(field,value);field.dispatchEvent(new frame.contentWindow.Event(kind==='select'?'change':'input',{bubbles:true}));};
-          const target=JSON.parse(frame.contentWindow.localStorage.getItem('gitvault_repos_v8'))[0].uploadTarget;
+          const target=frame.contentWindow.__auditTarget;
           set(dialog.querySelector('[aria-label="另存方式"]'),'existing','select');await pause();
           set(dialog.querySelector('[aria-label="另存目标仓库"]'),target.owner+'/'+target.repo);set(dialog.querySelector('[aria-label="另存目标分支"]'),target.branch);await pause();
           await click(doc,'比较新目标代码');
@@ -181,6 +183,28 @@ function inspect(doc, width, scenario) {
         if(scenario==='git-service'){const select=doc.querySelector('[aria-label="源码传输方式"]');Object.getOwnPropertyDescriptor(frame.contentWindow.HTMLSelectElement.prototype,'value').set.call(select,'git');select.dispatchEvent(new frame.contentWindow.Event('change',{bubbles:true}));await pause();}
         if(scenario==='backup') await click(doc,'数据备份与恢复');
         if(scenario==='apk') await click(doc,'APK 下载存储目录');
+      }
+      if (scenario === 'records-storage-error') {
+        frame.contentWindow.dispatchEvent(new frame.contentWindow.CustomEvent('gitvault-secure-storage-error',{detail:'项目记录保存未完成；源码缓存已保留。'+'很长的存储失败原因'.repeat(40)}));
+        await pause();
+        for (const text of ['重试保存记录','导出当前记录备份']) if(!buttons(doc).some(button=>button.textContent===text)) throw new Error('Missing storage recovery control: '+text);
+      }
+      if (scenario === 'records-large') {
+        await click(doc,'设置');await click(doc,'数据备份与恢复');
+        const large={...fixture,id:'large-record-audit',remark:'large-record-reloaded',retainedMetadata:'x'.repeat(6*1024*1024)};
+        const files=new frame.contentWindow.DataTransfer();
+        files.items.add(new frame.contentWindow.File([JSON.stringify({projects:[large]})],'large-record.json',{type:'application/json'}));
+        const input=doc.querySelector('input[type=file]');input.files=files.files;input.dispatchEvent(new frame.contentWindow.Event('change',{bubbles:true}));
+        for(let tries=0;tries<100&&!doc.querySelector('[data-app-dialog=confirm]');tries++)await pause();
+        await click(doc,'合并导入');
+        for(let tries=0;tries<100&&!doc.body.textContent.includes('备份恢复完成');tries++)await pause();
+        if(!doc.body.textContent.includes('备份恢复完成'))throw new Error('Large metadata restore did not finish');
+        if(frame.contentWindow.localStorage.getItem('gitvault_repos_v8')!==null)throw new Error('Large records still mirrored to localStorage');
+        await new Promise((resolve,reject)=>{const request=frame.contentWindow.indexedDB.open('GitVault_Records_v1');request.onerror=()=>reject(request.error);request.onsuccess=()=>{const db=request.result,transaction=db.transaction('projects'),row=transaction.objectStore('projects').get(large.id);transaction.oncomplete=()=>{db.close();try{if(JSON.parse(row.result.json).retainedMetadata.length!==6*1024*1024)throw new Error('Large database record changed');resolve();}catch(error){reject(error);}};transaction.onabort=()=>{db.close();reject(transaction.error);};};});
+        await new Promise((resolve,reject)=>{frame.onload=resolve;frame.onerror=reject;frame.contentWindow.location.reload();});
+        doc=frame.contentDocument;
+        for(let tries=0;tries<100&&!doc.querySelector('.app-header');tries++)await pause();
+        if(!doc.body.textContent.includes('large-record-reloaded'))throw new Error('Large metadata did not survive a real page reload');
       }
       if(scenario==='app-confirm'){await click(doc,'操作日志');await click(doc,'清空日志');}
       if(scenario==='app-prompt'){await click(doc,'仓库已有项目 (1)');await click(doc,'全选所有');await click(doc,'批量上传至私人仓库');await click(doc,'开始批量上传');}
