@@ -282,8 +282,11 @@ test('after detaching a deleted upload users can recreate the same repository na
   assert.equal(storedProjects()[0].uploadTarget.branch, 'develop'); assert.equal(storedProjects()[0].targetHealth['id:99'].status, 'available');
   assert.equal(storedProjects()[0].backups.length, 1); assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.ok(!requests.some(request => request.path.includes('/git/refs/heads/release')));
-  const previousAlerts = alerts.length; await click('同步上游'); await waitFor(() => alerts.length > previousAlerts);
-  assert.ok(alerts.at(-1)?.includes('当前已是最新版本'));
+  // A visible receipt precedes the final disk flush. Wait until the upload
+  // overlay closes before starting the next user operation.
+  await waitFor(() => !document.querySelector('span[title].whitespace-pre-wrap'));
+  const previousAlerts = alerts.length; await click('同步上游');
+  await waitFor(() => alerts.slice(previousAlerts).some(message => message.includes('当前已是最新版本')));
   assert.ok(!requests.some(request => request.path.endsWith('/merge-upstream')));
 });
 test('purged source can be recovered from its exact original commit after the old target is deleted and recreated under the same name', async () => {
