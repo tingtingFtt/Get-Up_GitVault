@@ -82,7 +82,13 @@ const failures = []; let checks = 0;
 const pause = () => new Promise(resolve => setTimeout(resolve, 60));
 function buttons(doc) { return [...doc.querySelectorAll('button')]; }
 async function click(doc, text) {
-  const button = buttons(doc).find(button => button.textContent.trim() === text || button.getAttribute('aria-label') === text);
+  let button;
+  // Database bootstrap and React rendering need a real readiness check,
+  // especially after the large-record restore has triggered browser GC.
+  for(let tries=0;tries<100&&!button;tries++){
+    button=buttons(doc).find(button=>button.textContent.trim()===text||button.getAttribute('aria-label')===text);
+    if(!button)await pause();
+  }
   if (!button) throw new Error('Missing control: ' + text);
   button.click(); await pause();
 }
@@ -125,6 +131,8 @@ function inspect(doc, width, scenario) {
     try {
       await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       let doc = frame.contentDocument;
+      for(let tries=0;tries<100&&!doc.querySelector('.app-header');tries++)await pause();
+      if(!doc.querySelector('.app-header'))throw new Error('App bootstrap did not finish: '+doc.body.textContent.slice(0,250));
       if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
         await click(doc,'仓库已有项目 (1)');
         if (scenario === 'projects') {
