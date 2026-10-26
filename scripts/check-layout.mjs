@@ -4,6 +4,7 @@ import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 
 // Runs against the production build with synthetic local records and no GitHub writes.
 const dist = resolve('dist');
@@ -243,24 +244,56 @@ const server = createServer(async (request, response) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const profile = await mkdtemp(resolve(tmpdir(), 'gitvault-layout-'));
 try {
-  // Production request spacing is part of this audit; allow its synthetic
-  // network reads as well as UI transitions to complete across all viewport fixtures.
-  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--virtual-time-budget=240000', '--dump-dom', `http://127.0.0.1:${server.address().port}/audit`];
-  const output = await new Promise((resolve, reject) => {
-    const child = spawn(chrome, args); let stdout = ''; let stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Layout audit timed out: ' + stderr.slice(-1500))); }, 120000);
-    child.stdout.on('data', data => stdout += data); child.stderr.on('data', data => stderr += data);
-    child.on('error', error => { clearTimeout(timer); reject(error); });
-    child.on('close', code => { clearTimeout(timer); code ? reject(new Error(stderr.slice(-2000))) : resolve(stdout); });
-  });
-  const match = output.match(/data-layout-report="([^"]+)"/);
-  if (!match) {
-    const partial = output.match(/data-layout-progress="([^"]+)"/);
-    throw new Error('Layout audit did not finish; last fixture: ' + (partial ? decodeURIComponent(partial[1]) : 'no browser progress'));
+  // Use real time: --virtual-time-budget can run to completion while an
+  // IndexedDB open/delete IPC is still pending, leaving the audit half finished.
+  const args = ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--disable-background-networking', '--disable-extensions', `--user-data-dir=${profile}`, '--window-size=1600,1000', '--remote-debugging-port=0', 'about:blank'];
+  const child = spawn(chrome, args);
+  let stderr = '';
+  child.stderr.on('data', data => { stderr = (stderr + data).slice(-4000); });
+  child.stdout.resume();
+  let socket;
+  try {
+    let port;
+    for (let attempt=0; attempt<100 && !port; attempt++) {
+      if (child.exitCode !== null) throw new Error('Chrome exited: ' + stderr);
+      try { port = Number((await readFile(resolve(profile,'DevToolsActivePort'),'utf8')).split('\n')[0]); }
+      catch { await new Promise(resolve=>setTimeout(resolve,100)); }
+    }
+    if (!port) throw new Error('Chrome debugging endpoint did not open: ' + stderr);
+    const response = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {method:'PUT'});
+    if (!response.ok) throw new Error('Cannot create Chrome audit tab: ' + response.status);
+    const target = await response.json();
+    socket = new WebSocket(target.webSocketDebuggerUrl);
+    await once(socket,'open');
+    let sequence = 0;
+    const pending = new Map();
+    socket.addEventListener('message',event=>{
+      const message=JSON.parse(String(event.data)),request=pending.get(message.id);
+      if (!request) return;
+      pending.delete(message.id);clearTimeout(request.timer);
+      if(message.error)request.reject(new Error(JSON.stringify(message.error)));else request.resolve(message.result);
+    });
+    const call=(method,params={})=>new Promise((resolve,reject)=>{
+      const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('Chrome command timed out: '+method));},15000);
+      pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));
+    });
+    await call('Page.navigate',{url:`http://127.0.0.1:${server.address().port}/audit`});
+    let encoded,progress;
+    const deadline=Date.now()+300000;
+    while(Date.now()<deadline&&!encoded){
+      if(child.exitCode!==null)throw new Error('Chrome exited during audit: '+stderr);
+      const result=await call('Runtime.evaluate',{expression:'JSON.stringify({report:document.documentElement.dataset.layoutReport,progress:document.documentElement.dataset.layoutProgress})',returnByValue:true});
+      const state=JSON.parse(result.result.value||'{}');encoded=state.report;progress=state.progress;
+      if(!encoded)await new Promise(resolve=>setTimeout(resolve,500));
+    }
+    if(!encoded)throw new Error('Layout audit did not finish; last fixture: '+(progress?decodeURIComponent(progress):'no browser progress'));
+    const report=JSON.parse(decodeURIComponent(encoded));
+    console.log(JSON.stringify(report,null,2));
+    // The projects scene checks both the initial toolbar and its selected state.
+    const expectedChecks=widths.length*(scenarios.length+1);
+    if(report.failures.length||report.checks!==expectedChecks)process.exitCode=1;
+  } finally {
+    socket?.close();
+    if(child.exitCode===null&&child.signalCode===null){const closed=once(child,'close');child.kill('SIGKILL');await closed;}
   }
-  const report = JSON.parse(decodeURIComponent(match[1]));
-  console.log(JSON.stringify(report, null, 2));
-  // The projects scene checks both the initial toolbar and its selected state.
-  const expectedChecks = widths.length * (scenarios.length + 1);
-  if (report.failures.length || report.checks !== expectedChecks) process.exitCode = 1;
 } finally { server.closeAllConnections(); server.close(); await rm(profile, { recursive: true, force: true }); }
