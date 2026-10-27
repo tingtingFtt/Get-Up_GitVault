@@ -2,7 +2,7 @@ import './dom';
 import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProjectRecordStore, prepareRecords, recordsJSON, PROJECT_RECORD_DB } from '../src/utils/projectRecordStore';
-import { initializeCredentials, readProjectRecords, writeProjectRecords, flushCredentials, retryCredentialWrites, hasUnflushedCredentials } from '../src/utils/credentialStorage';
+import { initializeCredentials, readProjectRecords, writeProjectRecords, flushCredentials, retryCredentialWrites, hasUnflushedCredentials, readProjectRecoveryBackup } from '../src/utils/credentialStorage';
 import { Capacitor } from '@capacitor/core';
 import { nativeBridge } from '../src/utils/nativePlatform';
 const platform = { isNativePlatform: Capacitor.isNativePlatform, getPlatform: Capacitor.getPlatform, isPluginAvailable: Capacitor.isPluginAvailable };
@@ -134,4 +134,21 @@ test('Android imports large encrypted records without a WebView mirror and retai
   await initializeCredentials();assert.deepEqual(readProjectRecords(),[next]);
   assert.equal(localStorage.getItem('gitvault_repos_v8'),null);assert.equal(localStorage.getItem('gitvault_global_token'),null);
   assert.ok(recordsJSON(prepareRecords(readProjectRecords())).includes('private-token'));
+});
+
+test('failed startup migration exposes a complete backup without nested credentials',async()=>{
+ const original=[small('first',{token:'source-secret',uploadTarget:{id:77,token:'target-secret'},backups:[{tree:[{path:'original.txt',sha:'exact'}]}]})];
+ localStorage.setItem('gitvault_repos_v8',list(original));
+ mock.method(IDBObjectStore.prototype,'put',function(){throw new DOMException('disk full','QuotaExceededError');});
+ await assert.rejects(initializeCredentials);
+ const raw=readProjectRecoveryBackup()!;assert.ok(raw);const backup=JSON.parse(raw);
+ assert.equal(backup.projects[0].id,'first');assert.equal(backup.projects[0].backups[0].tree[0].sha,'exact');assert.equal(backup.projects[0].uploadTarget.id,77);
+ assert.ok(!raw.includes('source-secret')&&!raw.includes('target-secret'));assert.equal(localStorage.getItem('gitvault_repos_v8'),list(original));
+});
+test('failed native encryption migration exposes the original project metadata for recovery',async()=>{
+ Capacitor.isNativePlatform=()=>true;Capacitor.getPlatform=()=> 'android';Capacitor.isPluginAvailable=()=>true;
+ const original=[small('native',{token:'secret',forkTarget:{id:77,token:'fork-secret'}})];
+ nativeBridge.readVault=async()=>({value:list({gitvault_repos_v8:list(original)})});nativeBridge.writeVault=async()=>{throw new Error('disk full');};
+ await assert.rejects(initializeCredentials,/disk full/);const raw=readProjectRecoveryBackup()!;
+ assert.equal(JSON.parse(raw).projects[0].forkTarget.id,77);assert.ok(!raw.includes('secret'));
 });

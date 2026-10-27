@@ -70,6 +70,15 @@ public class ManagedFolderStoreTest {
             f.store.task(null,null);assertEquals(1,f.store.status("content://test/tree/root").getInt("versions"));assertEquals("ready",f.store.describe(id,false,null).getString("state"));assertArrayEquals(bytes,Files.readAllBytes(f.content(id,"a").toPath()));
         }
     }
+    @Test public void cancelledCleanupScanKeepsThePublishedFolderAndOwnership()throws Exception{
+        try(Fixture f=new Fixture()){
+            byte[] bytes=new byte[1024*1024];JSArray manifest=new JSArray();manifest.put(entry("a",bytes));String id=f.begin("one",manifest).getString("id");f.store.write(id,"a",bytes.length,hash(bytes),"100644",new ByteArrayInputStream(bytes),null);f.store.finish(id);f.store.attach(id,"owner","one",false);
+            AtomicBoolean stop=new AtomicBoolean();f.store.task(stop,message->stop.set(true));
+            try{f.store.clear("owner","one",false);fail("Cleanup scan must acknowledge cancellation");}catch(IOException expected){assertTrue(expected.getMessage().contains("取消"));}
+            f.store.task(null,null);assertEquals("ready",f.store.describe(id,false,null).getString("state"));assertArrayEquals(bytes,Files.readAllBytes(f.content(id,"a").toPath()));
+            f.store.clear("owner","one",false);assertTrue(f.store.describe(id,false,null).getBoolean("missing"));
+        }
+    }
     @Test public void candidatesVerifyBeforeSwitchAndCleanupNeverTouchesUnmanagedSiblings()throws Exception{
         try(Fixture f=new Fixture()){
             byte[] first="old".getBytes(StandardCharsets.UTF_8),second="new".getBytes(StandardCharsets.UTF_8);JSArray expected=new JSArray();expected.put(entry("目录/a",first));

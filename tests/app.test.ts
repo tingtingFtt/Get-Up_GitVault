@@ -264,7 +264,7 @@ test('detaching a missing target clears its shared branch and Fork bindings whil
   assert.equal(saved[1].owner, 'source'); assert.equal(saved[1].accountState, undefined); assert.equal(saved[1].forkScope, undefined); assert.equal(saved[1].origin.repo, 'project');
   assert.equal((await localCache.getProjectFiles('tracked', 'v1'))[0].content, 'old');
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
-  assert.ok(targetManager()?.textContent?.includes('2 个记录'));
+  await waitFor(()=>targetManager()?.textContent?.includes('2 个记录')===true);
 });
 test('refusing detach confirmation keeps every binding intact', async () => {
   await reloadProject(boundProject()); deletedTargetFixture(); await openDeletedTargetManager();
@@ -482,8 +482,9 @@ async function waitFor(check: () => boolean) {
 }
 
 async function click(text: string) {
-  const button = buttons().find(b => b.textContent?.trim() === text || b.getAttribute('aria-label') === text);
-  assert.ok(button, `Missing button ${text}`);
+  const find=()=>buttons().find(b=>b.textContent?.trim()===text||b.getAttribute('aria-label')===text);
+  await waitFor(()=>{const button=find();return !!button&&!button.disabled;});
+  const button=find()!;
   await act(async () => { button.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
 }
 async function enterWorkbench() {
@@ -1576,4 +1577,25 @@ test('failed record persistence exposes retry and export, then retry preserves t
   await act(async()=>root.unmount());await initializeCredentials();
   root=createRoot(document.getElementById('root')!);await act(async()=>root.render(React.createElement(App)));
   assert.equal(storedProjects()[0].remark,'unsaved-new-remark');
+});
+
+test('batch cache cleanup can cancel a pending directory operation and never starts another project',async()=>{
+  const second={...repo(),id:'second',repo:'second'};await reloadProjects([repo(),second]);
+  const calls:string[]=[];
+  mock.method(localCache,'deleteProjectFiles',async(id:string,_ref?:string,options?:Parameters<typeof localCache.deleteProjectFiles>[2])=>{calls.push(id);assert.ok(options?.signal);return new Promise((_resolve,reject)=>options!.signal!.addEventListener('abort',()=>reject(options!.signal!.reason),{once:true}));});
+  await click('仓库已有项目 (2)');await click('全选所有');await click('批量精简缓存');await waitFor(()=>calls.length===1);
+  await click('取消');await waitFor(()=>alerts.some(message=>message.includes('未完成')));
+  assert.deepEqual(calls,['tracked']);assert.ok(storedProjects().every((project:any)=>!project.isCachePurged));
+});
+
+test('a release remains retryable when recording its completed cache purge fails',async()=>{
+  const base=globalThis.fetch;
+  globalThis.fetch=async(url,init={})=>{const path=String(url).replace('https://api.github.com','');if(path.includes('/git/ref/tags/'))return ok({message:'Not Found'},404);if(path.endsWith('/releases')&&init.method==='POST')return ok({html_url:'https://github.com/source/project/releases/tag/v1',tag_name:'v1'});return base(url,init);};
+  const original=IDBObjectStore.prototype.put;
+  mock.method(IDBObjectStore.prototype,'put',function(this:IDBObjectStore,value:any,key?:IDBValidKey){if(this.name==='projects'&&JSON.parse(value.json).backups.some((backup:any)=>backup.isCachePurged))throw new DOMException('disk full','QuotaExceededError');return original.call(this,value,key!);});
+  checkpoint({kind:'release',projectId:'tracked',purge:true,items:[{id:'old',name:'v1',sha:'v1',targetOwner:'source',targetRepo:'project',status:'pending'}]});
+  await reloadProject(repo());await click('查看并继续');await click('重试未完成发布');
+  await waitFor(()=>JSON.parse(localStorage.getItem('gitvault_tasks_v1')!)[0].items[0].status==='error');
+  const persisted=await (await import('../src/utils/projectRecordStore')).createProjectRecordStore().initialize({});
+  assert.equal((persisted.projects[0] as any).backups[0].isReleased,true);assert.ok(!(persisted.projects[0] as any).backups[0].isCachePurged);
 });

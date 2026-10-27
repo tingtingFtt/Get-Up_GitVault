@@ -489,6 +489,7 @@ export default function App() {
   const publishAccountRecord = async (repo: TrackedRepo, entry: AccountProject, token: string) => {
     queueAccountRecord(repo, entry);
     await flushCloudPending(repo, token);
+    await flushCredentials();
   };
   const accountRecord = (repo: TrackedRepo, target: TargetIdentity, kind: AccountProject['kind'], sourceBranch: string, branch: string, sourceSha?: string, commitSha?: string): AccountProject => ({ source: { ...sourceOf(repo), branch: sourceBranch }, target: { id: target.id, owner: target.owner, repo: target.repo, private:target.private }, kind, state: 'active', createdByApp: true, primary: !!repo.primarySource, profile: {tags:repo.tags,remark:repo.remark,description:repo.description || '',updatedAt:new Date().toISOString()}, history:repo.targetHistory, bindings: { [sourceBranch]: { branch, sourceSha, commitSha, updatedAt: new Date().toISOString() } }, branches: kind === 'full' ? repo.forkTarget?.branches : undefined, updatedAt: new Date().toISOString() });
   useEffect(() => {
@@ -616,7 +617,7 @@ export default function App() {
     if (purge) {
       operationSignal().throwIfAborted();
       try {
-        await flushCredentials(); await localCache.deleteProjectFiles(repo.id, sourceSha,{verifiedFiles:result.localFiles});
+        await flushCredentials(); await localCache.deleteProjectFiles(repo.id, sourceSha,{verifiedFiles:result.localFiles,signal:operationSignal()});
         if (version) patchRepo(repo.id, { backups: (reposRef.current.find(r => r.id === repo.id)?.backups || []).map(b => b.id === version.id ? { ...b, isCachePurged: true } : b) });
         else patchRepo(repo.id, { isCachePurged: true, cachedFilesCount: 0 });
       } catch (error) { throw new Error(`上传已验证成功，缓存清理未完成，可稍后重试：${(error as Error).message}`); }
@@ -659,6 +660,7 @@ export default function App() {
           })));
         } catch (error) { if (signal.aborted || !(error instanceof TargetRepositoryError)) throw error; }
       }
+      await flushCredentials();
       setTargetManagerMessage(override ? '检测完成；仅对身份验证成功的目标保存了新 Token。' : '检测完成；异常目标的原绑定仍保留，可按状态处理。');
     } catch (error) { setTargetManagerMessage(signal.aborted ? '检测已取消，原绑定保持不变。' : (error as Error).message); }
     finally { setTargetManagerBusy(false); }
@@ -669,7 +671,7 @@ export default function App() {
     if (!affected.length || !(await appDialog.confirm(`解除 ${target.owner}/${target.repo} 在 ${affected.length} 个项目记录中的所有当前分支／分叉绑定？\n本地文件、原始来源、历史快照和其他目标绑定全部保留，不删除任何 GitHub 仓库。\n仅在确认原仓库已删除或原 ID 已失效后重新创建。若只是 Token 无权限，请先更新 Token 并重新检测。`))) return;
     beginGithubOperation(); setTargetManagerBusy(true);
     const auth = targetManagerToken.trim() || targetToken(affected[0], target);
-    let locallyDetached = false;
+    let locallyDetached = false, locallySaved = false;
     try {
       try {
         await githubClient.repository(target.owner, target.repo, auth, target.id);
@@ -681,12 +683,14 @@ export default function App() {
         return affected.some(item => item.id === project.id) ? { ...next, accountState: next.uploadTarget || next.forkTarget ? 'bound' as const : undefined, creationReservation: undefined, cloudPending: (project.cloudPending || []).filter(entry => !sameTarget(entry.target, target)), cloudRemovals: [...(project.cloudRemovals || []), target] } : next;
       }));
       locallyDetached = true;
+      await flushCredentials();locallySaved=true;
       setDetachedTargetName(target.repo);
       setTargetManagerMessage(`已解除 ${affected.length} 个记录的旧目标绑定。可以重新设置上传或创建分叉；本地文件和历史快照已保留。GitHub 上已删除的历史无法在新仓库中自动重建。`);
       setTargetManagerId(repoId);
       if (auth) for (const project of affected) await flushCloudRemovals(project, auth);
+      await flushCredentials();
       logOperation('解除远端目标', 'success', affected[0], '当前绑定与账号记录已解除；历史快照保留');
-    } catch (error) { logOperation('解除远端目标', locallyDetached ? 'partial' : 'error', affected[0], (error as Error).message, '核对原目标或解除账号记录', error); setTargetManagerMessage((locallyDetached ? '本地记录已保留；账号解绑未完成，将在下次操作时重试：' : '无法确认旧目标已失效，绑定保持固定：') + (error as Error).message); }
+    } catch (error) { logOperation('解除远端目标', locallyDetached ? 'partial' : 'error', affected[0], (error as Error).message, '核对原目标或解除账号记录', error); setTargetManagerMessage((locallyDetached ? locallySaved ? '本地记录已保留；账号解绑未完成，将在下次操作时重试：' : '解绑记录尚未保存，请重试保存记录或导出当前备份：' : '无法确认旧目标已失效，绑定保持固定：') + (error as Error).message); }
     finally { setTargetManagerBusy(false); }
   };
   const reopenTargetSetup = (repoId: string, fork: boolean) => {
@@ -1659,7 +1663,7 @@ export default config;
   const clearApkTemporary = async () => {
     if(isLoading||isBatchUploading||importLock.current||batchTaskLock.current)return;
     if(!await appDialog.confirm('清理未完成下载的候选目录、内部下载进度及 Git 加速缓存？已绑定项目文件、项目记录和 GitHub 历史会保留。'))return;
-    startOperation();try{await clearNativeGitCache();await withFolderConfirmation(force=>folderTask(folderBridge.cleanTemporary,{force},operationSignal(),true),'候选下载目录存在变动，是否清理？');await transferCache.clearAll();logOperation('临时缓存清理','success',undefined,'候选目录与下载进度已清理');appDialog.notify('临时缓存已清理。');}catch(error){logOperation('临时缓存清理','error',undefined,(error as Error).message,'删除临时文件',error);appDialog.notify('临时缓存清理未完成：'+(error as Error).message);}finally{setIsLoading(false);}
+    startOperation();try{await clearNativeGitCache();await withFolderConfirmation(force=>folderTask(folderBridge.cleanTemporary,{force},operationSignal(),true),'候选下载目录存在变动，是否清理？',operationSignal());await transferCache.clearAll();logOperation('临时缓存清理','success',undefined,'候选目录与下载进度已清理');appDialog.notify('临时缓存已清理。');}catch(error){logOperation('临时缓存清理','error',undefined,(error as Error).message,'删除临时文件',error);appDialog.notify('临时缓存清理未完成：'+(error as Error).message);}finally{setIsLoading(false);}
   };
   const exportCurrentProject = async () => {
     if (!activeRepo || isLoading) return;
@@ -1835,7 +1839,7 @@ export default config;
     const branchTargets=Object.fromEntries(Object.entries(bindings).map(([branch,binding])=>[branch,{...nextTarget,branch:binding.branch}]));
     await localCache.saveSyncReceipt(repo.id,pending.sourceSha,snapshot);
     patchRepo(repo.id,{...pending.manifest,branch:pending.sourceBranch,latestCommitSha:pending.sourceSha,origin:{...sourceOf(repo),branch:pending.sourceBranch},owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repoMeta:{...repo.repoMeta,htmlUrl:`https://github.com/${result.owner}/${result.repo}`},primarySource:{owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repositoryId:result.repoId,branch:result.branch},uploadTarget:nextTarget,branchTargets,branchUploadPending:false,forkTarget:undefined,forkScope:undefined,privateRepoUrl:nextTarget.private?`https://github.com/${result.owner}/${result.repo}`:undefined,remoteSnapshot:snapshot,savedCopies:[...(repo.savedCopies||[]),...(repo.remoteSnapshot?[repo.remoteSnapshot]:[])],backups:[archiveVersion(repo),...repo.backups],targetHistory:history,cloudPending:[],pendingSwitch:undefined,creationReservation:undefined,accountState:'synced',verification:'ready',isCachePurged:false,cachedFilesCount:(await localCache.getProjectFiles(repo.id,pending.sourceSha)).length});
-    if(request.purge){await flushCredentials(); await localCache.deleteProjectFiles(repo.id,pending.sourceSha);patchRepo(repo.id,{isCachePurged:true,cachedFilesCount:0});}
+    if(request.purge){await flushCredentials(); await localCache.deleteProjectFiles(repo.id,pending.sourceSha,{signal:operationSignal()});patchRepo(repo.id,{isCachePurged:true,cachedFilesCount:0});}
     await flushCredentials();
     logOperation('另存并切换固定仓库','success',reposRef.current.find(item=>item.id===repo.id),`旧目标 ${pending.oldTarget?`${pending.oldTarget.owner}/${pending.oldTarget.repo}`:'无'} → ${result.owner}/${result.repo}:${result.branch}`);
     return '另存已验证，固定仓库已切换；旧仓库和历史记录保留。';
@@ -2148,12 +2152,15 @@ export default config;
     e.stopPropagation();
     if(cacheOperationBlocked())return;
     if (!(await appDialog.confirm('确定移除该项目的本地记录和缓存？远程仓库不会删除。'))) return;
+    startOperation();setLoadingText('正在清理本地文件；取消会停止剩余清理，已删除的文件不会恢复…');
     try {
-      await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true});
+      await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true,signal:operationSignal()});
       persistRepos(reposRef.current.filter(r => r.id !== repoId));
+      await flushCredentials();
       setSelectedProjectIds(prev => prev.filter(id => id !== repoId));
       if (activeRepoId === repoId) { setActiveRepoId(null); setCurrentView('projects'); }
     } catch (error) { appDialog.notify('删除未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // ================= BATCH OPERATIONS ON PROJECTS =================
@@ -2285,11 +2292,12 @@ export default config;
   const handleBatchDeleteProjects = async () => {
     if(cacheOperationBlocked())return;
     if (!selectedProjectIds.length || !(await appDialog.confirm('删除所选项目的本地记录和缓存？远程仓库不会删除。'))) return;
+    startOperation();setLoadingText('正在清理本地文件；取消会停止剩余清理，已删除的文件不会恢复…');
     try {
-      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true}); persistRepos(reposRef.current.filter(r => r.id !== id)); }
-      if (activeRepoId && selectedProjectIds.includes(activeRepoId)) { setActiveRepoId(null); setCurrentView('projects'); }
+      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true,signal:operationSignal()}); persistRepos(reposRef.current.filter(r => r.id !== id)); setSelectedProjectIds(ids=>ids.filter(value=>value!==id)); if(activeRepoId===id){setActiveRepoId(null);setCurrentView('projects');} await flushCredentials(); }
       setSelectedProjectIds([]);
     } catch (error) { appDialog.notify('部分删除未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // Open Batch Add Tag Modal
@@ -2379,11 +2387,13 @@ export default config;
   const handleBatchPurgeCache = async () => {
     if(cacheOperationBlocked())return;
     if (!selectedProjectIds.length || !(await appDialog.confirm('清理所选项目的本地源码和软件管理的目录文件？项目快照和 GitHub 历史会保留。'))) return;
+    startOperation();setLoadingText('正在清理本地文件；取消会停止剩余清理，已删除的文件不会恢复…');
     try {
-      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true}); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
+      for (const id of selectedProjectIds) { await flushCredentials(); await localCache.deleteProjectFiles(id,undefined,{interactive:true,signal:operationSignal()}); patchRepo(id, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === id)?.backups || []).map(b => ({ ...b, isCachePurged: true })) }); }
       await flushCredentials();
       setSelectedProjectIds([]); appDialog.notify('本地源码已清理，快照已保留。');
     } catch (error) { logOperation('批量清理缓存','error',undefined,(error as Error).message,'删除目录文件',error);appDialog.notify('缓存清理未完成：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // Selection Experience Enhancements for Backups
@@ -2469,9 +2479,10 @@ export default config;
           patchRepo(repoId, { backups: current.backups.map(backup => backup.id === item.id ? { ...backup, isReleased: true, releaseUrl: result.releaseUrl } : backup) });
           await flushCredentials();
           if (purgeCacheOption) {
-            await localCache.deleteProjectFiles(repoId, version.commitSha,{interactive:true});
+            await localCache.deleteProjectFiles(repoId, version.commitSha,{interactive:true,signal});
             patchRepo(repoId, { backups: (reposRef.current.find(repo => repo.id === repoId)?.backups || []).map(backup => backup.id === item.id ? { ...backup, isCachePurged: true } : backup) });
           }
+          await flushCredentials();
           item.status = 'success'; item.releaseUrl = result.releaseUrl; save();
           logOperation('批量归档发布', 'success', current, `已核验 ${version.tag}，保留原提交历史`);
         } catch (error) {
@@ -2490,20 +2501,26 @@ export default config;
     e?.stopPropagation(); if(cacheOperationBlocked()||!activeRepo)return;
     const backup = activeRepo.backups.find(b => b.id === backupId);
     if (!backup || !(await appDialog.confirm('清理此版本的本地源码？版本快照会保留。'))) return;
+    startOperation();setLoadingText('正在清理本地文件；取消会停止剩余清理，已删除的文件不会恢复…');
     try {
-      await flushCredentials(); await localCache.deleteProjectFiles(activeRepo.id, backup.commitSha,{interactive:true});
+      await flushCredentials(); await localCache.deleteProjectFiles(activeRepo.id, backup.commitSha,{interactive:true,signal:operationSignal()});
       patchRepo(activeRepo.id, { backups: activeRepo.backups.map(b => b.id === backupId ? { ...b, isCachePurged: true } : b) });
+      await flushCredentials();
     } catch (error) { logOperation('清理缓存','error',activeRepo||undefined,(error as Error).message,'删除目录文件',error);appDialog.notify('清理失败：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // Purge local cache for the active project
   const handlePurgeProjectCache = async (repoId: string, e?: React.MouseEvent) => {
     e?.stopPropagation(); if(cacheOperationBlocked())return; if (!(await appDialog.confirm('清理该项目的本地源码及软件管理目录内的文件？项目快照、仓库绑定和 GitHub 历史会保留。'))) return;
+    startOperation();setLoadingText('正在清理本地文件；取消会停止剩余清理，已删除的文件不会恢复…');
     try {
-      await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true});
+      await flushCredentials(); await localCache.deleteProjectFiles(repoId,undefined,{interactive:true,signal:operationSignal()});
       patchRepo(repoId, { isCachePurged: true, cachedFilesCount: 0, backups: (reposRef.current.find(r => r.id === repoId)?.backups || []).map(b => ({ ...b, isCachePurged: true })) });
+      await flushCredentials();
       if (activeRepoId === repoId) { setSelectedFilePath(null); setFileContent(null); }
     } catch (error) { logOperation('清理缓存','error',activeRepo||undefined,(error as Error).message,'删除目录文件',error);appDialog.notify('清理失败：' + (error as Error).message); }
+    finally { setIsLoading(false); }
   };
 
   // Re-pull and restore cache from GitHub for a project
@@ -2513,6 +2530,7 @@ export default config;
     try {
       const files = await versionFiles(repo);
       patchRepo(repo.id, { isCachePurged: false, cachedFilesCount: files.length });
+      await flushCredentials();
       appDialog.notify(`已恢复当前快照的 ${files.length} 个文件；获取新版本请使用更新操作。`);
     } catch (error) { appDialog.notify('恢复未完成：' + (error as Error).message); }
     finally { setIsLoading(false); }

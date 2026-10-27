@@ -4,7 +4,7 @@ import {cooperate} from './operation';
 import { gitBlobSha } from './gitFiles';
 import { clearNativeGitCache } from './nativeGitCache';
 import { markTransferFailure, type TransferFailureKind } from './transferFailure';
-import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, finishFolder, folderFiles, hydrateFile, withFolderConfirmation, type FolderFiles } from './nativeFolder';
+import { usesNativeFolder, hasFolderApi, folderRoot, folderBridge, beginFolder, putFolderFile, finishFolder, folderFiles, hydrateFile, withFolderConfirmation, folderTask, type FolderFiles } from './nativeFolder';
 
 export interface CachedFile {
   nativeRef?: { version: string; path: string; dirty?: boolean; added?: boolean };
@@ -232,28 +232,37 @@ export const localCache = {
       return value ? { ...file, content: value.content, isBase64: value.isBase64 } : null;
     });
   },
-  async deleteProjectFiles(repoId: string, ref?: string, options:{interactive?:boolean;verifiedFiles?:Array<{path:string;sha:string;mode:string}>}={}): Promise<void> {
+  async deleteProjectFiles(repoId: string, ref?: string, options:{interactive?:boolean;verifiedFiles?:Array<{path:string;sha:string;mode:string}>;signal?:AbortSignal}={}): Promise<void> {
     // Git pools may contain source and target history shared across tasks. Clear
     // all acceleration objects so a source purge cannot leave a reconstructible copy.
-    await clearNativeGitCache();
+    const signal=options.signal;signal?.throwIfAborted();
+    await clearNativeGitCache();signal?.throwIfAborted();
     if(hasFolderApi()) {
-      const clear=(force:boolean)=>folderBridge.clear({owner:repoId,ref:ref||'',force,verifiedFiles:options.verifiedFiles});
-      if(options.interactive)await withFolderConfirmation(clear,'清理将删除该项目目录中的已下载文件，保留项目记录和 GitHub 历史。');else await clear(false);
+      const clear=(force:boolean)=>folderTask(folderBridge.clear,{owner:repoId,ref:ref||'',force,verifiedFiles:options.verifiedFiles},signal,true);
+      if(options.interactive)await withFolderConfirmation(clear,'清理将删除该项目目录中的已下载文件，保留项目记录和 GitHub 历史。',signal);else await clear(false);
     }
+    signal?.throwIfAborted();
     await withDB(async db => {
+      signal?.throwIfAborted();
       const tx = db.transaction([LEGACY, SNAPSHOTS, CONTENTS, TRANSFERS, RECOVERY], 'readwrite');
       const done = completed(tx);
-      const snapshots = tx.objectStore(SNAPSHOTS);
-      const all = await read<Snapshot[]>(snapshots.getAll());
-      const removed = all.filter(s => s.repoId === repoId && (!ref || s.ref === ref));
-      for (const snapshot of removed) snapshots.delete(snapshot.id);
-      for (const snapshot of removed) await clearDownloadState(tx, snapshot.ref);
-      const remaining = all.filter(s => !removed.some(r => r.id === s.id));
-      const referenced = new Set(remaining.flatMap(s => s.files.map(f => f.sha)));
-      for (const snapshot of removed) for (const file of snapshot.files) if (!referenced.has(file.sha)) tx.objectStore(CONTENTS).delete(file.sha!);
-      const current = await read<any>(tx.objectStore(LEGACY).get(repoId));
-      if (!ref || current?.currentRef === ref || current?.files) tx.objectStore(LEGACY).delete(repoId);
-      await done;
+      const abort=()=>{try{tx.abort();}catch{}};
+      signal?.addEventListener('abort',abort,{once:true});
+      try {
+        signal?.throwIfAborted();
+        const snapshots = tx.objectStore(SNAPSHOTS);
+        const all = await read<Snapshot[]>(snapshots.getAll());
+        const removed = all.filter(s => s.repoId === repoId && (!ref || s.ref === ref));
+        for (const snapshot of removed) snapshots.delete(snapshot.id);
+        for (const snapshot of removed) await clearDownloadState(tx, snapshot.ref);
+        const remaining = all.filter(s => !removed.some(r => r.id === s.id));
+        const referenced = new Set(remaining.flatMap(s => s.files.map(f => f.sha)));
+        for (const snapshot of removed) for (const file of snapshot.files) if (!referenced.has(file.sha)) tx.objectStore(CONTENTS).delete(file.sha!);
+        const current = await read<any>(tx.objectStore(LEGACY).get(repoId));
+        if (!ref || current?.currentRef === ref || current?.files) tx.objectStore(LEGACY).delete(repoId);
+        signal?.throwIfAborted();await done;
+      } catch(error) { abort();await done.catch(()=>{});signal?.throwIfAborted();throw error; }
+      finally { signal?.removeEventListener('abort',abort); }
     });
   },
   async pruneBodies(): Promise<void> {

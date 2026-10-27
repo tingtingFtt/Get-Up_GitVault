@@ -7,6 +7,7 @@ import {folderBridge,hydrateFile,saveFolderArchive,finishFolder} from '../src/ut
 import {exportProjectDirectory} from '../src/utils/nativePlatform';
 import {nativeGitBridge,nativeGitTransfer} from '../src/utils/nativeGit';
 import {nativeGitCacheBridge} from '../src/utils/nativeGitCache';
+import {appDialog} from '../src/utils/appDialog';
 import {localCache,type CachedFile} from '../src/utils/localCache';
 import {githubClient,beginGithubOperation} from '../src/utils/githubClient';
 import {immediateTransport} from './transportFixture';
@@ -120,4 +121,42 @@ test('native directory small updates fetch only missing pinned blobs without dow
  globalThis.fetch=async input=>{const path=String(input);if(path.endsWith('/repos/source/project'))return new Response(JSON.stringify({id:77,default_branch:'main'}));if(path.includes('/commits/'))return new Response(JSON.stringify({sha:'a'.repeat(40),commit:{tree:{sha:'b'.repeat(40)},author:{}}}));if(path.includes('/git/trees/'))return new Response(JSON.stringify({tree:manifest}));assert.ok(path.endsWith('/git/blobs/'+manifest[1].sha),path);blobs.push(path);return new Response(JSON.stringify({content:changed.toString('base64')}));};
  const result=await githubClient.fetchRepo('source/project','main','token',{cachedFiles:manifest.map(file=>({...nativeFile({...file,content:'',isBase64:true}),nativeRef:{version:'old',path:file.path}}))});
  assert.equal(blobs.length,1);assert.deepEqual(documents.get('b'),changed);assert.equal(documents.has('a'),false);assert.equal(result.files.length,2);assert.ok(result.files.every(file=>file.nativeRef?.version==='version'));
+});
+
+test('cancelled folder cleanup waits for native acknowledgement and retains the snapshot index',async()=>{
+ enable();entries=[{path:'a',sha:sha(Buffer.from('a')),size:1,mode:'100644',content:'',isBase64:true}];await localCache.saveProjectFiles('project',entries.map(nativeFile),'old');
+ const controller=new AbortController();let taskId='',cancelled='',ack!:(value:any)=>void,settled=false;
+ mock.method(folderBridge,'listen',async()=>({remove:async()=>{}}));
+ mock.method(folderBridge,'clear',(value:any)=>{taskId=value.taskId;return new Promise(resolve=>{ack=resolve;});});
+ mock.method(folderBridge,'cancel',async(value:any)=>{cancelled=value.taskId;});
+ const pending=localCache.deleteProjectFiles('project','old',{signal:controller.signal}).finally(()=>{settled=true;});
+ const rejected=assert.rejects(pending,{name:'AbortError'});
+ for(let i=0;i<100&&!taskId;i++)await new Promise(resolve=>setTimeout(resolve,1));
+ assert.ok(taskId);controller.abort();await new Promise(resolve=>setTimeout(resolve,0));
+ assert.equal(cancelled,taskId);assert.equal(settled,false);assert.equal((await readStore('snapshots')).length,1);
+ ack({});await rejected;assert.equal((await readStore('snapshots')).length,1);
+});
+test('cancel during changed-folder confirmation never forces cleanup or removes cached metadata',async()=>{
+ enable();entries=[{path:'a',sha:sha(Buffer.from('a')),size:1,mode:'100644',content:'',isBase64:true}];await localCache.saveProjectFiles('project',entries.map(nativeFile),'old');
+ const controller=new AbortController();let asked=false,calls=0;
+ mock.method(folderBridge,'listen',async()=>({remove:async()=>{}}));
+ mock.method(folderBridge,'clear',async(value:any)=>{calls++;assert.equal(value.force,false);throw Object.assign(new Error('local changes'),{code:'LOCAL_CHANGES'});});
+ mock.method(appDialog,'confirm',(_message:string,options?:{signal?:AbortSignal})=>{assert.equal(options?.signal,controller.signal);asked=true;return new Promise((_resolve,reject)=>options!.signal!.addEventListener('abort',()=>reject(options!.signal!.reason),{once:true}));});
+ const pending=localCache.deleteProjectFiles('project','old',{signal:controller.signal,interactive:true});const rejected=assert.rejects(pending,{name:'AbortError'});
+ for(let i=0;i<100&&!asked;i++)await new Promise(resolve=>setTimeout(resolve,1));assert.ok(asked);controller.abort();await rejected;
+ assert.equal(calls,1);assert.equal((await readStore('snapshots')).length,1);
+});
+test('pre-cancelled cleanup does not touch Git objects, documents or snapshot rows',async()=>{
+ enable();let clears=0;mock.method(nativeGitCacheBridge,'clear',async()=>{clears++;return{bytes:0};});
+ mock.method(folderBridge,'clear',async()=>assert.fail('Native cleanup must not start'));
+ const controller=new AbortController();controller.abort();await assert.rejects(localCache.deleteProjectFiles('project',undefined,{signal:controller.signal}),{name:'AbortError'});assert.equal(clears,0);
+});
+
+test('cancelling browser cache deletion aborts the metadata transaction instead of removing shared bodies',async()=>{
+ const file={path:'a',content:'a',isBase64:false,sha:sha(Buffer.from('a')),mode:'100644'};
+ await localCache.saveProjectFiles('project',[file],'old');
+ const controller=new AbortController(),original=IDBObjectStore.prototype.getAll;
+ mock.method(IDBObjectStore.prototype,'getAll',function(this:IDBObjectStore,...args:any[]){const request=original.apply(this,args as any);if(this.name==='snapshots')queueMicrotask(()=>controller.abort());return request;});
+ await assert.rejects(localCache.deleteProjectFiles('project','old',{signal:controller.signal}),{name:'AbortError'});
+ mock.restoreAll();assert.equal((await readStore('snapshots')).length,1);assert.equal((await localCache.getProjectFiles('project','old'))[0].content,'a');
 });

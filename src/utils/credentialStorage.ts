@@ -8,6 +8,7 @@ let projects: readonly ProjectRecord[] = [];
 let prepared: PreparedRecords = { rows: new Map(), order: [] };
 let database = createProjectRecordStore();
 let initialized = false;
+let recoverySource: string | undefined;
 let writeQueue: Promise<void> | undefined;
 let requested = 0, committed = 0;
 let storageFailure: unknown;
@@ -37,6 +38,7 @@ export async function initializeCredentials() {
   storageFailure = undefined;
   const legacy: Record<string, string> = {};
   for (const key of projectKeys) { const value = localStorage.getItem(key); if (value !== null) legacy[key] = value; }
+  recoverySource=legacy.gitvault_repos_v8??legacy.gitvault_repos_v7;
   if (isNativeAndroid()) {
     const stored = await nativeBridge.readVault();
     values = stored.value ? JSON.parse(stored.value) : {};
@@ -44,6 +46,7 @@ export async function initializeCredentials() {
     for (const key of keys) if (!(key in values)) { const value = localStorage.getItem(key); if (value !== null) values[key] = value; }
     if (Object.keys(legacy).length) values.gitvault_legacy_project_backup = JSON.stringify(legacy);
     const raw = values.gitvault_repos_v8 ?? values.gitvault_repos_v7 ?? '[]';
+    recoverySource=raw;
     projects = JSON.parse(raw);
     prepared = prepareRecords(projects);
     values.gitvault_repos_v8 = recordsJSON(prepared);
@@ -57,10 +60,12 @@ export async function initializeCredentials() {
     const loaded = await database.initialize(legacy);
     projects = loaded.projects;
     prepared = loaded.records;
+    recoverySource=recordsJSON(prepared);
   }
   // Migration and read-back verification have completed; originals remain on failure.
   for (const key of projectKeys) localStorage.removeItem(key);
   initialized = true;
+  recoverySource=undefined;
 }
 export function readProjectRecords<T extends ProjectRecord>(): T[] {
   if (!initialized) throw new Error('项目记录尚未完成初始化');
@@ -98,4 +103,15 @@ export async function flushCredentials() {
 export async function retryCredentialWrites() {
   if (requested !== committed || storageFailure) startWrites();
   await flushCredentials();
+}
+
+/** Available even when migration stopped before the React app could start. */
+export function readProjectRecoveryBackup(): string | undefined {
+  try {
+    if (!recoverySource) return;
+    const original=JSON.parse(recoverySource);
+    if (!Array.isArray(original)) return;
+    const redact=(value:unknown):unknown=>Array.isArray(value)?value.map(redact):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).filter(([key])=>!['token','globaltoken'].includes(key.toLowerCase())).map(([key,item])=>[key,redact(item)])):value;
+    return JSON.stringify({version:'2.5',exportedAt:new Date().toISOString(),projectsCount:original.length,projects:redact(original)},null,2);
+  } catch { return; }
 }
