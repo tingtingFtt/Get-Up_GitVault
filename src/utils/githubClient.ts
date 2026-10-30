@@ -375,7 +375,7 @@ export const githubClient = {
     }
   },
 
-  async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string; repositoryId?: number }) {
+  async inspectImportTarget(target: { id?: number; owner: string; repo: string; branch: string }, token?: string, forkSource?: { owner: string; repo: string; repositoryId?: number }, verifiedCommit?: string) {
     const identity = await githubClient.repository(target.owner, target.repo, token, target.id);
     if (forkSource && (forkSource.repositoryId && identity.forkParentId ? forkSource.repositoryId !== identity.forkParentId : identity.forkParent?.toLowerCase() !== `${forkSource.owner}/${forkSource.repo}`.toLowerCase())) throw new Error('目标分叉的上游与来源不一致，不能沿用此同步关系');
     let commit;
@@ -395,6 +395,7 @@ export const githubClient = {
         if (branches.length < 100) return { identity, commitSha: undefined, tree: [] as RepoEntry[], missingBranch: true };
       }
     }
+    if(verifiedCommit && commit.sha===verifiedCommit)return {identity,commitSha:commit.sha as string,tree:[] as RepoEntry[],missingBranch:false,receiptMatched:true};
     const tree = await getTree(identity.owner, identity.repo, commit.commit.tree.sha, token);
     return { identity, commitSha: commit.sha as string, tree, missingBranch: false };
   },

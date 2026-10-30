@@ -1,3 +1,4 @@
+import { scanAccountDiscovery,discoveryStore,type DiscoveryRow } from './accountDiscovery';
 import { readMetadataSource } from './projectProvenance';
 import { githubApi, GitHubError, operationSignal } from './githubClient';
 import type { ProjectSource } from './projectModel';
@@ -32,7 +33,7 @@ const report = (message: string) => { if (typeof window !== 'undefined') window.
 export interface TargetHistory { target: TargetIdentity; kind: 'upload' | 'current' | 'full'; bindings: AccountProject['bindings']; changedAt: string }
 export interface AccountProject {
   source: ProjectSource; target: TargetIdentity;
-  discovery?: { kind: 'name' | 'fork' | 'metadata'; source?: {owner:string;repo:string}; branches?: string[] };
+  discovery?: { kind: 'name' | 'fork' | 'metadata' | 'search'; source?: {owner:string;repo:string}; branches?: string[]; fork?:boolean };
   kind: 'upload' | 'current' | 'full'; state: 'reserved' | 'active';
   createdByApp: boolean; reservationId?: string; branches?: string[];
   bindings: Record<string, { branch: string; sourceSha?: string; commitSha?: string; updatedAt: string }>;
@@ -80,9 +81,10 @@ function validateDocument(value: any, login: string): RegistryDocument {
 
 /** Only account bindings and receipts are stored remotely; never tokens or project file bytes. */
 export function createAccountRegistry(api = githubApi, wait = retryDelay) {
-  const ownedCache = new Map<string, { at: number; projects: any[] }>();
-  const parentCache = new Map<string, { at: number; meta: any }>();
-  const provenanceCache = new Map<string, { at: number; sources: Array<{owner:string;repo:string;branch:string}> }>();
+  let epoch=0,discoveryEpoch=0;
+  const discoveryReads=new WeakMap<AbortSignal,Map<string,{epoch:number,value:Promise<Awaited<ReturnType<typeof discoveryStore.load>>>}>>();
+  let taskAccounts=new WeakMap<AbortSignal,Map<string,{epoch:number;value:Promise<Awaited<ReturnType<typeof read>>>}>>();
+  const taskNames=new WeakMap<AbortSignal,Map<string,Promise<any>>>();
   const read = async (token: string, signal = operationSignal(), create = false, commitRef?: string) => {
     if (!token) throw new Error('跨设备识别需要 GitHub Token，请在设置中填写可访问账号仓库的凭证');
     const user = await api('/user', token, {}, signal);
@@ -92,7 +94,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     try { meta = await api(root, token, { cache: 'no-store' }, signal); }
     catch (error) {
       if (!missing(error)) throw error;
-      if (!create) return { login: user.login as string, root, meta: undefined, sha: undefined as string | undefined, document: { app: 'Get-Up_GitVault', version: 1, account: user.login, projects: [] } as RegistryDocument };
+      if (!create) return { login: user.login as string, root, meta: undefined, sha: undefined as string | undefined, ref:undefined as string|undefined, document: { app: 'Get-Up_GitVault', version: 1, account: user.login, projects: [] } as RegistryDocument };
       try { meta = await api('/user/repos', token, init('POST', { name: REGISTRY_REPO, description: MARKER, private: true, auto_init: true }), signal); }
       catch (creationError) { if (!(creationError instanceof GitHubError) || ![409, 422].includes(creationError.status)) throw creationError; meta = await api(root, token, { cache: 'no-store' }, signal); }
     }
@@ -106,7 +108,50 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     catch (error) { if (!missing(error)) throw error; if (meta.description !== MARKER) throw new Error(`私人仓库 ${REGISTRY_REPO} 已被其他用途占用，请更名后重试，未覆盖文件`); }
     if (file && (file.encoding !== 'base64' || !file.content || file.size > 1000000)) throw new Error('跨设备记录文件过大或不可读取，未将其当作空记录');
     const document = file ? validateDocument(decode(file.content), user.login) : { app: 'Get-Up_GitVault', version: 1, account: user.login, projects: [] } as RegistryDocument;
-    return { login: user.login as string, root, meta, sha: file?.sha as string | undefined, document };
+    return { login: user.login as string, root, meta, sha: file?.sha as string | undefined, document,ref };
+  };
+  const lookupRead = async (token:string,signal:AbortSignal,fresh=false) => {
+    signal.throwIfAborted();let entries=taskAccounts.get(signal);if(!entries){entries=new Map();taskAccounts.set(signal,entries);}
+    let entry=entries.get(token);const reused=!!entry&&entry.epoch===epoch;
+    if(!entry||entry.epoch!==epoch){entry={epoch,value:read(token,signal)};entries.set(token,entry);const current=entry;void entry.value.catch(()=>{if(entries!.get(token)===current)entries!.delete(token);});}
+    const account=await entry.value;signal.throwIfAborted();
+    if(fresh&&reused){
+      if(!account.meta){entries.delete(token);return lookupRead(token,signal);}
+      try{const ref=await api(`${account.root}/git/ref/heads/${(account.meta.default_branch||'main').split('/').map(encodeURIComponent).join('/')}`,token,{cache:'no-store'},signal);
+        if(ref.object?.sha!==account.ref){entries.delete(token);return lookupRead(token,signal);}
+      }catch(error){if(!missing(error))throw error;entries.delete(token);return lookupRead(token,signal);}
+    }
+    return account;
+  };
+  const cachedName = async (path:string,token:string,signal:AbortSignal) => {
+    let entries=taskNames.get(signal);if(!entries){entries=new Map();taskNames.set(signal,entries);}
+    const key=JSON.stringify([token,path]);let value=entries.get(key);
+    if(!value){value=api(path,token,{cache:'no-store'},signal).catch(error=>{if(missing(error))return undefined;entries!.delete(key);throw error;});entries.set(key,value);}
+    const result=await value;signal.throwIfAborted();return structuredClone(result);
+  };
+  const rememberAccount=(token:string,signal:AbortSignal,account:Awaited<ReturnType<typeof read>>)=>{
+    epoch++;let entries=taskAccounts.get(signal);if(!entries){entries=new Map();taskAccounts.set(signal,entries);}entries.set(token,{epoch,value:Promise.resolve(account)});
+  };
+  // Build identity maps once per account snapshot. Writes never use these maps.
+  const indexes=new WeakMap<object,{sourceIds:Map<number,AccountProject[]>;sourceNames:Map<string,AccountProject[]>;targetIds:Map<number,AccountProject[]>;targetNames:Map<string,AccountProject[]>}>();
+  const nameKey=(value:{owner:string;repo:string})=>`${value.owner}/${value.repo}`.toLowerCase();
+  const indexed = (document:RegistryDocument) => {
+    let index=indexes.get(document);if(index)return index;
+    index={sourceIds:new Map(),sourceNames:new Map(),targetIds:new Map(),targetNames:new Map()};
+    const add=(map:Map<any,AccountProject[]>,key:any,item:AccountProject)=>{if(key!==undefined)map.set(key,[...(map.get(key)||[]),item]);};
+    for(const item of document.projects){add(index.sourceIds,item.source.repositoryId,item);add(index.sourceNames,nameKey(item.source),item);add(index.targetIds,item.target.id,item);add(index.targetNames,nameKey(item.target),item);}
+    indexes.set(document,index);return index;
+  };
+  const recordedFor=(account:Awaited<ReturnType<typeof read>>,source:ProjectSource)=>{
+    const index=indexed(account.document);
+    const bySource=[...(source.repositoryId?index.sourceIds.get(source.repositoryId)||[]:[]),...(index.sourceNames.get(nameKey(source))||[])].filter(item=>sameSource(item.source,source));
+    if(bySource.length)return [...new Set(bySource)];
+    return [...new Set([...(source.repositoryId?index.targetIds.get(source.repositoryId)||[]:[]),...(index.targetNames.get(nameKey(source))||[])].filter(item=>source.repositoryId&&item.target.id?source.repositoryId===item.target.id:nameKey(item.target)===nameKey(source)))];
+  };
+  const legacyProject=(source:ProjectSource,meta:any,discovery:AccountProject['discovery']={kind:'name'}):AccountProject=>{
+    if(!Number.isSafeInteger(meta.id)||meta.id<=0||!validName(meta.owner?.login)||!validName(meta.name))throw new Error('候选仓库身份无效，请重新查找');
+    const full=!!meta.fork&&!!meta.parent&&(source.repositoryId&&meta.parent.id?source.repositoryId===meta.parent.id:meta.parent.full_name?.toLowerCase()===nameKey(source));
+    return {source,target:{id:meta.id,owner:meta.owner.login,repo:meta.name,private:meta.private},discovery:full?{kind:'fork',source:{owner:source.owner,repo:source.repo}}:discovery,kind:full?'full':'upload',state:'active',createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''};
   };
   const change = async (token: string, edit: (document: RegistryDocument, login: string) => RegistryDocument, signal = operationSignal()) => {
     signal.throwIfAborted();
@@ -122,16 +167,16 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
           const current = await read(token, signal, true);
           if (current.login.toLowerCase() !== key) throw new Error('GitHub 账号发生变化，已停止保存记录');
           const document = validateDocument(edit(current.document, current.login), current.login);
-          if (JSON.stringify(current.document) === JSON.stringify(document)) return document;
+          if (JSON.stringify(current.document) === JSON.stringify(document)) {rememberAccount(token,signal,current);return document;}
           const written = await api(`${current.root}/contents/${FILE}`, token, init('PUT', { message: 'Update GitVault account bindings', content: encode(document), branch: current.meta.default_branch || 'main', ...(current.sha ? { sha: current.sha } : {}) }), signal);
           if (!written.commit?.sha) throw new Error('GitHub 未返回账号记录提交版本，请使用更新／同步重新核实');
           // Verify our committed snapshot, not the entire mutable branch after
           // another device has legitimately added its own records.
           const verified = await read(token, signal, false, written.commit.sha);
           if (JSON.stringify(verified.document) !== JSON.stringify(document)) throw new GitHubError('账号记录在验证时发生变化，请重试合并', 409);
-          return verified.document;
+          rememberAccount(token,signal,verified);return verified.document;
         } catch (error) {
-          signal.throwIfAborted();
+          epoch++;signal.throwIfAborted();
           const conflict = error instanceof GitHubError && (error.status === 409 || error.status === 422 && /sha|already exists|reference update|conflict|does not match/i.test(error.message));
           const uncertain = error instanceof TypeError || error instanceof DOMException && error.name === 'TimeoutError' || error instanceof GitHubError && error.status >= 500;
           if (!conflict && !uncertain) throw error;
@@ -216,10 +261,33 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     if (!current.meta) return current.document;
     return change(token, document => ({ ...document, projects: document.projects.filter(item => target.id && item.target.id ? item.target.id !== target.id : item.target.owner.toLowerCase() !== target.owner.toLowerCase() || item.target.repo.toLowerCase() !== target.repo.toLowerCase()) }), signal);
   };
-  const candidates = async (source: ProjectSource, token: string, signal = operationSignal()) => {
+  const discoveryIndexes=new WeakMap<object,{names:Map<string,DiscoveryRow[]>;parents:Map<number,DiscoveryRow[]>}>();
+  const legacyRows=(source:ProjectSource,rows:DiscoveryRow[])=>{
+    let index=discoveryIndexes.get(rows);if(!index){index={names:new Map(),parents:new Map()};
+      const add=(map:Map<any,DiscoveryRow[]>,key:any,row:DiscoveryRow)=>{if(key!==undefined)map.set(key,[...(map.get(key)||[]),row]);};
+      for(const row of rows){for(const item of row.sources)add(index.names,nameKey(item),row);if(row.parent?.id)add(index.parents,row.parent.id,row);if(row.parent?.full_name)add(index.names,row.parent.full_name.toLowerCase(),row);add(index.names,`name:${row.repo.name.toLowerCase()}`,row);}discoveryIndexes.set(rows,index);
+    }
+    const matching=[...new Set([...(index.names.get(nameKey(source))||[]),...(index.names.get(`name:${source.repo.toLowerCase()}`)||[]),...(source.repositoryId?index.parents.get(source.repositoryId)||[]:[])])];
+    const legacy:AccountProject[]=[];
+    for(const row of matching){const repo=row.repo;if(repo.id===source.repositoryId||nameKey({owner:repo.owner.login,repo:repo.name})===nameKey(source))continue;
+      if(repo.fork&&row.parent&&(source.repositoryId&&row.parent.id?source.repositoryId===row.parent.id:row.parent.full_name?.toLowerCase()===nameKey(source)))legacy.push(legacyProject(source,{...repo,parent:row.parent}));
+      else{const matches=row.sources.filter(item=>nameKey(item)===nameKey(source));
+        if(matches.length){const entry=legacyProject(source,repo,{kind:'metadata',source:{owner:matches[0].owner,repo:matches[0].repo},branches:matches.map(item=>item.branch).sort()});entry.bindings[source.branch].branch=matches.find(item=>item.branch===source.branch)?.branch||matches[0].branch;legacy.push(entry);}
+        else if(repo.name.toLowerCase()===source.repo.toLowerCase())legacy.push(legacyProject(source,repo));}
+    }return legacy;
+  };
+  const availableLegacy=(account:Awaited<ReturnType<typeof read>>,source:ProjectSource,list:AccountProject[])=>{
+    const index=indexed(account.document);return list.filter(item=>![...(index.targetIds.get(item.target.id!)||[]),...(index.targetNames.get(nameKey(item.target))||[])].some(bound=>!sameSource(bound.source,source)));
+  };
+  const cachedDiscovery=async(login:string,signal:AbortSignal)=>{
+    let entries=discoveryReads.get(signal);if(!entries){entries=new Map();discoveryReads.set(signal,entries);}let entry=entries.get(login);
+    if(!entry||entry.epoch!==discoveryEpoch){entry={epoch:discoveryEpoch,value:discoveryStore.load(login.toLowerCase())};entries.set(login,entry);const current=entry;void entry.value.catch(()=>{if(entries!.get(login)===current)entries!.delete(login);});}
+    return entry.value;
+  };
+  const candidates = async (source: ProjectSource, token: string, signal = operationSignal(), options:{fresh?:boolean}={}) => {
     report('正在读取账号来源记录，识别已有上传与分叉…');
     let account: Awaited<ReturnType<typeof read>>;
-    try { account = await read(token,signal); }
+    try { account = await lookupRead(token,signal,options.fresh); }
     catch (registryError) {
       signal.throwIfAborted();
       // A readable same-name repository can still be compared without the
@@ -231,79 +299,45 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
       const full=!!meta.fork&&!!meta.parent&&(source.repositoryId&&meta.parent.id?source.repositoryId===meta.parent.id:meta.parent.full_name?.toLowerCase()===`${source.owner}/${source.repo}`.toLowerCase());
       return {login:user.login as string,recorded:[] as AccountProject[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || user.login,repo:meta.name || source.repo,private:meta.private},discovery:{kind:full?'fork' as const:'name' as const,source:full?{owner:meta.parent.owner?.login || meta.parent.full_name?.split('/')[0],repo:meta.parent.name || meta.parent.full_name?.split('/')[1]}:undefined},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}],registryError:(registryError as Error).message};
     }
-    let recorded = account.document.projects.filter(item => sameSource(item.source, source));
-    if (!recorded.length) recorded = account.document.projects.filter(item => source.repositoryId && item.target.id ? source.repositoryId === item.target.id : item.target.owner.toLowerCase() === source.owner.toLowerCase() && item.target.repo.toLowerCase() === source.repo.toLowerCase());
-    if (recorded.length) return { login: account.login, recorded, legacy: [] as AccountProject[] };
-    try {
-      const meta = await api(`/repos/${account.login}/${source.repo}`, token, {cache:'no-store'}, signal);
-      const full = !!meta.fork && !!meta.parent && (source.repositoryId && meta.parent.id ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
-      return {login:account.login,recorded:[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || account.login,repo:meta.name || source.repo,private:meta.private},discovery:{kind:full?'fork' as const:'name' as const,source:full?{owner:meta.parent.owner?.login || meta.parent.full_name?.split('/')[0],repo:meta.parent.name || meta.parent.full_name?.split('/')[1]}:undefined},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}]};
-    } catch (error) { if (!missing(error)) throw error; }
-
-    let owned = ownedCache.get(token)?.projects;
-    if (!owned || Date.now() - ownedCache.get(token)!.at > 60000) {
-      owned = [];
-      for (let page = 1; page <= 50; page++) {
-        report(`正在发现旧版同源目标：读取账号仓库第 ${page} 页…`);
-        const list = await api(`/user/repos?affiliation=owner&per_page=100&page=${page}`, token, { cache: 'no-store' }, signal);
-        if (!Array.isArray(list)) throw new Error('账号仓库列表读取失败，不能确认没有同源项目');
-        owned.push(...list.filter(item => item.owner?.login?.toLowerCase() === account.login.toLowerCase() && item.name !== REGISTRY_REPO));
-        if (list.length < 100) break;
-        if (page === 50) throw new Error('账号仓库列表未遍历完整，请先导入已有目标比较，未创建重复项目');
-      }
-      ownedCache.set(token, { at: Date.now(), projects: owned });
-    }
-    const legacy: AccountProject[] = [];
-    let checked = 0;
-    for (const repo of owned) {
-      signal.throwIfAborted();
-      report(`正在核对已有仓库来源 ${++checked}/${owned.length}…`);
-      if (repo.id === source.repositoryId || repo.owner?.login?.toLowerCase() === source.owner.toLowerCase() && repo.name.toLowerCase() === source.repo.toLowerCase()) continue;
-      let match = repo.name.toLowerCase() === source.repo.toLowerCase(), full = false;
-      let discovery: AccountProject['discovery'] = {kind:'name'};
-      if (repo.fork) {
-        const key = `${token}:${repo.id || `${repo.owner.login}/${repo.name}`}`;
-        let meta = parentCache.get(key)?.meta;
-        if (!meta || Date.now() - parentCache.get(key)!.at > 60000) { meta = await api(`/repos/${repo.owner.login}/${repo.name}`, token, { cache: 'no-store' }, signal); parentCache.set(key, {at: Date.now(), meta}); }
-        full = !!meta.parent && (source.repositoryId ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
-        match ||= full;
-        if(full) discovery={kind:'fork',source:{owner:source.owner,repo:source.repo}};
-      }
-      if (!match && !repo.fork) {
-        const key = `${token}:${repo.id || `${repo.owner.login}/${repo.name}`}`;
-        let provenance = provenanceCache.get(key);
-        if (!provenance || Date.now() - provenance.at > 60000) {
-          const root = `/repos/${repo.owner.login}/${repo.name}`, sources: Array<{owner:string;repo:string;branch:string}> = [];
-          const branches: string[] = [];
-          for (let page = 1; page <= 50; page++) {
-            const list = await api(`${root}/branches?per_page=100&page=${page}`, token, {}, signal);
-            if (!Array.isArray(list)) throw new Error('旧版托管仓库分支读取失败，未创建重复项目');
-            branches.push(...list.map(item => item.name)); if (list.length < 100) break;
-            if (page === 50) throw new Error('旧版托管仓库分支未完整遍历');
-          }
-          for (const branch of branches) {
-            try {
-              const file = await api(`${root}/contents/GITVAULT_METADATA.md?ref=${encodeURIComponent(branch)}`, token, {}, signal);
-              if (file.encoding !== 'base64' || file.size > 64000) continue;
-              const text = new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), char => char.charCodeAt(0)));
-              const original = readMetadataSource(text);
-              if (original) sources.push({ ...original, branch });
-            } catch (error) { if (!missing(error)) throw error; }
-          }
-          provenance = { at: Date.now(), sources }; provenanceCache.set(key, provenance);
-        }
-        // A generic managed marker says nothing about which upstream was saved.
-        const matching=provenance.sources.filter(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
-        match = matching.length > 0;
-        if(match) discovery={kind:'metadata',source:{owner:matching[0].owner,repo:matching[0].repo},branches:matching.map(item=>item.branch).sort()};
-      }
-      if (match) {
-        const branch=discovery.kind==='metadata' && !discovery.branches?.includes(source.branch) ? discovery.branches![0] : source.branch;
-        legacy.push({ source, discovery, target: { id: repo.id, owner: repo.owner.login, repo: repo.name }, kind: full ? 'full' : 'upload', state: 'active', createdByApp: false, bindings: { [source.branch]: { branch, updatedAt: '' } }, updatedAt: '' });
-      }
-    }
-    return { login: account.login, recorded: [], legacy };
+    const recorded=recordedFor(account,source);
+    if (recorded.length) return { login: account.login, recorded:structuredClone(recorded), legacy: [] as AccountProject[] };
+    const meta=await cachedName(`/repos/${account.login}/${source.repo}`,token,signal);
+    if(meta)return {login:account.login,recorded:[] as AccountProject[],legacy:availableLegacy(account,source,[legacyProject(source,meta)]),discoveryComplete:false};
+    // Reuse already saved evidence; a quick lookup never starts a remote scan.
+    try{const cached=await cachedDiscovery(account.login,signal);signal.throwIfAborted();return {login:account.login,recorded:[] as AccountProject[],legacy:availableLegacy(account,source,legacyRows(source,cached.rows)),discoveryComplete:false};}
+    catch(error){signal.throwIfAborted();report('旧版发现缓存暂不可读取；可在“查找已有仓库”中重试。');return {login:account.login,recorded:[] as AccountProject[],legacy:[] as AccountProject[],discoveryComplete:false,discoveryError:(error as Error).message};}
   };
-  return { read, save, reserve, reserveSwitch, completeSwitch, remove, candidates, invalidate: () => { ownedCache.clear(); parentCache.clear(); provenanceCache.clear(); } };
+  const discover = async (source:ProjectSource,token:string,signal=operationSignal(),refresh=false) => {
+    const account=await lookupRead(token,signal);
+    let rows:DiscoveryRow[];
+    try{rows=await scanAccountDiscovery(account.login,token,api,signal,report,refresh);}finally{discoveryEpoch++;}
+    return {login:account.login,recorded:structuredClone(recordedFor(account,source)),legacy:availableLegacy(account,source,legacyRows(source,rows)),discoveryComplete:true};
+  };
+  const search = async (source:ProjectSource,token:string,query:string,signal=operationSignal()) => {
+    signal.throwIfAborted();const account=await lookupRead(token,signal);const text=query.trim();
+    if(!text)throw new Error('请输入仓库关键词或完整仓库链接');
+    let repos:any[],incomplete=false;
+    const exact=/^(?:https?:\/\/(?:www\.)?github\.com\/)?([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(text);
+    if(exact)repos=[await api(`/repos/${exact[1]}/${exact[2]}`,token,{cache:'no-store'},signal)];
+    else{
+      // Treat user input as literal name terms; do not allow qualifiers to change the account scope.
+      const terms=text.match(/[\p{L}\p{N}_.-]+/gu)?.slice(0,8).join(' ')||'';
+      if(!terms||terms.length>120)throw new Error('请输入较短的仓库名称关键词');
+      const result=await api(`/search/repositories?q=${encodeURIComponent(`user:${account.login} ${terms} in:name fork:true`)}&per_page=30`,token,{cache:'no-store'},signal);
+      if(!Array.isArray(result.items))throw new Error('仓库搜索结果格式错误');
+      repos=result.items.filter((item:any)=>item.owner?.login?.toLowerCase()===account.login.toLowerCase());incomplete=!!result.incomplete_results||result.total_count>repos.length;
+    }
+    const recorded:AccountProject[]=[],legacy:AccountProject[]=[];let blocked=0;
+    const index=indexed(account.document);
+    for(const meta of repos){
+      const bound=[...(index.targetIds.get(meta.id)||[]),...(index.targetNames.get(nameKey({owner:meta.owner?.login||'',repo:meta.name||''}))||[])];
+      const same=bound.find(item=>sameSource(item.source,source));
+      if(same)recorded.push(structuredClone(same));
+      else if(bound.length)blocked++;
+      else if(meta.id!==source.repositoryId)legacy.push(legacyProject(source,meta,{kind:'search',fork:!!meta.fork}));
+    }
+    return {login:account.login,recorded,legacy,incomplete,blocked};
+  };
+  return { read, save, reserve, reserveSwitch, completeSwitch, remove, candidates, discover, search, invalidate: () => { epoch++;discoveryEpoch++;taskAccounts=new WeakMap(); } };
 }
 export const accountRegistry = createAccountRegistry();

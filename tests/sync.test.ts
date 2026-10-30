@@ -25,6 +25,14 @@ test('import comparison rejects a Fork with another upstream before reading its 
   await assert.rejects(githubClient.inspectImportTarget({ id: 77, owner: 'me', repo: 'fork', branch: 'main' }, 'token', { owner: 'source', repo: 'template' }), /上游与来源不一致/);
   assert.equal(calls.length, 1);
 });
+test('verified receipts skip tree reads only while the freshly checked branch commit still matches',async()=>{
+  let head='verified';
+  handler=path=>path==='/repos/me/project'?response({id:77,name:'project',owner:{login:'me'}}):path.includes('/commits/')?response({sha:head,commit:{tree:{sha:'changed-tree'}}}):path.includes('/git/trees/')?response({tree:[{path:'changed.txt',sha:'blob',type:'blob',mode:'100644'}]}):response({},404);
+  const target={id:77,owner:'me',repo:'project',branch:'dev'};
+  const same=await githubClient.inspectImportTarget(target,'token',undefined,'verified');assert.equal(same.receiptMatched,true);assert.ok(!calls.some(call=>call.path.includes('/git/trees/')));
+  head='changed';const changed=await githubClient.inspectImportTarget(target,'token',undefined,'verified');assert.equal(changed.receiptMatched,undefined);assert.equal(changed.tree[0].path,'changed.txt');
+  assert.ok(calls.some(call=>call.path.includes('/git/trees/changed-tree')));
+});
 test('missing target branch is offered for future creation only after repository and branch access are verified', async () => {
   handler = path => {
     if (path === '/repos/me/project') return response({ id: 77, default_branch: 'main' });

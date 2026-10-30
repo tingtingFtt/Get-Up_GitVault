@@ -1193,6 +1193,64 @@ test('batch sync shares complete-Fork transfers but refreshes every selected man
 function cloudEntry(full = false): AccountProject {
   return {source:{owner:'source',repo:'project',url:'https://github.com/source/project',branch:'develop',repositoryId:42},target:{id:77,owner:'destination',repo:'backup'},kind:full?'full':'upload',state:'active',createdByApp:true,branches:full?['develop','other']:undefined,bindings:{develop:{branch:'release',sourceSha:'import-new',commitSha:'target-current',updatedAt:'now'}},updatedAt:'now'};
 }
+test('manual candidate search runs on demand, filters candidates and binds only after an explicit comparison',async()=>{
+  importAssociationFixture();let searches=0;
+  accountRegistry.search=async(_source,_token,query)=>{searches++;assert.equal(query,'backup');return {login:'destination',recorded:[],legacy:[{...cloudEntry(),discovery:{kind:'search'}}],incomplete:false,blocked:0};};
+  await enterWorkbench();await click('分叉与私有仓');await click('查找已有上传／分叉仓库');await waitFor(()=>!!importDialog());
+  assert.equal(searches,0);assert.ok(!buttons().some(button=>button.textContent==='对比此项目'));
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="已有仓库关键词"]')!,'backup');assert.equal(searches,0);
+  await click('搜索当前账号');await waitFor(()=>importDialog()?.textContent?.includes('关键词／链接搜索（待确认）')===true);
+  assert.equal(searches,1);assert.equal(storedProjects()[0].uploadTarget,undefined);
+  await setField(document.querySelector<HTMLSelectElement>('[aria-label="候选类型筛选"]')!,'fork');assert.ok(!buttons().some(button=>button.textContent==='对比此项目'));
+  await setField(document.querySelector<HTMLSelectElement>('[aria-label="候选类型筛选"]')!,'pending');
+  await click('对比此项目');await waitFor(()=>buttons().some(button=>button.textContent==='沿用上传目标'&&!button.disabled));
+  await click('沿用上传目标');await waitFor(()=>alerts.some(message=>message.includes('保存固定目标')));
+  assert.equal(storedProjects()[0].uploadTarget.id,77);assert.equal(storedProjects()[0].uploadTarget.branch,'release');
+  assert.equal((await localCache.getProjectFiles('tracked','v2'))[0].content,'new');
+  assert.ok(requests.every(request=>!request.payload));
+});
+test('manual discovery can be cancelled without cancelling the parent picker and can be retried',async()=>{
+  let starts=0;
+  accountRegistry.discover=async(_source,_token,signal)=>{starts++;return new Promise((_resolve,reject)=>signal!.addEventListener('abort',()=>reject(signal!.reason),{once:true}));};
+  await enterWorkbench();await click('上传指定仓库');await click('查找已有上传／分叉仓库');await click('继续完整发现');await waitFor(()=>starts===1);
+  await click('取消查找');await waitFor(()=>importDialog()?.textContent?.includes('查找已取消')===true);
+  assert.ok(importDialog());assert.equal(storedProjects()[0].uploadTarget,undefined);
+  await click('继续完整发现');await waitFor(()=>starts===2);await click('取消本次导入');await waitFor(()=>!importDialog());
+  assert.ok(requests.every(request=>!request.payload));
+});
+test('a fresh synced receipt verifies identity and current head without rereading the target tree',async()=>{
+  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture({identical:true});
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry()],legacy:[]});
+  await importSourceLink();await waitFor(()=>alerts.length>0);
+  assert.ok(requests.some(request=>request.path==='/repos/destination/backup'));
+  assert.ok(requests.some(request=>request.path==='/repos/destination/backup/commits/release'));
+  assert.ok(!requests.some(request=>request.path.includes('/git/trees/compare-tree')));
+  assert.equal(storedProjects()[0].accountState,'synced');
+});
+test('project type and full source-link filters scope the existing bulk quick selection',async()=>{
+  const second={...boundProject(),id:'bound',owner:'other',repo:'different',url:'https://github.com/other/different'};
+  await reloadProjects([repo(),second]);await click('仓库已有项目 (2)');
+  await setField(document.querySelector<HTMLSelectElement>('[aria-label="项目类型筛选"]')!,'unbound');
+  await input('搜索项目名称、备注、详细描述或标签...','https://github.com/source/project');
+  await click('仅选未上传');assert.ok(document.body.textContent?.includes('已选定 1 / 1 个项目'));
+});
+test('optional search before pulling opens an empty picker before downloading any source bytes',async()=>{
+  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture();
+  await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','查找后拉取');
+  const check=document.querySelector<HTMLInputElement>('input[type=checkbox]')!;await act(async()=>check.click());
+  await click('确认拉取进入本地');await waitFor(()=>!!importDialog());
+  assert.ok(importDialog()?.textContent?.includes('快速查询暂无候选'));assert.ok(!requests.some(request=>request.path.includes('/git/blobs/')||request.path.includes('/zipball/')));
+  await click('独立导入，不关联');await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].latestCommitSha,'import-new');assert.equal(storedProjects()[0].uploadTarget,undefined);
+});
+test('a keyword Fork candidate becomes a full Fork binding only after checking its actual upstream',async()=>{
+  importAssociationFixture({full:true});
+  accountRegistry.search=async()=>({login:'destination',recorded:[],legacy:[{...cloudEntry(),discovery:{kind:'search',fork:true}}],incomplete:false,blocked:0});
+  await enterWorkbench();await click('分叉与私有仓');await click('查找已有上传／分叉仓库');
+  await setField(document.querySelector<HTMLInputElement>('[aria-label="已有仓库关键词"]')!,'backup');await click('搜索当前账号');
+  await waitFor(()=>buttons().some(button=>button.textContent==='对比此项目'));await click('对比此项目');
+  await waitFor(()=>buttons().some(button=>button.textContent==='沿用分叉同步'&&!button.disabled));await click('沿用分叉同步');await waitFor(()=>alerts.length>0);
+  assert.equal(storedProjects()[0].forkScope,'full');assert.equal(storedProjects()[0].forkTarget.id,77);assert.equal(storedProjects()[0].uploadTarget.branch,'release');
+});
 test('a fresh device importing the original link restores the account target and synced receipt without uploading', async () => {
   localStorage.setItem('gitvault_global_token','account-token'); await reloadProjects([]); importAssociationFixture({identical:true});
   accountRegistry.candidates = async () => ({login:'destination',recorded:[cloudEntry()],legacy:[]});
@@ -1507,6 +1565,7 @@ test('HTTP difference can update the selected existing branch immediately while 
 });
 test('HTTP renaming keeps ID, updates shared primary location and can be recovered on another device',async()=>{
  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'renamed-copy');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].primarySource?.repo==='renamed-copy');
+ await waitFor(()=>!document.querySelector('span[title].whitespace-pre-wrap'));
  const id=storedProjects()[0].uploadTarget.id;(globalThis as any).prompt=()=> 'renamed-again';await click('分叉与私有仓');await click('修改项目名称');await waitFor(()=>storedProjects()[0].uploadTarget.repo==='renamed-again');assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');assert.equal(server.document().projects[0].target.repo,'renamed-again');
  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');
 });

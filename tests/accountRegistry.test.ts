@@ -1,4 +1,7 @@
-import { test } from 'node:test';
+import { test,beforeEach } from 'node:test';
+import 'fake-indexeddb/auto';
+import {discoveryStore} from '../src/utils/accountDiscovery';
+beforeEach(async()=>{await discoveryStore.clear('me');});
 import assert from 'node:assert/strict';
 import { createAccountRegistry, ExistingSourceError, REGISTRY_REPO, type AccountProject } from '../src/utils/accountRegistry';
 import { GitHubError, beginGithubOperation } from '../src/utils/githubClient';
@@ -43,7 +46,7 @@ function fixture(options: { exists?: boolean; owned?: any[]; document?: any; con
 test('read-only discovery does not create a repository and quota errors never imply no existing source', async () => {
   const f = fixture(); assert.deepEqual((await f.registry.candidates(source, 'token')).recorded, []);
   assert.ok(f.requests.every(request => request.method === 'GET'));
-  const limited = fixture({ failList: true }); await assert.rejects(limited.registry.candidates(source, 'token'), (error: any) => error.rateLimited);
+  const limited = fixture({ failList: true }); await assert.rejects(limited.registry.discover(source, 'token'), (error: any) => error.rateLimited);
   assert.ok(limited.requests.every(request => request.method === 'GET'));
 });
 test('first reservation creates a private account index with no tokens or source bytes and locks the chosen name across clients', async () => {
@@ -209,7 +212,7 @@ test('legacy native Forks and renamed app uploads require comparison and scan br
     if (path.endsWith('GITVAULT_METADATA.md?ref=feature%2Fx')) return {encoding:'base64',size:100,content:Buffer.from('# copy\n\nhttps://github.com/upstream/source').toString('base64')};
     return f.api(path, ...args);
   };
-  const result = await createAccountRegistry(legacyApi).candidates(source,'token');
+  const result = await createAccountRegistry(legacyApi).discover(source,'token');
   assert.equal(result.recorded.length,0); assert.equal(result.legacy.length,2); assert.equal(result.legacy[0].kind,'full');
   assert.ok(result.legacy.every(entry=>!entry.createdByApp));
   assert.equal(result.legacy.find(entry=>entry.target.id===78)?.bindings.main.branch,'feature/x');
@@ -225,7 +228,7 @@ test('legacy provenance is reused during a batch instead of querying every Fork 
     return f.api(path,...args);
   };
   const registry=createAccountRegistry(api);
-  await registry.candidates(source,'token');await registry.candidates({...source,repo:'different',repositoryId:123},'token');
+  await registry.discover(source,'token');await registry.discover({...source,repo:'different',repositoryId:123},'token');
   assert.equal(parents,1);assert.equal(branches,1);assert.equal(files,1);
 });
 test('a modified project mentioning the original upstream in its description is not that upstreams uploaded target',async()=>{
@@ -236,13 +239,14 @@ test('a modified project mentioning the original upstream in its description is 
     return f.api(path,...args);
   };
   const registry=createAccountRegistry(api);
-  assert.equal((await registry.candidates(source,'token')).legacy.length,0);
-  const actual=await registry.candidates({...source,owner:'modified',repositoryId:43},'token');
+  assert.equal((await registry.discover(source,'token')).legacy.length,0);
+  const actual=await registry.discover({...source,owner:'modified',repositoryId:43},'token');
   assert.equal(actual.legacy.length,1);
   assert.deepEqual(actual.legacy[0].discovery,{kind:'metadata',source:{owner:'modified',repo:'source'},branches:['main']});
 });
 test('a managed marker without matching provenance never associates an unrelated repository',async()=>{
   for(const metadata of [undefined,'https://github.com/someone/different','https://github.com/upstream/source']){
+    await discoveryStore.clear('me');
     const f=fixture({owned:[{id:78,name:'unrelated-name',owner:{login:'me'},description:'[GitVault 托管]'}]});
     const api=async(path:string,...args:any[])=>{
       if(path.startsWith('/repos/me/unrelated-name/branches?'))return [{name:'main'}];
@@ -253,8 +257,8 @@ test('a managed marker without matching provenance never associates an unrelated
       return f.api(path,...args);
     };
     const registry=createAccountRegistry(api);
-    assert.equal((await registry.candidates(source,'token')).legacy.length,metadata==='https://github.com/upstream/source'?1:0);
-    assert.equal((await registry.candidates({...source,repo:'another',repositoryId:123},'token')).legacy.length,0);
+    assert.equal((await registry.discover(source,'token')).legacy.length,metadata==='https://github.com/upstream/source'?1:0);
+    assert.equal((await registry.discover({...source,repo:'another',repositoryId:123},'token')).legacy.length,0);
     assert.ok(f.requests.every(request=>request.method==='GET'));
   }
 });
@@ -279,4 +283,87 @@ test('profile-only changes retain branch receipts and store no target credential
   const f=fixture();await f.registry.save(project(),'token');
   await f.registry.save(project({target:{...project().target,token:'never-store'} as any,profile:{tags:['B'],remark:'name',description:'description',updatedAt:'2026-10-16T09:00:00Z'},bindings:{main:{branch:'release',updatedAt:'later'}}}),'token');
   assert.equal(f.document().projects[0].bindings.main.commitSha,'target-v1');assert.deepEqual(f.document().projects[0].profile.tags,['B']);assert.ok(!JSON.stringify(f.document()).includes('never-store'));
+});
+
+
+test('100 indexed sources share one snapshot read without listing repositories or branches',async()=>{
+  const projects=Array.from({length:100},(_,i)=>project({source:{...source,repo:'source-'+i,repositoryId:1000+i},target:{id:2000+i,owner:'me',repo:'target-'+i}}));
+  const f=fixture({document:{app:'Get-Up_GitVault',version:1,account:'me',projects}});
+  for(const item of projects)assert.equal((await f.registry.candidates(item.source,'token')).recorded[0].target.id,item.target.id);
+  assert.equal(f.requests.filter(r=>r.path===`/repos/me/${REGISTRY_REPO}`).length,1);
+  assert.equal(f.requests.filter(r=>r.path.includes('/contents/gitvault.json')).length,1);
+  assert.equal(f.requests.filter(r=>r.path.startsWith('/user/repos?')||r.path.includes('/branches')).length,0);
+});
+test('quick lookup does not scan old repositories and coalesces concurrent account reads',async()=>{
+  const f=fixture({owned:[{id:78,name:'renamed',owner:{login:'me'}}]});
+  await Promise.all(Array.from({length:20},(_,i)=>f.registry.candidates({...source,repo:'project-'+i},'token')));
+  assert.equal(f.requests.filter(r=>r.path===`/repos/me/${REGISTRY_REPO}`).length,1);
+  assert.equal(f.requests.filter(r=>r.path.startsWith('/user/repos?')).length,0);
+  assert.ok(f.requests.every(r=>r.method==='GET'));
+});
+test('a write refreshes the lookup snapshot and reservation still rechecks another clients binding',async()=>{
+  const f=fixture();await f.registry.candidates(source,'token');await f.registry.save(project(),'token');
+  const reads=f.requests.filter(r=>r.path.includes('/contents/gitvault.json')).length;
+  assert.equal((await f.registry.candidates(source,'token')).recorded[0].target.id,77);
+  assert.equal(f.requests.filter(r=>r.path.includes('/contents/gitvault.json')).length,reads);
+  const other=createAccountRegistry(f.api);await other.save(project({source:{...source,repositoryId:43,repo:'other'},target:{id:88,owner:'me',repo:'other-target'}}),'token');
+  await assert.rejects(f.registry.reserve({...source,repositoryId:43,repo:'other'},'duplicate','upload','token'),ExistingSourceError);
+});
+test('fresh lookup detects another devices changed registry head before using an old target',async()=>{
+  const f=fixture();await f.registry.save(project(),'token');await f.registry.candidates(source,'token');
+  const other=createAccountRegistry(f.api);await other.remove(project().target,'token');await other.save(project({target:{id:88,owner:'me',repo:'new-fixed'}}),'token');
+  assert.equal((await f.registry.candidates(source,'token',new AbortController().signal)).recorded[0].target.id,88);
+  // The original batch also detects the new head, rather than reusing its old cached mapping.
+  assert.equal((await f.registry.candidates(source,'token',undefined,{fresh:true})).recorded[0].target.id,88);
+});
+test('keyword search is account-scoped, includes forks and does not read each results files',async()=>{
+  const f=fixture();const api=async(path:string,...args:any[])=>{
+    if(path.startsWith('/search/repositories?'))return {items:[{id:78,name:'source-copy',owner:{login:'me'},fork:true},{id:99,name:'source',owner:{login:'outsider'}}],total_count:2,incomplete_results:true};
+    return f.api(path,...args);
+  };
+  let query='';const registry=createAccountRegistry(async(path,...args)=>{if(path.startsWith('/search/'))query=new URL(path,'https://api.github.com').searchParams.get('q')||'';return api(path,...args);});
+  const found=await registry.search(source,'token','source user:outsider');
+  assert.ok(query.includes('user:me'));assert.ok(!query.includes('user:outsider'));assert.ok(query.includes('fork:true'));
+  assert.equal(found.legacy.length,1);assert.equal(found.legacy[0].discovery?.kind,'search');assert.equal(found.legacy[0].discovery?.fork,true);assert.equal(found.incomplete,true);
+  assert.ok(!f.requests.some(r=>r.path.includes('/branches')||r.path.includes('GITVAULT_METADATA')));
+});
+test('explicit search excludes destinations fixed to other sources and does not bind by name',async()=>{
+  const f=fixture();await f.registry.save(project(),'token');
+  const api=async(path:string,...args:any[])=>path==='/repos/me/fixed-name'?{id:77,name:'fixed-name',owner:{login:'me'}}:f.api(path,...args);
+  const found=await createAccountRegistry(api).search({...source,repositoryId:43,repo:'different'},'token','https://github.com/me/fixed-name');
+  assert.equal(found.legacy.length,0);assert.equal(found.recorded.length,0);assert.equal(found.blocked,1);
+});
+test('cancelled full discovery resumes saved branches across registry recreation without rereading completed work',async()=>{
+  const f=fixture({owned:[{id:78,name:'saved-copy',owner:{login:'me'},fork:false}]});
+  const controller=new AbortController();let first=0,second=0,blocked=false;
+  const api=async(path:string,...args:any[])=>{
+    if(path.includes('/branches?'))return [{name:'one'},{name:'two'}];
+    if(path.endsWith('ref=one')){first++;return {encoding:'base64',size:20,content:Buffer.from('https://github.com/upstream/source').toString('base64')};}
+    if(path.endsWith('ref=two')){second++;if(!blocked){blocked=true;controller.abort();controller.signal.throwIfAborted();}throw new GitHubError('missing',404);}
+    return f.api(path,...args);
+  };
+  await assert.rejects(createAccountRegistry(api).discover(source,'token',controller.signal),{name:'AbortError'});
+  const resumed=await createAccountRegistry(api).discover(source,'token');
+  assert.equal(resumed.legacy.length,1);assert.equal(first,1);assert.equal(second,2);
+  assert.equal(f.requests.filter(r=>r.path.startsWith('/user/repos?')).length,1);
+  await createAccountRegistry(api).discover(source,'token');assert.equal(first,1);assert.equal(second,2);
+});
+test('a new operation does not reuse a failed or previous accounts index',async()=>{
+  const f=fixture();await f.registry.candidates(source,'token');const before=f.requests.length;
+  beginGithubOperation();await f.registry.candidates(source,'token');assert.ok(f.requests.length>before);
+});
+test('quick lookups reuse durable completed provenance without a new repository or branch scan',async()=>{
+  const f=fixture({owned:[{id:78,name:'renamed-copy',owner:{login:'me'},fork:false}]});
+  const api=async(path:string,...args:any[])=>path.includes('/branches?')?[{name:'main'}]:path.includes('GITVAULT_METADATA')?{encoding:'base64',size:40,content:Buffer.from('https://github.com/upstream/source').toString('base64')}:f.api(path,...args);
+  await createAccountRegistry(api).discover(source,'token');const requests=f.requests.length;
+  beginGithubOperation();const found=await createAccountRegistry(api).candidates(source,'token');
+  assert.equal(found.legacy[0].target.id,78);
+  assert.ok(!f.requests.slice(requests).some(request=>request.path.startsWith('/user/repos?')||request.path.includes('/branches')));
+});
+test('refresh clears completed discovery evidence and retrieves changed metadata',async()=>{
+  const f=fixture({owned:[{id:78,name:'copy',owner:{login:'me'},fork:false}]});let original=true;
+  const api=async(path:string,...args:any[])=>path.includes('/branches?')?[{name:'main'}]:path.includes('GITVAULT_METADATA')?{encoding:'base64',size:40,content:Buffer.from(original?'https://github.com/upstream/source':'https://github.com/different/source').toString('base64')}:f.api(path,...args);
+  const registry=createAccountRegistry(api);assert.equal((await registry.discover(source,'token')).legacy.length,1);original=false;
+  assert.equal((await registry.discover(source,'token',undefined,true)).legacy.length,0);
+  assert.equal(f.requests.filter(request=>request.path.startsWith('/user/repos?')).length,2);
 });
