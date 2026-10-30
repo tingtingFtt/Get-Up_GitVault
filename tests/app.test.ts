@@ -296,6 +296,8 @@ test('purged source can be recovered from its exact original commit after the ol
   deletedTargetFixture({ recreate: true, restoreSource: true }); await openDeletedTargetManager();
   await click('解除此目标的所有绑定'); await click('重新设置上传'); await click('立即新建私人仓库并上传');
   await waitFor(() => storedProjects()[0].remoteSnapshot?.repoId === 99);
+  // The receipt appears before the account record and cache-state markers finish saving.
+  await waitFor(() => alerts.some(message => message.includes('已验证完整上传')));
   assert.equal((await localCache.getProjectFiles('tracked', 'v2'))[0].content, 'new');
   assert.equal(storedProjects()[0].isCachePurged, false); assert.ok(requests.some(request => request.path === '/repos/source/project/commits/v2'));
   assert.ok(!requests.some(request => request.path.includes('/commits/deleted-target-commit')));
