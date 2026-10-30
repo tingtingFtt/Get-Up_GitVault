@@ -212,6 +212,7 @@ test('legacy native Forks and renamed app uploads require comparison and scan br
   const result = await createAccountRegistry(legacyApi).candidates(source,'token');
   assert.equal(result.recorded.length,0); assert.equal(result.legacy.length,2); assert.equal(result.legacy[0].kind,'full');
   assert.ok(result.legacy.every(entry=>!entry.createdByApp));
+  assert.equal(result.legacy.find(entry=>entry.target.id===78)?.bindings.main.branch,'feature/x');
   assert.ok(f.requests.every(request=>request.method==='GET'));
 });
 test('legacy provenance is reused during a batch instead of querying every Fork and branch for each source', async()=>{
@@ -226,6 +227,19 @@ test('legacy provenance is reused during a batch instead of querying every Fork 
   const registry=createAccountRegistry(api);
   await registry.candidates(source,'token');await registry.candidates({...source,repo:'different',repositoryId:123},'token');
   assert.equal(parents,1);assert.equal(branches,1);assert.equal(files,1);
+});
+test('a modified project mentioning the original upstream in its description is not that upstreams uploaded target',async()=>{
+  const f=fixture({owned:[{id:78,name:'saved-modified',owner:{login:'me'},fork:false}]});
+  const api=async(path:string,...args:any[])=>{
+    if(path.startsWith('/repos/me/saved-modified/branches?'))return [{name:'main'}];
+    if(path.includes('GITVAULT_METADATA.md'))return {encoding:'base64',size:300,content:Buffer.from('# modified\n\nhttps://github.com/upstream/source\n\nhttps://github.com/modified/source').toString('base64')};
+    return f.api(path,...args);
+  };
+  const registry=createAccountRegistry(api);
+  assert.equal((await registry.candidates(source,'token')).legacy.length,0);
+  const actual=await registry.candidates({...source,owner:'modified',repositoryId:43},'token');
+  assert.equal(actual.legacy.length,1);
+  assert.deepEqual(actual.legacy[0].discovery,{kind:'metadata',source:{owner:'modified',repo:'source'},branches:['main']});
 });
 test('a managed marker without matching provenance never associates an unrelated repository',async()=>{
   for(const metadata of [undefined,'https://github.com/someone/different','https://github.com/upstream/source']){

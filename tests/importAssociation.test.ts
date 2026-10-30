@@ -1,9 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { importCandidates, compareImportTrees } from '../src/utils/importAssociation';
+import { importCandidates, compareImportTrees, candidateExclusion, isExcludedCandidate, type ImportCandidate } from '../src/utils/importAssociation';
 
 const source = { owner: 'author', repo: 'template', url: 'https://github.com/author/template', branch: 'develop' };
 const target = { id: 77, owner: 'me', repo: 'renamed-project', branch: 'release', purgeAfterUpload: true, kind: 'upload' as const };
+test('unrelated decisions are scoped to source, account, target identity and evidence; confirmed bindings override them', () => {
+  const candidate:ImportCandidate={key:'test',projectId:'',remark:'',source,target,fullFork:false,confirmed:false,account:'ME'};
+  const excluded=[candidateExclusion(candidate,{...source,repositoryId:42})!];
+  assert.equal(isExcludedCandidate(candidate,{...source,repositoryId:42},excluded),true);
+  assert.equal(isExcludedCandidate({...candidate,account:'other'},source,excluded),false);
+  assert.equal(isExcludedCandidate({...candidate,target:{...target,id:99}},source,excluded),false);
+  assert.equal(isExcludedCandidate(candidate,{...source,repositoryId:43},excluded),false);
+  assert.equal(isExcludedCandidate({...candidate,confirmed:true},source,excluded),false);
+  assert.equal(isExcludedCandidate({...candidate,accountRecord:{discovery:{kind:'metadata',source:{owner:'author',repo:'template'}}} as any},source,excluded),false);
+});
+test('recreated repositories with different IDs cannot inherit a same-address source binding', () => {
+  assert.equal(importCandidates([{...source,repositoryId:42,id:'old',uploadTarget:target}],{...source,repositoryId:43}).length,0);
+});
 test('import matching uses recorded source identity, preserves renamed targets and exact branch mappings', () => {
   const projects = [{ ...source, id: 'old', uploadTarget: target, branchTargets: { develop: target } }];
   const exact = importCandidates(projects, { ...source, owner: 'AUTHOR' });

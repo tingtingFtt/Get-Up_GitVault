@@ -1,4 +1,5 @@
-import { githubApi, GitHubError, operationSignal, parseRepository } from './githubClient';
+import { readMetadataSource } from './projectProvenance';
+import { githubApi, GitHubError, operationSignal } from './githubClient';
 import type { ProjectSource } from './projectModel';
 import type { TargetIdentity } from './targetLifecycle';
 
@@ -31,6 +32,7 @@ const report = (message: string) => { if (typeof window !== 'undefined') window.
 export interface TargetHistory { target: TargetIdentity; kind: 'upload' | 'current' | 'full'; bindings: AccountProject['bindings']; changedAt: string }
 export interface AccountProject {
   source: ProjectSource; target: TargetIdentity;
+  discovery?: { kind: 'name' | 'fork' | 'metadata'; source?: {owner:string;repo:string}; branches?: string[] };
   kind: 'upload' | 'current' | 'full'; state: 'reserved' | 'active';
   createdByApp: boolean; reservationId?: string; branches?: string[];
   bindings: Record<string, { branch: string; sourceSha?: string; commitSha?: string; updatedAt: string }>;
@@ -80,7 +82,7 @@ function validateDocument(value: any, login: string): RegistryDocument {
 export function createAccountRegistry(api = githubApi, wait = retryDelay) {
   const ownedCache = new Map<string, { at: number; projects: any[] }>();
   const parentCache = new Map<string, { at: number; meta: any }>();
-  const provenanceCache = new Map<string, { at: number; sources: Array<{owner:string;repo:string}> }>();
+  const provenanceCache = new Map<string, { at: number; sources: Array<{owner:string;repo:string;branch:string}> }>();
   const read = async (token: string, signal = operationSignal(), create = false, commitRef?: string) => {
     if (!token) throw new Error('跨设备识别需要 GitHub Token，请在设置中填写可访问账号仓库的凭证');
     const user = await api('/user', token, {}, signal);
@@ -227,7 +229,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
       let meta:any;
       try{meta=await api(`/repos/${user.login}/${source.repo}`,token,{cache:'no-store'},signal);}catch{throw registryError;}
       const full=!!meta.fork&&!!meta.parent&&(source.repositoryId&&meta.parent.id?source.repositoryId===meta.parent.id:meta.parent.full_name?.toLowerCase()===`${source.owner}/${source.repo}`.toLowerCase());
-      return {login:user.login as string,recorded:[] as AccountProject[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || user.login,repo:meta.name || source.repo,private:meta.private},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}],registryError:(registryError as Error).message};
+      return {login:user.login as string,recorded:[] as AccountProject[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || user.login,repo:meta.name || source.repo,private:meta.private},discovery:{kind:full?'fork' as const:'name' as const,source:full?{owner:meta.parent.owner?.login || meta.parent.full_name?.split('/')[0],repo:meta.parent.name || meta.parent.full_name?.split('/')[1]}:undefined},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}],registryError:(registryError as Error).message};
     }
     let recorded = account.document.projects.filter(item => sameSource(item.source, source));
     if (!recorded.length) recorded = account.document.projects.filter(item => source.repositoryId && item.target.id ? source.repositoryId === item.target.id : item.target.owner.toLowerCase() === source.owner.toLowerCase() && item.target.repo.toLowerCase() === source.repo.toLowerCase());
@@ -235,7 +237,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     try {
       const meta = await api(`/repos/${account.login}/${source.repo}`, token, {cache:'no-store'}, signal);
       const full = !!meta.fork && !!meta.parent && (source.repositoryId && meta.parent.id ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
-      return {login:account.login,recorded:[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || account.login,repo:meta.name || source.repo,private:meta.private},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}]};
+      return {login:account.login,recorded:[],legacy:[{source,target:{id:meta.id,owner:meta.owner?.login || account.login,repo:meta.name || source.repo,private:meta.private},discovery:{kind:full?'fork' as const:'name' as const,source:full?{owner:meta.parent.owner?.login || meta.parent.full_name?.split('/')[0],repo:meta.parent.name || meta.parent.full_name?.split('/')[1]}:undefined},kind:full?'full' as const:'upload' as const,state:'active' as const,createdByApp:false,bindings:{[source.branch]:{branch:source.branch,updatedAt:''}},updatedAt:''}]};
     } catch (error) { if (!missing(error)) throw error; }
 
     let owned = ownedCache.get(token)?.projects;
@@ -258,18 +260,20 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
       report(`正在核对已有仓库来源 ${++checked}/${owned.length}…`);
       if (repo.id === source.repositoryId || repo.owner?.login?.toLowerCase() === source.owner.toLowerCase() && repo.name.toLowerCase() === source.repo.toLowerCase()) continue;
       let match = repo.name.toLowerCase() === source.repo.toLowerCase(), full = false;
+      let discovery: AccountProject['discovery'] = {kind:'name'};
       if (repo.fork) {
         const key = `${token}:${repo.id || `${repo.owner.login}/${repo.name}`}`;
         let meta = parentCache.get(key)?.meta;
         if (!meta || Date.now() - parentCache.get(key)!.at > 60000) { meta = await api(`/repos/${repo.owner.login}/${repo.name}`, token, { cache: 'no-store' }, signal); parentCache.set(key, {at: Date.now(), meta}); }
         full = !!meta.parent && (source.repositoryId ? meta.parent.id === source.repositoryId : meta.parent.full_name?.toLowerCase() === `${source.owner}/${source.repo}`.toLowerCase());
         match ||= full;
+        if(full) discovery={kind:'fork',source:{owner:source.owner,repo:source.repo}};
       }
       if (!match && !repo.fork) {
         const key = `${token}:${repo.id || `${repo.owner.login}/${repo.name}`}`;
         let provenance = provenanceCache.get(key);
         if (!provenance || Date.now() - provenance.at > 60000) {
-          const root = `/repos/${repo.owner.login}/${repo.name}`, sources: Array<{owner:string;repo:string}> = [];
+          const root = `/repos/${repo.owner.login}/${repo.name}`, sources: Array<{owner:string;repo:string;branch:string}> = [];
           const branches: string[] = [];
           for (let page = 1; page <= 50; page++) {
             const list = await api(`${root}/branches?per_page=100&page=${page}`, token, {}, signal);
@@ -282,15 +286,21 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
               const file = await api(`${root}/contents/GITVAULT_METADATA.md?ref=${encodeURIComponent(branch)}`, token, {}, signal);
               if (file.encoding !== 'base64' || file.size > 64000) continue;
               const text = new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), char => char.charCodeAt(0)));
-              for (const line of text.split(/\r?\n/)) { try { sources.push(parseRepository(line.trim())); } catch { /* only source links */ } }
+              const original = readMetadataSource(text);
+              if (original) sources.push({ ...original, branch });
             } catch (error) { if (!missing(error)) throw error; }
           }
           provenance = { at: Date.now(), sources }; provenanceCache.set(key, provenance);
         }
         // A generic managed marker says nothing about which upstream was saved.
-        match = provenance.sources.some(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
+        const matching=provenance.sources.filter(item => item.owner.toLowerCase() === source.owner.toLowerCase() && item.repo.toLowerCase() === source.repo.toLowerCase());
+        match = matching.length > 0;
+        if(match) discovery={kind:'metadata',source:{owner:matching[0].owner,repo:matching[0].repo},branches:matching.map(item=>item.branch).sort()};
       }
-      if (match) legacy.push({ source, target: { id: repo.id, owner: repo.owner.login, repo: repo.name }, kind: full ? 'full' : 'upload', state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' });
+      if (match) {
+        const branch=discovery.kind==='metadata' && !discovery.branches?.includes(source.branch) ? discovery.branches![0] : source.branch;
+        legacy.push({ source, discovery, target: { id: repo.id, owner: repo.owner.login, repo: repo.name }, kind: full ? 'full' : 'upload', state: 'active', createdByApp: false, bindings: { [source.branch]: { branch, updatedAt: '' } }, updatedAt: '' });
+      }
     }
     return { login: account.login, recorded: [], legacy };
   };

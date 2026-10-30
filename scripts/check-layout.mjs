@@ -17,7 +17,7 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release', 'records-storage-error', 'records-large', 'records-startup-error'];
+const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'import-unconfirmed', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release', 'records-storage-error', 'records-large', 'records-startup-error'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
@@ -44,6 +44,8 @@ if (new URLSearchParams(location.search).has('audit-import') || new URLSearchPar
   const target = { id: 77, owner: 'destination-with-a-long-owner-name', repo: 'renamed-repository-'.repeat(6), branch: 'release/' + 'long-branch-'.repeat(8), purgeAfterUpload: false };
   fixture.url = 'https://github.com/' + fixture.owner + '/' + fixture.repo;
   fixture.uploadTarget = target;
+  const unconfirmed=new URLSearchParams(location.search).get('audit-import')==='unconfirmed';
+  if(unconfirmed){delete fixture.uploadTarget;localStorage.setItem('gitvault_global_token','audit-token');}
   window.__auditTarget = target;
   const switchScene=new URLSearchParams(location.search).get('audit-switch');
   if(switchScene==='switch-pending')fixture.pendingSwitch={reservationId:'audit',sourceSha:fixture.latestCommitSha,sourceBranch:fixture.branch,oldTarget:target,request:{mode:'existing',name:target.owner+'/new-'+target.repo,branch:target.branch,purge:false},result:{verified:true,repoId:99,owner:target.owner,repo:'new-'+target.repo,branch:target.branch,commitSha:'saved-new',htmlUrl:'https://github.com/example/new'}};
@@ -58,6 +60,8 @@ if (new URLSearchParams(location.search).has('audit-import') || new URLSearchPar
     if (!url.includes('api.github.com') && !url.includes('codeload.github.com')) return original(input, init);
     if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
     const reply = value => new Response(JSON.stringify(value), {headers:{'Content-Type':'application/json'}});
+    if(unconfirmed && path==='/user')return reply({login:target.owner});
+    if(unconfirmed && path==='/repos/'+target.owner+'/'+fixture.repo)return reply({...target,owner:{login:target.owner},name:target.repo});
     if (path === sourceRoot) return reply({id:42, default_branch:fixture.branch, owner:{login:fixture.owner}, name:fixture.repo, html_url:fixture.url});
     if (path === targetRoot) {
       const state = new URLSearchParams(location.search).get('audit-target');
@@ -130,7 +134,7 @@ function inspect(doc, width, scenario) {
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario==='records-startup-error'?'?audit-records-error=1':scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario==='records-startup-error'?'?audit-records-error=1':scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':scenario==='import-unconfirmed'?'unconfirmed':'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       let doc = frame.contentDocument;
       const ready=()=>scenario==='records-startup-error'?buttons(doc).some(button=>button.textContent==='导出可读取记录备份'):doc.querySelector('.app-header');
       for(let tries=0;tries<100&&!ready();tries++)await pause();
@@ -181,7 +185,10 @@ function inspect(doc, width, scenario) {
         await click(doc,'确认拉取进入本地');
         for(let tries=0;tries<100&&!doc.querySelector('[aria-label="选择已有项目作为同步基础"]');tries++) await pause();
         if(!doc.querySelector('[aria-label="选择已有项目作为同步基础"]')) throw new Error('Import match dialog did not open');
-        if(scenario!=='import-match') {
+        if(scenario==='import-unconfirmed') {
+          if(!buttons(doc).some(button=>button.textContent==='这是不同项目，不再关联此候选'))throw new Error('Missing unrelated candidate control');
+          if(!doc.body.textContent.includes('仓库同名（待确认）'))throw new Error('Missing candidate evidence');
+        } else if(scenario!=='import-match') {
           await click(doc,'对比此项目');
           for(let tries=0;tries<100&&doc.body.textContent.includes('正在校验仓库身份并对比文件');tries++) await pause();
           if(scenario==='import-error'&&!doc.body.textContent.includes('身份已变化')) throw new Error('Expected identity comparison error');

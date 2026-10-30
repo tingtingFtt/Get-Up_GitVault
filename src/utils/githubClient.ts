@@ -1,3 +1,4 @@
+import { sourceMarker } from './projectProvenance';
 import {usesNativeFolder, beginFolder, putFolderFile, finishFolder, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, type FolderFiles} from './nativeFolder';
 import { gitBlobSha, gitTreeSha } from './gitFiles';
 import {beginGithubOperation, cancelGithubOperation, operationSignal, cooperate} from './operation';
@@ -457,7 +458,7 @@ export const githubClient = {
     const allFiles = [...files];
     if (description || remark || originalSourceUrl) {
       // Preserve a source project file with this name rather than silently overwriting it.
-      if (!allFiles.some(f => f.path === 'GITVAULT_METADATA.md')) allFiles.push({ path: 'GITVAULT_METADATA.md', content: [`# ${targetRepo}`, description || '', remark || '', originalSourceUrl || ''].join('\n\n'), isBase64: false });
+      if (!allFiles.some(f => f.path === 'GITVAULT_METADATA.md')) allFiles.push({ path: 'GITVAULT_METADATA.md', content: [`# ${targetRepo}`, description || '', remark || '', originalSourceUrl || '', sourceMarker(originalSourceUrl)].filter(Boolean).join('\n\n'), isBase64: false });
     }
     const paths = new Set<string>();
     for (const file of allFiles) {

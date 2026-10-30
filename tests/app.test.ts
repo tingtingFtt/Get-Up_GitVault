@@ -354,6 +354,15 @@ test('choosing independent import never inherits an upload or Fork binding or ch
   assert.deepEqual(saved.find((project: any) => project.id === 'tracked'), previous);
   assert.ok(requests.every(r => r.payload === null));
 });
+test('a legacy hint cannot downgrade the same destination already bound in local project records',async()=>{
+  await reloadProject(boundProject());importAssociationFixture();
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[],legacy:[{...cloudEntry(),discovery:{kind:'name'}}]});
+  await beginMatchingImport();
+  assert.ok(!buttons().some(button=>button.textContent==='这是不同项目，不再关联此候选'));
+  assert.ok(importDialog()?.textContent?.includes('已保存的来源与目标绑定'));
+  await click('取消本次导入');await waitFor(()=>!importDialog());
+  assert.equal(storedProjects()[0].uploadTarget.id,77);
+});
 test('importing the destination URL can explicitly resume the original source instead of tracking the destination as its own upstream', async () => {
   await reloadProject(boundProject()); importAssociationFixture();
   await click('新建链接/拉取项目');
@@ -1401,6 +1410,60 @@ function accountHttpFixture() {
 }
 async function freshDevice() {await waitFor(()=>!document.querySelector('span[title].whitespace-pre-wrap'));await flushCredentials();localStorage.clear();localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);}
 async function importSourceLink(){await click('新建链接/拉取项目');await input('https://github.com/owner/repo 或 https://github.com/owner/repo.git 或 owner/repo','source/project');await input('例如: 生产核心源码 / 模块A','跨设备项目');await click('确认拉取进入本地');}
+test('rejecting an unrelated name candidate allows first upload to the chosen new name and preserves the other project',async()=>{
+  const server=accountHttpFixture();
+  server.repositories.set('project',{id:177,name:'project',refs:new Map([['main','init'],['develop','other-v']]),fork:false,private:true,description:'unrelated project'});
+  await enterWorkbench();await click('分叉与私有仓');
+  const name=[...document.querySelectorAll<HTMLInputElement>('input')].find(field=>field.value==='project')!;
+  await setField(name,'independent-new');await click('立即新建私人仓库并上传');await waitFor(()=>!!importDialog());
+  assert.ok(importDialog()?.textContent?.includes('仓库同名（待确认）'));
+  assert.ok(!server.sent.some(request=>request.method!=='GET'));
+  await click('这是不同项目，不再关联此候选');
+  await waitFor(()=>storedProjects()[0]?.remoteSnapshot?.repoId && alerts.some(message=>message.includes('已验证完整上传')));
+  const saved=storedProjects()[0];
+  assert.equal(saved.uploadTarget.repo,'independent-new');assert.equal(saved.excludedCandidates.length,1);
+  assert.equal(server.repositories.get('project')!.refs.get('develop'),'other-v');
+  assert.equal(server.document().projects[0].source.owner,'source');
+  assert.equal(server.document().projects[0].target.repo,'independent-new');
+});
+test('independent import persists its exclusion across restart and then uploads only to the explicitly selected repository and branch',async()=>{
+  const server=accountHttpFixture();
+  server.repositories.set('project',{id:177,name:'project',refs:new Map([['main','init'],['develop','other-v']]),fork:false,private:true,description:'unrelated project'});
+  server.repositories.set('explicit-copy',{id:188,name:'explicit-copy',refs:new Map([['main','init'],['develop','other-v']]),fork:false,private:true,description:'chosen destination'});
+  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>!!importDialog());
+  await click('独立导入，不关联');await waitFor(()=>alerts.length>0);
+  const imported=storedProjects()[0];assert.equal(imported.excludedCandidates.length,1);assert.equal(imported.uploadTarget,undefined);
+  assert.ok(server.sent.every(request=>request.method==='GET'));
+  await reloadProjects(storedProjects());alerts=[];
+  await enterWorkbench();await click('上传指定仓库');await input('owner/repo','destination/explicit-copy');
+  await input('留空使用当前来源分支','develop');await click('确认上传');
+  await waitFor(()=>storedProjects()[0]?.remoteSnapshot?.repoId===188 && alerts.some(message=>message.includes('已验证上传')));
+  assert.ok(!importDialog());assert.equal(server.repositories.get('project')!.refs.get('develop'),'other-v');
+  assert.equal(server.repositories.get('explicit-copy')!.refs.get('main'),'init');
+  assert.notEqual(server.repositories.get('explicit-copy')!.refs.get('develop'),'other-v');
+  assert.equal(server.repositories.size,2);assert.equal(server.document().projects[0].target.id,188);
+  assert.equal(storedProjects()[0].excludedCandidates.length,1);
+});
+test('a confirmed account binding overrides an earlier unrelated-candidate decision and cannot be rejected',async()=>{
+  const saved=repo() as any;
+  saved.excludedCandidates=[{account:'destination',source:{owner:'source',repo:'project'},target:{id:77,owner:'destination',repo:'backup'},evidence:JSON.stringify({kind:'name'})}];
+  await reloadProject(saved);importAssociationFixture({identical:true});
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[cloudEntry()],legacy:[]});
+  await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');
+  await waitFor(()=>storedProjects()[0]?.uploadTarget?.id===77 && alerts.length>0);
+  assert.ok(!importDialog());assert.ok(!requests.some(request=>request.path==='/user/repos'||request.path.endsWith('/git/commits')));
+});
+test('an unreadable unconfirmed candidate still offers independent import without changing that remote repository',async()=>{
+  localStorage.setItem('gitvault_global_token','account-token');await reloadProjects([]);importAssociationFixture();
+  accountRegistry.candidates=async()=>({login:'destination',recorded:[],legacy:[{...cloudEntry(),discovery:{kind:'name'}}]});
+  const base=globalThis.fetch;
+  globalThis.fetch=async(url,init={})=>String(url)==='https://api.github.com/repos/destination/backup'?ok({message:'Not Found'},404):base(url,init);
+  await importSourceLink();await waitFor(()=>!!importDialog());
+  assert.ok(importDialog()?.querySelector('[role=alert]'));
+  await click('这是不同项目，不再关联此候选');await waitFor(()=>alerts.length>0);
+  assert.equal(storedProjects()[0].uploadTarget,undefined);assert.equal(storedProjects()[0].excludedCandidates.length,1);
+  assert.ok(requests.every(request=>!request.payload));
+});
 test('HTTP A upload -> fresh B same-name compare -> auto-bind -> tag save -> branch-only update without registry mocks',async()=>{
   const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot?.commitSha);
   const a=storedProjects()[0];const originalHead=server.repositories.get('project')!.refs.get('develop');assert.equal(server.document().projects[0].target.id,a.uploadTarget.id);

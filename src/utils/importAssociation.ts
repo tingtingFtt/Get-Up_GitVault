@@ -14,8 +14,30 @@ export interface ImportCandidate {
   key: string; projectId: string; remark: string; source: ProjectSource;
   target: UploadTarget; fullFork: boolean; branches?: string[];
   accountRecord?: import('./accountRegistry').AccountProject;
+  confirmed?: boolean;
+  account?: string;
 }
-export function sameRepository(a: { owner: string; repo: string }, b: { owner: string; repo: string }) {
+export interface CandidateExclusion {
+  account: string;
+  source: Pick<ProjectSource, 'owner' | 'repo' | 'repositoryId'>;
+  target: TargetIdentity;
+  evidence: string;
+}
+export function candidateExclusion(candidate: ImportCandidate, source: ProjectSource): CandidateExclusion | undefined {
+  // Local bindings and authenticated registry records always take priority over exclusions.
+  if (candidate.confirmed !== false || !candidate.account) return undefined;
+  return { account: candidate.account.toLowerCase(), source: { owner: source.owner, repo: source.repo, repositoryId: source.repositoryId },
+    target: { id: candidate.target.id, owner: candidate.target.owner, repo: candidate.target.repo },
+    evidence: JSON.stringify(candidate.accountRecord?.discovery || {kind:'legacy'}) };
+}
+export function isExcludedCandidate(candidate: ImportCandidate, source: ProjectSource, exclusions: CandidateExclusion[]) {
+  const current = candidateExclusion(candidate, source);
+  return !!current && exclusions.some(item => item.account === current.account &&
+    (item.source.repositoryId && current.source.repositoryId ? item.source.repositoryId === current.source.repositoryId : sameRepository(item.source, current.source)) &&
+    sameTarget(item.target, current.target) && item.evidence === current.evidence);
+}
+export function sameRepository(a: { owner: string; repo: string; repositoryId?: number }, b: { owner: string; repo: string; repositoryId?: number }) {
+  if (a.repositoryId && b.repositoryId) return a.repositoryId === b.repositoryId;
   return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase();
 }
 /** Only recorded provenance is evidence of a relationship; a matching repository name is not. */

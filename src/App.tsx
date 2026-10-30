@@ -1,3 +1,4 @@
+import { readMetadataSource } from './utils/projectProvenance';
 import {folderBridge, folderTask, usesNativeFolder, hydrateFile, saveFolderArchive, withFolderConfirmation, type FolderFiles} from './utils/nativeFolder';
 import {nativeGitCacheEnabled,saveNativeGitCache,clearNativeGitCache} from './utils/nativeGitCache';
 import AppUpdates, { openAppUpdater } from './components/AppUpdates';
@@ -23,7 +24,7 @@ import { sourceOf, pullSourceOf, savedSnapshot, archiveVersion, renamedProject, 
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import {reportProgress,cooperate} from './utils/operation';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
-import { importCandidates, compareImportTrees, sameRepository, type ImportCandidate } from './utils/importAssociation';
+import { importCandidates, compareImportTrees, sameRepository, candidateExclusion, isExcludedCandidate, type CandidateExclusion, type ImportCandidate } from './utils/importAssociation';
 import { projectSelections } from './utils/projectSelection';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
 import { accountRegistry, AccountRecordPendingError, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject, type TargetHistory } from './utils/accountRegistry';
@@ -49,6 +50,7 @@ interface RepoTreeItem {
 interface SwitchRequest { mode: 'create'|'existing'; name: string; branch: string; token: string; purge: boolean; expectedId?: number }
 interface PendingSwitch { manifest?: Pick<TrackedRepo,'tree'|'commitMessage'|'commitAuthor'|'commitDate'>; request: Omit<SwitchRequest,'token'>; reservationId: string; sourceSha: string; sourceBranch: string; oldTarget?: TargetIdentity; result?: {verified:boolean;repoId?:number;owner:string;repo:string;branch:string;commitSha:string;htmlUrl:string;repoPrivate?:boolean} }
 interface TrackedRepo {
+  excludedCandidates?: CandidateExclusion[];
   primarySource?: ProjectSource;
   targetHistory?: TargetHistory[];
   pendingSwitch?: PendingSwitch;
@@ -142,7 +144,13 @@ interface BatchUploadItemStatus {
 }
 
 type ImportComparison = { status: 'loading' | 'ready' | 'error'; error?: string; target?: UploadTarget; sourceSha?: string; commitSha?: string; missingBranch?: boolean; diff?: ReturnType<typeof compareImportTrees>; targetHealth?: TargetHealth; equal?: boolean; generatedMetadata?: boolean; private?: boolean };
-type ImportChoice = { candidate: ImportCandidate; comparison: ImportComparison; automatic?: boolean; newName?: string; updateNow?: boolean } | 'independent' | 'skip';
+type BoundImportChoice = { candidate: ImportCandidate; comparison: ImportComparison; automatic?: boolean; newName?: string; updateNow?: boolean; excluded?: CandidateExclusion[] };
+type IndependentImportChoice = { independent: true; excluded: CandidateExclusion[] };
+type ImportChoice = BoundImportChoice | IndependentImportChoice | 'independent' | 'skip';
+const isImportBinding = (choice: ImportChoice): choice is BoundImportChoice => typeof choice !== 'string' && !('independent' in choice);
+const isIndependentImport = (choice: ImportChoice) => choice === 'independent' || typeof choice !== 'string' && 'independent' in choice;
+
+const mergeCandidateExclusions = (...groups: CandidateExclusion[][]) => [...new Map(groups.flat().map(item=>[JSON.stringify(item),item])).values()];
 
 // Light Morandi Gradient Color Palette for heatmap
 const MORANDI_HEATMAP_COLORS = [
@@ -379,7 +387,7 @@ export default function App() {
   const [recordStorageError, setRecordStorageError] = useState('');
   const [recordStorageRetrying, setRecordStorageRetrying] = useState(false);
   const [importCancelled, setImportCancelled] = useState(false);
-  const [importMatch, setImportMatch] = useState<{ source: ProjectSource; sha: string; tree: RepoTreeItem[]; candidates: ImportCandidate[]; token: string; comparisons: Record<string, ImportComparison> } | null>(null);
+  const [importMatch, setImportMatch] = useState<{ source: ProjectSource; sha: string; tree: RepoTreeItem[]; candidates: ImportCandidate[]; token: string; comparisons: Record<string, ImportComparison>; excluded: CandidateExclusion[] } | null>(null);
   const importResolver = useRef<((choice: ImportChoice) => void) | null>(null);
   const importSession = useRef(0);
   const importLock = useRef(false);
@@ -1268,15 +1276,27 @@ export default config;
     setIsLoading(false);
   };
 
+  const sourceExclusions = (source: ProjectSource) => reposRef.current.filter(project => sameSource(sourceOf(project), source)).flatMap(project => Array.isArray(project.excludedCandidates) ? project.excludedCandidates : []);
+  const accountCandidates = (found: { login: string; recorded: AccountProject[]; legacy: AccountProject[] }, source: ProjectSource, token: string) => [
+    ...found.recorded.map(record => candidateFromAccount(record, source, token)),
+    ...found.legacy.map(record => ({...candidateFromAccount(record, source, token), confirmed:false, account:found.login, remark:'账号中的待确认候选，尚未固定来源关系'})),
+  ].filter(candidate => !isExcludedCandidate(candidate, source, sourceExclusions(source)));
+  const saveCandidateExclusions = async (source: ProjectSource, excluded: CandidateExclusion[]) => {
+    if (!excluded.length) return;
+    for (const project of reposRef.current.filter(item => sameSource(sourceOf(item), source))) {
+      patchRepo(project.id, {excludedCandidates:mergeCandidateExclusions(project.excludedCandidates || [],excluded)});
+    }
+    await flushCredentials();
+  };
   // Import matching is read-only. A destination is bound only after an explicit choice.
   const chooseImportBase = async (data: { owner: string; repo: string; branch: string; repositoryId?: number; latestCommitSha: string; tree: RepoTreeItem[] }, token: string, extra: ImportCandidate[] = [], initial: Record<string,ImportComparison> = {}): Promise<ImportChoice> => {
     const source = { owner: data.owner, repo: data.repo, branch: data.branch, repositoryId: data.repositoryId, url: `https://github.com/${data.owner}/${data.repo}` };
-    const all = [...extra, ...importCandidates(reposRef.current, source)];
+    const all = [...extra, ...importCandidates(reposRef.current, source)].sort((a,b)=>Number(a.confirmed===false)-Number(b.confirmed===false));
     const candidates = all.filter((candidate, i) => !all.slice(0, i).some(other => sameTarget(other.target, candidate.target)));
     if (!candidates.length) return 'independent';
     const signal = operationSignal(); signal.throwIfAborted();
     importSession.current++; setImportNewName('');
-    setImportMatch({ source, sha: data.latestCommitSha, tree: data.tree, candidates, token, comparisons: initial });
+    setImportMatch({ source, sha: data.latestCommitSha, tree: data.tree, candidates, token, comparisons: initial, excluded: [] });
     const wasLoading = isLoading || importLock.current || !(batchTaskLock.current || batchUploadLock.current); setIsLoading(false);
     try {
       return await new Promise<ImportChoice>((resolve, reject) => {
@@ -1288,19 +1308,27 @@ export default config;
     } finally { importSession.current++; setImportMatch(null); setIsLoading(wasLoading); }
   };
 
+  const rejectImportCandidates = (candidate?: ImportCandidate) => {
+    if (!importMatch) return;
+    const rejected = candidate ? [candidate] : importMatch.candidates;
+    const excluded=[...importMatch.excluded,...rejected.flatMap(item=>{const exclusion=candidateExclusion(item,importMatch.source);return exclusion?[exclusion]:[];})];
+    const remaining=candidate?importMatch.candidates.filter(item=>item.key!==candidate.key):[];
+    if(remaining.length) setImportMatch({...importMatch,candidates:remaining,excluded});
+    else importResolver.current?.({independent:true,excluded});
+  };
   const generatedImportMetadata = async (candidate:ImportCandidate, source:ProjectSource, sourceTree:RepoTreeItem[], inspected:Awaited<ReturnType<typeof githubClient.inspectImportTarget>>, token:string) => {
     let generated=!!candidate.accountRecord?.createdByApp;
     if (!candidate.fullFork && !generated && inspected.tree.some(item=>item.path==='GITVAULT_METADATA.md') && !sourceTree.some(item=>item.path==='GITVAULT_METADATA.md')) {
       const metadata=await githubApi(`/repos/${inspected.identity.owner}/${inspected.identity.repo}/contents/GITVAULT_METADATA.md?ref=${encodeURIComponent(inspected.commitSha!)}`,token);
       if(metadata.encoding==='base64' && metadata.size<=64000) {
         const content=new TextDecoder().decode(Uint8Array.from(atob(metadata.content.replace(/\s/g,'')),char=>char.charCodeAt(0)));
-        generated=content.split(/\r?\n/).some(line=>{try{const parsed=parseRepository(line.trim());return sameRepository(parsed,source);}catch{return false;}});
+        const original=readMetadataSource(content);generated=!!original && sameRepository(original,source);
       }
     }
     return generated;
   };
-  const candidateFromAccount = (record: AccountProject, source: ProjectSource, token: string): ImportCandidate => ({ key: `${source.owner}/${source.repo}:${source.branch}=>${targetKey(record.target)}`, projectId: '', remark: record.state === 'reserved' ? '账号中的首次任务尚未完成，需要继续完成或处理旧目标' : '当前 GitHub 账号的已有项目', source, target: { ...record.target, branch: record.bindings[source.branch]?.branch || source.branch, kind: record.kind, token, purgeAfterUpload: false }, fullFork: record.kind === 'full', branches: record.branches, accountRecord: record });
-  const automaticAccountChoice = async (record: AccountProject, source: ProjectSource, token: string, latestSha?: string, sourceTree?: RepoTreeItem[]): Promise<Exclude<ImportChoice, string>> => {
+  const candidateFromAccount = (record: AccountProject, source: ProjectSource, token: string): ImportCandidate => ({ key: `${source.owner}/${source.repo}:${source.branch}=>${targetKey(record.target)}`, projectId: '', confirmed:true, remark: record.state === 'reserved' ? '账号中的首次任务尚未完成，需要继续完成或处理旧目标' : '当前 GitHub 账号的已有项目', source, target: { ...record.target, branch: record.bindings[source.branch]?.branch || source.branch, kind: record.kind, token, purgeAfterUpload: false }, fullFork: record.kind === 'full', branches: record.branches, accountRecord: record });
+  const automaticAccountChoice = async (record: AccountProject, source: ProjectSource, token: string, latestSha?: string, sourceTree?: RepoTreeItem[]): Promise<BoundImportChoice> => {
     const candidate = candidateFromAccount(record, source, token);
     try {
       const inspected = await githubClient.inspectImportTarget(candidate.target, token, candidate.fullFork ? source : undefined);
@@ -1315,11 +1343,11 @@ export default config;
       return { candidate, automatic: true, comparison: { status: 'ready', target: candidate.target, sourceSha: latestSha, missingBranch: true, targetHealth: error.health } };
     }
   };
-  const resolveImportChoice = async (data: { owner: string; repo: string; repositoryId?: number; branch: string; latestCommitSha: string; tree: RepoTreeItem[] }, token: string): Promise<ImportChoice> => {
+  const resolveImportChoice = async (data: { owner: string; repo: string; repositoryId?: number; branch: string; latestCommitSha: string; tree: RepoTreeItem[] }, token: string, existingCandidates?: Awaited<ReturnType<typeof accountRegistry.candidates>>): Promise<ImportChoice> => {
     if (token) operationTokens.current.add(token);
     const source: ProjectSource = { owner: data.owner, repo: data.repo, repositoryId: data.repositoryId, branch: data.branch, url: `https://github.com/${data.owner}/${data.repo}` };
     if (!token) return chooseImportBase(data, token);
-    const found = await accountRegistry.candidates(source, token);
+    const found = existingCandidates || await accountRegistry.candidates(source, token);
     const active = found.recorded.filter(record => record.state === 'active');
     if (active.length === 1) {
       const entry = active[0];
@@ -1337,26 +1365,31 @@ export default config;
       try { await githubClient.repository(reserved.target.owner, reserved.target.repo, token, reserved.target.id); }
       catch (error) { if (error instanceof TargetRepositoryError) return automaticAccountChoice(reserved, source, token, data.latestCommitSha); throw error; }
     }
-    const extras = [...found.recorded,...found.legacy].map(record=>candidateFromAccount(record,source,token));
+    const extras = accountCandidates(found,source,token);
     // Old local bindings still require an explicit comparison; fresh-account name
     // matches are compared automatically before any source file download.
     const locals = importCandidates(reposRef.current,source);
     const unique = extras.filter((candidate,i)=>!extras.slice(0,i).some(other=>sameTarget(other.target,candidate.target)));
     if (unique.length === 1 && !locals.length && !reserved) {
       const candidate=unique[0];
-      const inspected=await githubClient.inspectImportTarget(candidate.target,token,candidate.fullFork?source:undefined);
-      const generated=await generatedImportMetadata(candidate,source,data.tree,inspected,token);
-      const diff=compareImportTrees(data.tree,inspected.tree,generated);
-      const equal=!inspected.missingBranch && !diff.added.length && !diff.modified.length && !diff.removed.length;
-      const comparison:ImportComparison={status:'ready',target:{...candidate.target,id:inspected.identity.id,owner:inspected.identity.owner,repo:inspected.identity.repo,private:inspected.identity.private},sourceSha:data.latestCommitSha,commitSha:inspected.commitSha,missingBranch:inspected.missingBranch,diff,equal,generatedMetadata:generated};
-      if(equal) return {candidate,comparison};
-      return chooseImportBase(data,token,extras,{[candidate.key]:comparison});
+      try {
+        const inspected=await githubClient.inspectImportTarget(candidate.target,token,candidate.fullFork?source:undefined);
+        const generated=await generatedImportMetadata(candidate,source,data.tree,inspected,token);
+        const diff=compareImportTrees(data.tree,inspected.tree,generated);
+        const equal=!inspected.missingBranch && !diff.added.length && !diff.modified.length && !diff.removed.length;
+        const comparison:ImportComparison={status:'ready',target:{...candidate.target,id:inspected.identity.id,owner:inspected.identity.owner,repo:inspected.identity.repo,private:inspected.identity.private},sourceSha:data.latestCommitSha,commitSha:inspected.commitSha,missingBranch:inspected.missingBranch,diff,equal,generatedMetadata:generated};
+        if(equal) return {candidate,comparison};
+        return chooseImportBase(data,token,extras,{[candidate.key]:comparison});
+      } catch(error) {
+        operationSignal().throwIfAborted();
+        return chooseImportBase(data,token,extras,{[candidate.key]:{status:'error',error:(error as Error).message}});
+      }
     }
     return chooseImportBase(data, token, extras);
   };
 
   const finishAccountBinding = async (repo: TrackedRepo, choice: ImportChoice, token: string) => {
-    if (typeof choice === 'string' || choice.newName) return;
+    if (!isImportBinding(choice) || choice.newName) return;
     const target = choice.comparison.target!;
     const entry = choice.candidate.accountRecord;
     const receipt=entry?.bindings[sourceOf(repo).branch];
@@ -1397,18 +1430,20 @@ export default config;
     const choice = await resolveImportChoice(manifest, token);
     operationSignal().throwIfAborted();
     if (choice === 'skip') return { choice, data: undefined };
-    const selected = typeof choice === 'string' ? { ...source, branch: manifest.branch } : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? {owner:choice.comparison.target!.owner,repo:choice.comparison.target!.repo,url:`https://github.com/${choice.comparison.target!.owner}/${choice.comparison.target!.repo}`,branch:choice.comparison.target!.branch} : choice.candidate.source;
-    const sha = typeof choice === 'string' ? manifest.latestCommitSha : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? choice.comparison.commitSha : choice.comparison.sourceSha;
+    if(typeof choice==='object') await saveCandidateExclusions({...manifest,url:source.url},choice.excluded || []);
+    const selected = !isImportBinding(choice) ? { ...source, branch: manifest.branch } : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? {owner:choice.comparison.target!.owner,repo:choice.comparison.target!.repo,url:`https://github.com/${choice.comparison.target!.owner}/${choice.comparison.target!.repo}`,branch:choice.comparison.target!.branch} : choice.candidate.source;
+    const sha = !isImportBinding(choice) ? manifest.latestCommitSha : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? choice.comparison.commitSha : choice.comparison.sourceSha;
     if (!sha) throw new Error('来源提交未完成校验，请重新对比');
     const previous = reposRef.current.find(project => sameRepository(sourceOf(project), selected) && sourceOf(project).branch === selected.branch);
     const cachedFiles = previous ? await localCache.getProjectFiles(previous.id, sha) : [];
-    const data = await githubClient.fetchRepo(selected.url, selected.branch, token || (typeof choice === 'string' ? undefined : choice.comparison.target?.token), { ref: sha, cachedFiles });
+    const data = await githubClient.fetchRepo(selected.url, selected.branch, token || (!isImportBinding(choice) ? undefined : choice.comparison.target?.token), { ref: sha, cachedFiles });
     return { choice, data };
   };
 
   const importWithBase = (newRepo: TrackedRepo, choice: ImportChoice, batch = false): TrackedRepo => {
-    if (typeof choice === 'string') return newRepo;
+    if (!isImportBinding(choice)) return {...newRepo,excludedCandidates:mergeCandidateExclusions(sourceExclusions(sourceOf(newRepo)),typeof choice==='object'?choice.excluded:[])};
     const { candidate, comparison } = choice;
+    newRepo={...newRepo,excludedCandidates:mergeCandidateExclusions(sourceExclusions(sourceOf(newRepo)),choice.excluded || [])};
     if (comparison.status !== 'ready' || !comparison.target) throw new Error('请完成项目对比后再选择同步基础');
     const previous = reposRef.current.find(project => !project.origin && sameRepository(project, newRepo) && project.branch === newRepo.branch);
     const target = comparison.target;
@@ -1460,7 +1495,7 @@ export default config;
   };
 
   const sourceManifest = (repo: TrackedRepo) => ({ ...sourceOf(repo), latestCommitSha: repo.latestCommitSha, tree: repo.tree });
-  const applyAccountChoice = async (repo: TrackedRepo, choice: Exclude<ImportChoice, string>, token: string, save = false) => {
+  const applyAccountChoice = async (repo: TrackedRepo, choice: BoundImportChoice, token: string, save = false) => {
     repo = reposRef.current.find(project => project.id === repo.id) || repo;
     const entry = choice.candidate.accountRecord;
     const raw = choice.comparison.target!;
@@ -1471,7 +1506,7 @@ export default config;
     const sameReceipt = !choice.comparison.targetHealth && !choice.comparison.missingBranch && old && old.commitSha===choice.comparison.commitSha && sameTarget({ ...old, id: old.repoId }, target) && old.branch === target.branch;
     const receipt = entry?.bindings[source.branch];
     const remoteSnapshot = choice.comparison.equal && choice.comparison.commitSha ? {repoId:target.id,owner:target.owner,repo:target.repo,branch:target.branch,sourceSha:repo.latestCommitSha,commitSha:choice.comparison.commitSha,htmlUrl:`https://github.com/${target.owner}/${target.repo}/tree/${target.branch}`} : !choice.comparison.targetHealth && receipt?.sourceSha && receipt.commitSha && choice.comparison.commitSha === receipt.commitSha ? { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.branch, sourceSha: receipt.sourceSha, commitSha: receipt.commitSha, htmlUrl: `https://github.com/${target.owner}/${target.repo}/tree/${target.branch}` } : sameReceipt ? old : undefined;
-    const next: TrackedRepo = { ...repo, ...(entry?.profile?{tags:entry.profile.tags,remark:entry.profile.remark,description:entry.profile.description}:{}), uploadTarget: target, branchTargets: { ...repo.branchTargets, ...Object.fromEntries(Object.entries(entry?.bindings || {}).map(([branch, binding]) => [branch, { ...target, branch: binding.branch }])), [source.branch]: target }, branchUploadPending: !!choice.comparison.missingBranch,
+    const next: TrackedRepo = { ...repo, excludedCandidates:mergeCandidateExclusions(repo.excludedCandidates || [],choice.excluded || []), ...(entry?.profile?{tags:entry.profile.tags,remark:entry.profile.remark,description:entry.profile.description}:{}), uploadTarget: target, branchTargets: { ...repo.branchTargets, ...Object.fromEntries(Object.entries(entry?.bindings || {}).map(([branch, binding]) => [branch, { ...target, branch: binding.branch }])), [source.branch]: target }, branchUploadPending: !!choice.comparison.missingBranch,
       primarySource: entry?.primary ? {owner:target.owner,repo:target.repo,url:`https://github.com/${target.owner}/${target.repo}`,repositoryId:target.id,branch:target.branch} : repo.primarySource, targetHistory:entry?.history || repo.targetHistory,
       remoteSnapshot, savedCopies: old && !sameReceipt ? [...(repo.savedCopies || []), old] : repo.savedCopies,
       forkScope: choice.candidate.fullFork ? 'full' : 'current',
@@ -1548,12 +1583,17 @@ export default config;
       await publishAccountRecord(repo, withLocalBranchMappings(repo, { ...accountRecord(repo, repo.uploadTarget, repo.forkScope === 'full' ? 'full' : repo.uploadTarget.kind || 'upload', source.branch, repo.uploadTarget.branch), createdByApp: false }), token);
       return { skipped: true, name: repo.uploadTarget.repo, message: '已有固定目标，本次跳过首次上传，请使用更新或同步。' };
     }
-    if (local.length || found.recorded.length || found.legacy.length) {
-      const choice = local.length ? await chooseImportBase(manifest, token, [...found.recorded, ...found.legacy].map(item => candidateFromAccount(item, source, token))) : await resolveImportChoice(manifest,token);
-      if (typeof choice === 'string') return { skipped: true, name, message: '账号已有待确认的同源候选，未创建其他仓库；可重新比较后使用已有目标。' };
-      const next=await applyAccountChoice(repo, choice, token, !choice.newName);
-      if(choice.newName) return {skipped:true,name:choice.newName,message:await performSwitch(next,{mode:'create',name:choice.newName,branch:source.branch,token,purge:false})};
-      return { skipped: true, name: choice.comparison.target!.repo, message: '已完成比较并固定已有目标，本次跳过首次上传／分叉；后续请使用更新或同步。' };
+    const candidates=accountCandidates(found,source,token);
+    if (local.length || candidates.length) {
+      const choice = local.length ? await chooseImportBase(manifest, token, candidates) : await resolveImportChoice(manifest,token,found);
+      if (!isImportBinding(choice)) {
+        if(!isIndependentImport(choice) || local.length || found.recorded.length) return { skipped: true, name, message: '已跳过首次上传；已确认的同源绑定仍需使用更新／同步。' };
+        if(typeof choice==='object') await saveCandidateExclusions(source,choice.excluded);
+      } else {
+        const next=await applyAccountChoice(repo, choice, token, !choice.newName);
+        if(choice.newName) return {skipped:true,name:choice.newName,message:await performSwitch(next,{mode:'create',name:choice.newName,branch:source.branch,token,purge:false})};
+        return { skipped: true, name: choice.comparison.target!.repo, message: '已完成比较并固定已有目标，本次跳过首次上传／分叉；后续请使用更新或同步。' };
+      }
     }
     // A chosen name may already belong to an unrelated repository: compare before binding.
     let occupied: TargetIdentity | undefined;
@@ -1562,9 +1602,9 @@ export default config;
       catch (error) { if (!(error instanceof TargetRepositoryError) || error.health.status !== 'unavailable') throw error; }
     }
     if (occupied) {
-      const existing: AccountProject = { source, target: occupied, kind, state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' };
-      const choice = await chooseImportBase(manifest, token, [candidateFromAccount(existing, source, token)]);
-      if (typeof choice !== 'string') await applyAccountChoice(repo, choice, token, true);
+      const existing: AccountProject = { source, target: occupied, discovery:{kind:'name'}, kind, state: 'active', createdByApp: false, bindings: { [source.branch]: { branch: source.branch, updatedAt: '' } }, updatedAt: '' };
+      const choice = await chooseImportBase(manifest, token, [{...candidateFromAccount(existing, source, token),confirmed:false,account:found.login}]);
+      if (isImportBinding(choice)) await applyAccountChoice(repo, choice, token, true);
       return { skipped: true, name, message: '目标名称已有仓库，本次未写入；请比较并绑定后使用更新或同步。' };
     }
     try {
@@ -1618,10 +1658,15 @@ export default config;
       await publishAccountRecord(repo, withLocalBranchMappings(repo, record), token);
       return { repo: reposRef.current.find(project => project.id === repo.id) || repo, boundOnly: false };
     }
-    if (found.recorded.length || found.legacy.length) {
-      const choice = await chooseImportBase(sourceManifest(repo), token, [...found.recorded, ...found.legacy].map(item => candidateFromAccount(item, source, token)));
-      if (typeof choice !== 'string') return { repo: await applyAccountChoice(repo, choice, token, true), boundOnly: true };
-      throw new Error('已有同源目标尚未确认，未执行写入；请先比较并固定目标');
+    const candidates=accountCandidates(found,source,token);
+    if (candidates.length) {
+      const choice = await chooseImportBase(sourceManifest(repo), token, candidates);
+      if (isImportBinding(choice)) return { repo: await applyAccountChoice(repo, choice, token, true), boundOnly: true };
+      if(isIndependentImport(choice) && !found.recorded.length) {
+        if(typeof choice==='object') await saveCandidateExclusions(source,choice.excluded);
+        return {repo:reposRef.current.find(item=>item.id===repo.id) || repo,boundOnly:false};
+      }
+      throw new Error('已有确认的同源绑定，未执行写入；请使用固定目标更新或同步');
     }
     return { repo, boundOnly: false };
   };
@@ -1704,19 +1749,19 @@ export default config;
         operationSignal().throwIfAborted();
         if (!data) { items[i] = { ...items[i], status: 'skipped', message: '用户选择跳过此链接' }; publishImportResults(items); continue; }
         const exists = reposRef.current.some(item => { const source = sourceOf(item); return source.owner.toLowerCase() === data.owner.toLowerCase() && source.repo.toLowerCase() === data.repo.toLowerCase() && source.branch === data.branch && !item.origin; });
-        if (exists && choice === 'independent' && !importCandidates(reposRef.current, { ...data, url: items[i].url! }).length) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
+        if (exists && isIndependentImport(choice) && !importCandidates(reposRef.current, { ...data, url: items[i].url! }).length) { items[i] = { ...items[i], status: 'skipped', message: `默认分支 ${data.branch} 已在项目列表中` }; }
         else {
-          const newRepo = importWithBase({ ...data, id: `repo-${crypto.randomUUID()}`, url: typeof choice === 'string' ? items[i].url! : choice.candidate.source.url, verification: token ? 'ready' : 'unchecked', token: tokenInput.trim() || undefined, remark: items[i].remark || '', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length }, choice, true);
+          const newRepo = importWithBase({ ...data, id: `repo-${crypto.randomUUID()}`, url: !isImportBinding(choice) ? items[i].url! : choice.candidate.source.url, verification: token ? 'ready' : 'unchecked', token: tokenInput.trim() || undefined, remark: items[i].remark || '', description: data.repoMeta.description || '', tags: ['默认'], checkInterval: 0, lastCheckedAt: new Date().toISOString(), lastSyncedAt: new Date().toISOString(), backups: [], hasUpdate: false, isCachePurged: false, cachedFilesCount: data.files.length }, choice, true);
           // Keep file contents in IndexedDB only; never copy them into the project record.
           const { files, ...record } = newRepo as TrackedRepo & { files?: CachedFile[] };
           await localCache.saveProjectFiles(record.id, data.files, data.latestCommitSha,{signal:operationSignal()});
           operationSignal().throwIfAborted(); persistRepos([record, ...reposRef.current.filter(item => item.id !== record.id)]);
           await finishAccountBinding(record, choice, token);
-          if(typeof choice!=='string'&&choice.updateNow) await uploadComparedImport(record,token);
-          if (typeof choice!=='string' && choice.newName) await performSwitch(record,{mode:'create',name:choice.newName,branch:record.branch,token,purge:false});
+          if(isImportBinding(choice)&&choice.updateNow) await uploadComparedImport(record,token);
+          if (isImportBinding(choice) && choice.newName) await performSwitch(record,{mode:'create',name:choice.newName,branch:record.branch,token,purge:false});
           await exportToNativeDirectory(record, data.files);
           await flushCredentials();
-          items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${typeof choice !== 'string' ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
+          items[i] = { ...items[i], status: 'success', message: `${data.branch} · ${data.files.length} 个文件${isImportBinding(choice) ? `，已沿用 ${choice.comparison.target!.owner}/${choice.comparison.target!.repo} · ${choice.comparison.target!.branch}（尚未写入远端）` : '，备注和描述可在项目设置中修改'}` };
         }
         await transferCache.clear(data.latestCommitSha);
       } catch (error) {
@@ -1745,7 +1790,7 @@ export default config;
       operationSignal().throwIfAborted();
       if (!data) return;
       const newRepo = importWithBase({
-        id: `${data.owner}-${data.repo}-${Date.now()}`, url: typeof choice === 'string' ? repoUrl.trim() : choice.candidate.source.url, owner: data.owner, repo: data.repo, repositoryId: data.repositoryId, branch: data.branch,
+        id: `${data.owner}-${data.repo}-${Date.now()}`, url: !isImportBinding(choice) ? repoUrl.trim() : choice.candidate.source.url, owner: data.owner, repo: data.repo, repositoryId: data.repositoryId, branch: data.branch,
         token: tokenInput.trim() || undefined, remark: remarkInput.trim() || '未备注项目', description: descriptionInput.trim() || data.repoMeta.description,
         verification: tokenInput.trim() || globalToken ? 'ready' : 'unchecked', tags: tagsInput.split(',').map(t => t.trim()).filter(Boolean), checkInterval: 0, lastCheckedAt: new Date().toISOString(),
         latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate,
@@ -1754,13 +1799,13 @@ export default config;
       await localCache.saveProjectFiles(newRepo.id, data.files, data.latestCommitSha,{signal:operationSignal()});
       operationSignal().throwIfAborted(); persistRepos([newRepo, ...reposRef.current.filter(item => item.id !== newRepo.id)]);
       await finishAccountBinding(newRepo, choice, tokenInput.trim() || globalToken);
-      if(typeof choice!=='string'&&choice.updateNow) await uploadComparedImport(newRepo,tokenInput.trim()||globalToken);
-      if(typeof choice!=='string' && choice.newName) await performSwitch(newRepo,{mode:'create',name:choice.newName,branch:newRepo.branch,token:tokenInput.trim() || globalToken,purge:false});
+      if(isImportBinding(choice)&&choice.updateNow) await uploadComparedImport(newRepo,tokenInput.trim()||globalToken);
+      if(isImportBinding(choice) && choice.newName) await performSwitch(newRepo,{mode:'create',name:choice.newName,branch:newRepo.branch,token:tokenInput.trim() || globalToken,purge:false});
       await exportToNativeDirectory(newRepo, data.files);
       await flushCredentials();
       setIsAddModalOpen(false); setRepoUrl(''); setBranchInput(''); setAvailableBranches([]); setTokenInput(''); setRemarkInput(''); setDescriptionInput(''); setCurrentView('projects');
       await transferCache.clear(data.latestCommitSha);
-      appDialog.notify(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${typeof choice !== 'string' ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
+      appDialog.notify(`项目完整下载并持久保存成功，共 ${data.files.length} 个文件。${isImportBinding(choice) ? '已按选择绑定已有目标，后续上传或分叉同步时使用；本次未写入远端。' : ''}`);
     } catch (error) {
       const cancelled = isOperationCancelled(error, signal);
       const message = cancelled ? '已取消导入；已完成的项目保留，可重新拉取。' : (error as Error).message || '导入失败';
@@ -4169,12 +4214,12 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
       </div>}
 
       {importMatch && <div className="fixed inset-0 bg-[#33302C]/40 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
-        <div role="dialog" aria-modal="true" aria-label="选择已有项目作为同步基础" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-6 shadow-xl flex flex-col gap-4">
+        <div role="dialog" aria-modal="true" aria-label="选择已有项目作为同步基础" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-6 shadow-xl flex flex-col gap-4 max-h-[90dvh] overflow-y-auto">
           <div className="flex flex-row justify-between items-start gap-3">
             <h3 className="text-base font-bold font-serif text-[#2B2723]">发现已有上传或分叉项目</h3>
             <button type="button" aria-label="取消本次导入" disabled={isCancelling} onClick={cancelGithubOperation} className="text-[#91887C] p-1"><X className="w-5 h-5" /></button>
           </div>
-          <p className="text-xs text-[#7A7367] leading-relaxed break-words">已检查当前账号的同名仓库或固定来源关系。代码不同可选择更新已有项目，或填写新名称上传并切换固定仓库。沿用只保存关联，后续更新时写入对应分支。</p>
+          <p className="text-xs text-[#7A7367] leading-relaxed break-words">同名或元数据提示仅作为待确认候选。不同项目可排除后独立上传；确认沿用则固定目标和分支。已确认的绑定仍通过更新、同步或另存切换处理。</p>
           <p className="text-xs text-[#474239] break-all">新链接：{importMatch.source.owner}/{importMatch.source.repo} · {importMatch.source.branch}<br />待导入提交：{importMatch.sha}</p>
           <div className="flex flex-col gap-3">
             {importMatch.candidates.map(candidate => {
@@ -4184,8 +4229,11 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 <p className="font-semibold text-[#4D5E4A] break-all">{candidate.fullFork ? '完整分叉' : target.kind === 'current' ? '分支副本' : '上传仓库'}：{target.owner}/{target.repo}</p>
                 {candidate.remark && <p className="text-[#7A7367]">已有备注：{candidate.remark}</p>}
                 <p className="text-[#474239] break-all">本次导入来源：{candidate.source.owner}/{candidate.source.repo}</p>
+                <p className="text-[#7A7367] break-all">匹配依据：{candidate.confirmed===false ? candidate.accountRecord?.discovery?.kind==='metadata'?'元数据来源提示（待确认）':candidate.fullFork?'GitHub 分叉父仓库（待确认）':'仓库同名（待确认）' : '已保存的来源与目标绑定'}</p>
+                {candidate.accountRecord?.discovery?.source && <p className="text-[#7A7367] break-all">候选记录来源：{candidate.accountRecord.discovery.source.owner}/{candidate.accountRecord.discovery.source.repo}</p>}
+                {candidate.confirmed===false && <button type="button" onClick={()=>rejectImportCandidates(candidate)} className="self-start px-3 py-2 text-[#8C5D54] border border-[#DFD8CE] rounded-xl">这是不同项目，不再关联此候选</button>}
                 <p className="text-[#474239] break-all">分支映射：{candidate.source.branch} → {target.branch}</p>
-                <label className="text-[#7A7367]">已有仓库目标分支<input aria-label={`比较目标分支 ${candidate.target.repo}`} value={candidate.target.branch} readOnly={candidate.accountRecord?.state==='active'&&!!candidate.accountRecord.bindings[candidate.source.branch]} onChange={event=>setImportMatch(match=>match?{...match,candidates:match.candidates.map(item=>item.key===candidate.key?{...item,target:{...item.target,branch:event.target.value}}:item),comparisons:{...match.comparisons,[candidate.key]:{status:'error',error:'分支已修改，请重新对比'}}}:match)} className="w-full mt-1 p-2 bg-white border border-[#DFD8CE] rounded-lg" /></label>
+                <label className="text-[#7A7367]">已有仓库目标分支<input aria-label={`比较目标分支 ${candidate.target.repo}`} value={candidate.target.branch} readOnly={candidate.confirmed!==false&&candidate.accountRecord?.state==='active'&&!!candidate.accountRecord.bindings[candidate.source.branch]} onChange={event=>setImportMatch(match=>match?{...match,candidates:match.candidates.map(item=>item.key===candidate.key?{...item,target:{...item.target,branch:event.target.value}}:item),comparisons:{...match.comparisons,[candidate.key]:{status:'error',error:'分支已修改，请重新对比'}}}:match)} className="w-full mt-1 p-2 bg-white border border-[#DFD8CE] rounded-lg" /></label>
                 {comparison?.status === 'loading' && <p role="status" className="text-[#7A7367]">正在校验仓库身份并对比文件…</p>}
                 {comparison?.status === 'error' && <p role="alert" className="text-[#8C5D54]">无法沿用：{comparison.error}</p>}
                 {comparison?.status === 'ready' && <div className="flex flex-col gap-2 text-[#5D6F5A]">
@@ -4194,23 +4242,23 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <p role="status">相对目标：新增 {comparison.diff!.added.length} · 修改 {comparison.diff!.modified.length} · 删除 {comparison.diff!.removed.length}</p>
                   {!candidate.fullFork && <p className="text-[#7A7367]">应用自动生成的 GITVAULT_METADATA.md 不计入差异；来源自带的同名文件仍会比较。</p>}
                   {!comparison.diff!.added.length && !comparison.diff!.modified.length && !comparison.diff!.removed.length && <p>当前文件内容与文件模式一致。</p>}
-                  <p className="text-[#7A7367]">文件差异不影响同一来源的识别。沿用后上传会按来源快照覆盖该目标分支的文件，并保留提交历史。</p>
+                  <p className="text-[#7A7367]">待确认候选不代表同一项目。确认沿用后，上传会按来源快照更新该目标分支的文件，并保留提交历史。</p>
                   {candidate.fullFork && <p className="text-[#7A7367]">此处对比当前分支；后续“分叉同步”会同步该分叉的全部上游分支。</p>}
                   {comparison.diff!.added.length + comparison.diff!.modified.length + comparison.diff!.removed.length > 0 && <details><summary className="cursor-pointer">查看文件差异</summary><div className="max-h-40 overflow-y-auto mt-2 flex flex-col gap-1 break-all">{(['added', 'modified', 'removed'] as const).flatMap((kind, index) => comparison.diff![kind].map(path => <p key={`${kind}:${path}`}>{['新增', '修改', '删除'][index]} · {path}</p>))}</div></details>}
                 </div>}
                 <div className="grid grid-cols-2 gap-2 mt-1">
                   <button type="button" disabled={comparison?.status === 'loading'} onClick={() => void compareImportBase(candidate)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl text-[#5D6F5A] disabled:opacity-40">{comparison?.status === 'ready' ? '重新对比' : '对比此项目'}</button>
-                  <button type="button" disabled={comparison?.status !== 'ready'} onClick={() => comparison?.status === 'ready' && importResolver.current?.({ candidate, comparison })} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl disabled:opacity-40">{candidate.fullFork ? '沿用分叉同步' : '沿用上传目标'}</button>
+                  <button type="button" disabled={comparison?.status !== 'ready'} onClick={() => comparison?.status === 'ready' && importResolver.current?.({ candidate, comparison, excluded:importMatch.excluded })} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl disabled:opacity-40">{candidate.fullFork ? '沿用分叉同步' : '沿用上传目标'}</button>
                 </div>
-                {comparison?.status==='ready' && !comparison.equal && <button type="button" onClick={()=>importResolver.current?.({candidate,comparison,updateNow:true})} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl">更新此仓库（保留历史）</button>}
-                {comparison?.status==='ready' && <div className="flex flex-col gap-2 border-t border-[#DFD8CE] pt-2"><label>使用其他名称上传<input aria-label="导入另存仓库名" value={importNewName} onChange={event=>setImportNewName(event.target.value)} placeholder="新的仓库名称" className="mt-1 p-2 w-full bg-white border border-[#DFD8CE] rounded-lg" /></label><button type="button" disabled={!/^[a-zA-Z0-9._-]{1,100}$/.test(importNewName.trim())} onClick={()=>importResolver.current?.({candidate,comparison,newName:importNewName.trim()})} className="px-3 py-2 border border-[#DFD8CE] text-[#5D6F5A] rounded-xl disabled:opacity-40">使用新名称上传并固定</button></div>}
+                {comparison?.status==='ready' && !comparison.equal && <button type="button" onClick={()=>importResolver.current?.({candidate,comparison,updateNow:true,excluded:importMatch.excluded})} className="px-3 py-2 bg-[#8E9F8B] text-white rounded-xl">更新此仓库（保留历史）</button>}
+                {comparison?.status==='ready' && <div className="flex flex-col gap-2 border-t border-[#DFD8CE] pt-2"><label>使用其他名称上传<input aria-label="导入另存仓库名" value={importNewName} onChange={event=>setImportNewName(event.target.value)} placeholder="新的仓库名称" className="mt-1 p-2 w-full bg-white border border-[#DFD8CE] rounded-lg" /></label><button type="button" disabled={!/^[a-zA-Z0-9._-]{1,100}$/.test(importNewName.trim())} onClick={()=>importResolver.current?.({candidate,comparison,newName:importNewName.trim(),excluded:importMatch.excluded})} className="px-3 py-2 border border-[#DFD8CE] text-[#5D6F5A] rounded-xl disabled:opacity-40">使用新名称上传并固定</button></div>}
               </div>;
             })}
           </div>
           <div className="flex flex-row flex-wrap justify-end gap-2 border-t border-[#EDE7DF] pt-3">
             <button type="button" disabled={isCancelling} onClick={cancelGithubOperation} className="px-3 py-2 text-xs text-[#8C5D54]">取消本次导入</button>
             <button type="button" onClick={() => importResolver.current?.('skip')} className="px-3 py-2 text-xs border border-[#DFD8CE] rounded-xl text-[#554F45]">跳过此链接</button>
-            <button type="button" onClick={() => importResolver.current?.('independent')} className="px-3 py-2 text-xs bg-[#EFECE6] rounded-xl text-[#554F45]">独立导入，不关联</button>
+            <button type="button" onClick={() => rejectImportCandidates()} className="px-3 py-2 text-xs bg-[#EFECE6] rounded-xl text-[#554F45]">独立导入，不关联</button>
           </div>
         </div>
       </div>}
