@@ -30,7 +30,7 @@ if (new URLSearchParams(location.search).has('audit-batch')) {
     const url = new URL(String(input));
     if (init.method && init.method !== 'GET') throw new Error('Writes are prohibited in the layout audit');
     if (url.pathname === '/user') return new Response(JSON.stringify({login:'audit-account'}),{status:200});
-    if (url.pathname === '/user/repos') {
+    if (url.pathname === '/repos/audit-account/.gitvault-state') {
       const state = new URLSearchParams(location.search).get('audit-batch');
       if (state==='error') return new Response(JSON.stringify({message:'Resource not accessible '+ 'long-failure-reason-'.repeat(30)}),{status:403});
       if (state==='limited') return new Response(JSON.stringify({message:'You have exceeded a secondary rate limit'}),{status:403,headers:{'Retry-After':'120'}});
@@ -196,7 +196,9 @@ function inspect(doc, width, scenario) {
         if(scenario.startsWith('import-search')) {
           if(scenario==='import-search-empty'){if(!doc.body.textContent.includes('快速查询暂无候选'))throw new Error('Missing empty discovery explanation');}
           else {set(doc.querySelector('[aria-label="已有仓库关键词"]'),'renamed');await pause();await click(doc,'搜索当前账号');
-            for(let tries=0;tries<100&&!doc.body.textContent.includes('找到')&&!doc.body.textContent.includes('Resource not accessible')&&!buttons(doc).some(button=>button.textContent==='取消查找');tries++)await pause();
+            const ready=()=>scenario==='import-search-error'?doc.body.textContent.includes('Resource not accessible'):scenario==='import-search-running'||scenario==='import-search-cancelled'?buttons(doc).some(button=>button.textContent==='取消查找'):doc.body.textContent.includes('找到');
+            for(let tries=0;tries<100&&!ready();tries++)await pause();
+            if(!ready())throw new Error('Search fixture did not reach its expected state');
             if(scenario==='import-search-error'&&!doc.body.textContent.includes('Resource not accessible'))throw new Error('Missing search failure');
             if(scenario==='import-search-cancelled'){await click(doc,'取消查找');for(let tries=0;tries<100&&!doc.body.textContent.includes('查找已取消');tries++)await pause();if(!doc.body.textContent.includes('查找已取消'))throw new Error('Search did not cancel');}
           }
