@@ -64,7 +64,7 @@ final class GitNetwork implements HttpConnectionFactory,ProgressMonitor,AutoClos
         public InputStream getInputStream()throws IOException{check();return new FilterInputStream(http.getInputStream()){
             @Override public int read()throws IOException{check();return super.read();}
             @Override public int read(byte[] bytes,int offset,int length)throws IOException{check();return in.read(bytes,offset,length);}
-            @Override public void close()throws IOException{try{super.close();}finally{forget(http);}}
+            @Override public void close()throws IOException{try{super.close();}finally{connections.remove(http);}}
         };}
         public String getHeaderField(String name){return http.getHeaderField(name);}
         public List<String> getHeaderFields(String name){List<String> result=new ArrayList<>();for(Map.Entry<String,List<String>> entry:http.getHeaderFields().entrySet())if(name.equalsIgnoreCase(entry.getKey())&&entry.getValue()!=null)result.addAll(entry.getValue());return result;}
