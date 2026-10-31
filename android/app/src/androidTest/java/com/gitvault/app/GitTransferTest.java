@@ -72,6 +72,8 @@ public class GitTransferTest {
             ObjectId tree=GitVaultGitPlugin.writeSnapshot(git.getRepository(),files,stop);ObjectId first;
             try(ObjectInserter insert=git.getRepository().newObjectInserter()) {CommitBuilder commit=new CommitBuilder();PersonIdent author=new PersonIdent("GitVault","gitvault@example.invalid");commit.setAuthor(author);commit.setCommitter(author);commit.setTreeId(tree);commit.setMessage("first");first=insert.insert(commit);insert.flush();}
             git.push().setRemote(destination.toURI().toString()).setRefSpecs(new RefSpec(first.name()+":refs/heads/dev")).call();
+            assertTrue(GitVaultGitPlugin.hasCommitTree(git.getRepository(),first.name()));
+            assertFalse(GitVaultGitPlugin.hasCommitTree(git.getRepository(),"ffffffffffffffffffffffffffffffffffffffff"));
             assertNull(remote.getRepository().exactRef("refs/heads/main"));assertEquals(first,remote.getRepository().exactRef("refs/heads/dev").getObjectId());
             JSObject snapshot=GitVaultGitPlugin.readSnapshot(git.getRepository(),first.name(),stop);assertEquals(3,snapshot.getJSONArray("files").length());assertEquals(tree.name(),snapshot.getString("treeSha"));
             JSArray next=new JSArray();next.put(file("new.txt","new","100644"));ObjectId nextTree=GitVaultGitPlugin.writeSnapshot(git.getRepository(),next,stop);ObjectId second;
@@ -85,7 +87,10 @@ public class GitTransferTest {
         File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-https-test-"+System.nanoTime());
         try(Git git=Git.init().setBare(true).setDirectory(folder).call()){
             String commit="b9ad1a1688992240e27b84e90be514c6ee866110";
-            git.fetch().setRemote("https://github.com/tingtingFtt/Get-Up_GitVault.git").setTimeout(60).setDepth(1).setRefSpecs(new RefSpec(commit+":refs/gitvault/source")).call();
+            AtomicBoolean stop=new AtomicBoolean();
+            try(GitNetwork network=new GitNetwork(stop,message->{})){
+                new GitTransferRecovery(stop,message->{},milliseconds->{}).read("public HTTPS",timeout->git.fetch().setRemote("https://github.com/tingtingFtt/Get-Up_GitVault.git").setTimeout(timeout).setTransportConfigCallback(network::configure).setDepth(1).setTagOpt(org.eclipse.jgit.transport.TagOpt.NO_TAGS).setProgressMonitor(network).setRefSpecs(new RefSpec(commit+":refs/gitvault/source")).call());
+            }
             JSObject snapshot=GitVaultGitPlugin.readSnapshot(git.getRepository(),commit,new AtomicBoolean());
             assertEquals(commit,snapshot.getString("commitSha"));assertTrue(snapshot.getJSONArray("files").length()>90);
         }finally{remove(folder);}

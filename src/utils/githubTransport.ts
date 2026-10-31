@@ -1,4 +1,4 @@
-import { markTransferFailure } from './transferFailure';
+import { markTransferFailure, transferFailureKind } from './transferFailure';
 export class GitHubError extends Error {
   constructor(message: string, public status: number, public rateLimited = false, public retryAt?: number) { super(message); }
 }
@@ -10,11 +10,12 @@ interface TransportOptions {
   requestInterval?: number;
   hourlyWrites?: number;
   retries?: number;
+  readRetries?: number;
   shareAcrossTabs?: boolean;
   onWait?: (message: string) => void;
 }
 function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  signal.throwIfAborted();
+  if (signal.aborted) { void promise.catch(() => {});return Promise.reject(signal.reason); }
   return new Promise((resolve, reject) => {
     const abort = () => reject(signal.reason);
     signal.addEventListener('abort', abort, { once: true });
@@ -43,6 +44,7 @@ export function createGithubTransport(options: TransportOptions = {}) {
   // Explicit rate-limit rejections are safe to resume. Keep the task alive until
   // it succeeds or the user cancels; uncertain writes are never replayed here.
   const retries = options.retries ?? Infinity;
+  const readRetries = options.readRetries ?? 2;
   let cooldown = 0, nextStart = 0, nextWrite = 0, readers = 0;
   let writeHistory: number[] = [];
   let writeTail = Promise.resolve(), admissionTail = Promise.resolve();
@@ -122,6 +124,7 @@ export function createGithubTransport(options: TransportOptions = {}) {
       const response = await fetch(url, { ...init, signal: controller.signal }).catch(error => {
         controller.signal.throwIfAborted(); throw markTransferFailure(error, 'network');
       });
+      controller.signal.throwIfAborted();
       if (!response.ok) {
         const bytes = await response.arrayBuffer();
         let message = new TextDecoder().decode(bytes);
@@ -150,25 +153,35 @@ export function createGithubTransport(options: TransportOptions = {}) {
       throw error;
     } finally { closed = true; clearTimeout(timer); signal.removeEventListener('abort', abort); }
   };
-  const executeRequest = async <T>(url: string, init: RequestInit, signal: AbortSignal, timeout: number, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idle=false): Promise<T> => {
+  const executeRequest = async <T>(url: string, init: RequestInit, signal: AbortSignal, timeout: number, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idle=false, replayConsumer=false): Promise<T> => {
       const queuedAt=clock.now();let entered=false,waitMs=0,requestMs=0,attempts=0,rateLimits=0;
       const write = !['GET', 'HEAD', 'OPTIONS'].includes((init.method || 'GET').toUpperCase());
       const execute = async () => {
         entered=true;waitMs+=Math.max(0,clock.now()-queuedAt);
+        let transientAttempts = 0;
         for (let attempt = 0; ; attempt++) {
           const waiting=clock.now();try{await admit(write, signal);}finally{waitMs+=Math.max(0,clock.now()-waiting);}
-          const started=clock.now();attempts++;
-          try { return await fetchOnce(url, init, signal, timeout, attempt, consume, idle); }
+          const started=clock.now();let retryWait=0;attempts++;
+          let consumed = false;
+          try { return await fetchOnce(url, init, signal, Math.min(timeout * 2 ** transientAttempts, Math.max(timeout, 180000)), attempt, (response, touch, requestSignal) => { consumed = true; return consume(response, touch, requestSignal); }, idle); }
           catch (error) {
             signal.throwIfAborted();
-            if (!(error instanceof GitHubError) || !error.rateLimited) throw error;
-            rateLimits++;
-            pause(error.retryAt!);
-            if (attempt >= retries) throw error;
-            // Only an explicit rate-limit rejection is replayed here. Lost
-            // mutation responses and 5xx remain the caller's reconciliation job.
+            if (error instanceof GitHubError && error.rateLimited) {
+              rateLimits++;
+              pause(error.retryAt!);
+              if (rateLimits > retries) throw error;
+            } else {
+              // Replay only safe reads. A streamed archive consumer may already
+              // have written verified files; its caller owns partial recovery.
+              const temporary = error instanceof GitHubError ? [408, 500, 502, 503, 504].includes(error.status) : transferFailureKind(error) === 'network';
+              if (write || !['GET', 'HEAD'].includes((init.method || 'GET').toUpperCase()) || consumed && !replayConsumer || !temporary || transientAttempts >= readRetries) throw error;
+              const delay = 1000 * 2 ** transientAttempts++;
+              notify(`GitHub 读取连接中断或超时，${delay / 1000} 秒后恢复（${transientAttempts}/${readRetries}）；可取消`);
+              const waiting = clock.now();
+              try { await clock.sleep(delay, signal); } finally { retryWait = Math.max(0, clock.now() - waiting);waitMs += retryWait; }
+            }
           } finally {
-            requestMs+=Math.max(0,clock.now()-started);
+            requestMs+=Math.max(0,clock.now()-started-retryWait);
             if (write) { nextWrite = clock.now() + writeInterval; persist(LAST_WRITE, String(nextWrite)); }
           }
         }
@@ -192,8 +205,23 @@ export function createGithubTransport(options: TransportOptions = {}) {
       }
     };
   return {
-    request(url: string, init: RequestInit, signal: AbortSignal, timeout = 45000): Promise<Response> {
-      return executeRequest(url, init, signal, timeout, async response => new Response(response.status === 204 ? null : await response.arrayBuffer(), { status: response.status, headers: response.headers }));
+    request(url: string, init: RequestInit, signal: AbortSignal, timeout = 90000): Promise<Response> {
+      return executeRequest(url, init, signal, timeout, async (response, touch, requestSignal) => {
+        if (response.status === 204 || !response.body) return new Response(null, { status: response.status, headers: response.headers });
+        const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+        const abort = () => { void reader.cancel(requestSignal.reason).catch(() => {}); };
+        requestSignal.addEventListener('abort', abort, { once: true });
+        try {
+          while (true) {
+            let next: ReadableStreamReadResult<Uint8Array>;
+            try { next = await reader.read(); } catch (error) { throw markTransferFailure(error, 'network'); }
+            requestSignal.throwIfAborted();
+            if (next.done) break;
+            chunks.push(next.value);touch();
+          }
+          return new Response(new Blob(chunks as BlobPart[]), { status: response.status, headers: response.headers });
+        } finally { requestSignal.removeEventListener('abort', abort);reader.releaseLock(); }
+      }, true, true);
     },
     stream<T>(url: string, init: RequestInit, signal: AbortSignal, consume: (response: Response, touch: () => void, signal: AbortSignal) => Promise<T>, idleTimeout = 60000): Promise<T> {
       if (!['GET', 'HEAD'].includes((init.method || 'GET').toUpperCase())) throw new Error('流式接口仅用于下载');

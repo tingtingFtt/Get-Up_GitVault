@@ -12,6 +12,7 @@ export function transferFailureKind(error: unknown): TransferFailureKind {
     const e = value as Error & { code?: string; status?: number; rateLimited?: boolean };
     if (e.rateLimited === true) return 'rate-limit';
     if (e.name === 'AbortError' || e.code === 'CANCELLED') return 'cancelled';
+    if (e.code === 'GIT_NETWORK') return 'network';
     if (e.name === 'QuotaExceededError' || e.code === 'ENOSPC' || e.code === 'INSUFFICIENT_SPACE') return 'storage-space';
     if (['NotAllowedError', 'SecurityError'].includes(e.name)) return 'storage-permission';
     const marked = marks.get(value); if (marked) return marked;

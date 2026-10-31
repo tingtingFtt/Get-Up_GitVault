@@ -1568,7 +1568,7 @@ test('HTTP difference can update the selected existing branch immediately while 
 test('HTTP renaming keeps ID, updates shared primary location and can be recovered on another device',async()=>{
  const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'renamed-copy');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].primarySource?.repo==='renamed-copy');
  await waitFor(()=>!document.querySelector('span[title].whitespace-pre-wrap'));
- const id=storedProjects()[0].uploadTarget.id;(globalThis as any).prompt=()=> 'renamed-again';await click('分叉与私有仓');await click('修改项目名称');await waitFor(()=>storedProjects()[0].uploadTarget.repo==='renamed-again');assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');assert.equal(server.document().projects[0].target.repo,'renamed-again');
+ const id=storedProjects()[0].uploadTarget.id;(globalThis as any).prompt=()=> 'renamed-again';await click('分叉与私有仓');await click('修改项目名称');await waitFor(()=>alerts.some(message=>message.includes('项目名称已修改')));assert.equal(storedProjects()[0].uploadTarget.repo,'renamed-again');assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');assert.equal(server.document().projects[0].target.repo,'renamed-again');
  await freshDevice();alerts=[];await importSourceLink();await waitFor(()=>alerts.length>0);assert.equal(storedProjects()[0].uploadTarget.id,id);assert.equal(storedProjects()[0].primarySource.repo,'renamed-again');
 });
 test('HTTP cancel a switch preserves its previous target and can resume after explicitly comparing the created destination',async()=>{
@@ -1604,6 +1604,7 @@ test('manual cache cleanup preserves files while a preview or transfer is readin
 
 for(const scenario of ['deleted','recreated'] as const)test(`HTTP fresh B retains an unavailable primary target after it is ${scenario}, without reading or overwriting a replacement`,async()=>{
   const server=accountHttpFixture();await enterWorkbench();await click('分叉与私有仓');const field=[...document.querySelectorAll<HTMLInputElement>('input')].find(item=>item.value==='project')!;await setField(field,'fixed-copy');await click('立即新建私人仓库并上传');await waitFor(()=>storedProjects()[0].remoteSnapshot);
+  await waitFor(()=>alerts.some(message=>message.includes('已验证完整上传'))&&!document.querySelector('span[title].whitespace-pre-wrap'));
   const previous=server.repositories.get('fixed-copy')!,fixedId=previous.id;
   if(scenario==='deleted')server.repositories.delete('fixed-copy');
   else server.repositories.set('fixed-copy',{...previous,id:fixedId+1000,refs:new Map([['main','init'],['develop','other-v']])});

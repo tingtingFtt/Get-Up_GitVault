@@ -54,7 +54,7 @@ function targetHealthEvent(target: TargetIdentity, health: TargetHealth, checkId
 }
 
 // Every operation, including account records and source blobs, uses one policy.
-async function request(path: string, token?: string, init: RequestInit = {}, signal = operationSignal(), timeout = 45000): Promise<Response> {
+async function request(path: string, token?: string, init: RequestInit = {}, signal = operationSignal(), timeout = 90000): Promise<Response> {
   return githubTransport.request(path.startsWith('https://') ? path : `https://api.github.com${path}`, {
     ...init, headers: { ...headers(token), ...init.headers },
   }, signal, timeout);
@@ -81,6 +81,19 @@ function body(method: string, value: unknown): RequestInit {
 }
 const refPath = (ref: string) => ref.split('/').map(encodeURIComponent).join('/');
 const root = (owner: string, repo: string) => `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+function temporaryConnectionFailure(error: unknown) {
+  return error instanceof GitHubError ? !error.rateLimited && [408, 500, 502, 503, 504].includes(error.status) : transferFailureKind(error) === 'network';
+}
+async function waitForUploadRecovery(attempt: number, signal: AbortSignal) {
+  const delay = 1000 * 2 ** attempt;
+  progress(`上传连接中断，已核对远端，${delay / 1000} 秒后恢复（${attempt + 1}/2）；可取消`);
+  await new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, delay);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
 export function parseRepository(url: string) {
   const input = url.trim();
   const full = /^https?:\/\//i.test(input) ? new URL(input) : null;
@@ -497,14 +510,37 @@ export const githubClient = {
     const checkpoints = typeof indexedDB !== 'undefined' && Number.isSafeInteger(checkpointId) && checkpointId > 0 ? uploadCache : undefined;
     const acknowledged = checkpoints ? await checkpoints.load(checkpointId) : new Set<string>();
     const verifiedBlobs = new Set([...existing.values()].filter(item => item.type === 'blob').map(item => item.sha));
+    const writeObject = async (kind: 'blobs' | 'trees', hash: string, payload: unknown) => {
+      for (let attempt = 0; ; attempt++) {
+        try { return await json(`${base}/git/${kind}`, token, body('POST', payload), signal); }
+        catch (error) {
+          signal.throwIfAborted();
+          if (!temporaryConnectionFailure(error)) throw error;
+          // Content-addressed objects can be recovered by their expected SHA.
+          // An unreadable remote is never treated as an absent object.
+          try {
+            const remote = await json(`${base}/git/${kind}/${hash}`, token, { cache: 'no-store' }, signal);
+            if (remote.sha !== hash || kind === 'blobs' && await gitBlobSha(bytesFromBase64(remote.content)) !== hash) throw new Error('恢复上传时远程对象校验失败，本地文件已保留');
+            return remote;
+          } catch (lookupError) {
+            signal.throwIfAborted();
+            if (!(lookupError instanceof GitHubError) || lookupError.status !== 404) throw lookupError;
+          }
+          if (attempt >= 2) throw error;
+          await waitForUploadRecovery(attempt, signal);
+          await githubClient.repository(targetOwner, targetRepo, token, identity.id, signal);
+        }
+      }
+    };
     let inlineBudget = 2 * 1024 * 1024, inlineCount = 0;
     let pendingText: Array<{item: {path:string;mode:string;type:string;content?:string;sha?:string}; sha:string}> = [];
     const flushText = async () => {
       if (!pendingText.length) return;
       progress(`正在合并上传 ${pendingText.length} 个文本文件…`);
-      const result = await json(`${base}/git/trees`,token,body('POST',{tree:pendingText.map(entry=>entry.item)}),signal);
       const hashes = pendingText.map(entry=>({path:entry.item.path,mode:entry.item.mode,sha:entry.sha}));
-      if (result.sha !== await gitTreeSha(hashes)) throw new Error('文本批次文件树校验失败，未更新目标分支；本地文件已保留');
+      const expectedTree = await gitTreeSha(hashes);
+      const result = await writeObject('trees', expectedTree, {tree:pendingText.map(entry=>entry.item)});
+      if (result.sha !== expectedTree) throw new Error('文本批次文件树校验失败，未更新目标分支；本地文件已保留');
       if (checkpoints) await checkpoints.saveBatch(checkpointId,hashes.map(entry=>entry.sha));
       for (const entry of pendingText) { delete entry.item.content; entry.item.sha=entry.sha; verifiedBlobs.add(entry.sha); }
       pendingText=[];inlineBudget=2*1024*1024;
@@ -537,7 +573,7 @@ export const githubClient = {
           } catch (error) { if (!(error instanceof GitHubError) || error.status !== 404) throw error; }
         }
         if (!reusable) {
-          const blob = await json(`${base}/git/blobs`, token, body('POST', { content: file.content, encoding: file.isBase64 ? 'base64' : 'utf-8' }), signal);
+          const blob = await writeObject('blobs', hash, { content: file.content, encoding: file.isBase64 ? 'base64' : 'utf-8' });
           sha = blob.sha;
           if (sha !== hash) throw new Error(`上传文件校验失败: ${file.path}`);
           if (checkpoints) await checkpoints.save(checkpointId, hash);
@@ -556,7 +592,7 @@ export const githubClient = {
     trace.phase('生成提交并验证目标分支');
     // Build an exact snapshot. Omitting base_tree applies source deletions as well.
     let treeSha: string;
-    if (treeItems.length) treeSha = (await json(`${base}/git/trees`, token, body('POST', { tree: treeItems }))).sha;
+    if (treeItems.length) treeSha = (await writeObject('trees', await gitTreeSha(expectedFiles), { tree: treeItems })).sha;
     else {
       // Git's well-known empty tree supports legitimate empty source commits.
       treeSha = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -567,7 +603,7 @@ export const githubClient = {
       signal.throwIfAborted();
       const commit = expectedParent && parentTree === treeSha ? { sha: expectedParent } : await json(`${base}/git/commits`, token, body('POST', { message: commitMessage || 'Sync complete project snapshot via GitVault', tree: treeSha, parents: expectedParent ? [expectedParent] : [] }), signal);
       let moved = '';
-      try {
+      for (let writeAttempt = 0; ; writeAttempt++) { try {
         if (expectedParent) {
           const current = await readHead();
           if (current !== expectedParent && current !== commit.sha) moved = current;
@@ -575,15 +611,20 @@ export const githubClient = {
         } else await json(`${base}/git/refs`, token, body('POST', { ref: `refs/heads/${branch}`, sha: commit.sha }), signal);
       } catch (error) {
         signal.throwIfAborted();
-        if (error instanceof GitHubError && error.status < 500 && ![409, 422].includes(error.status)) throw error;
+        if (error instanceof GitHubError && error.status < 500 && ![408, 409, 422].includes(error.status)) throw error;
         let actual: string;
-        try { actual = await readHead(); } catch { throw error; }
+        try { actual = await readHead(); } catch (lookupError) { signal.throwIfAborted(); if (!expectedParent && lookupError instanceof GitHubError && lookupError.status === 404) actual = ''; else throw lookupError; }
         if (actual !== commit.sha) {
           if (actual !== expectedParent) moved = actual;
           else if (error instanceof GitHubError && error.status === 422 && /fast.forward/i.test(error.message)) throw new GitHubError(`${error.message}；目标分支 ${branch} 拒绝非快进更新，本地源码已保留。请重新读取目标版本后重试，或选择新分支；不会强制覆盖远程历史。`, error.status);
+          else if (temporaryConnectionFailure(error) && writeAttempt < 2) {
+            await waitForUploadRecovery(writeAttempt, signal);
+            await githubClient.repository(targetOwner, targetRepo, token, identity.id, signal);
+            continue;
+          }
           else throw error;
         }
-      }
+      } break; }
       if (!moved) {
         progress('正在验证目标提交和分支…');
         const verifiedHead = await readHead();

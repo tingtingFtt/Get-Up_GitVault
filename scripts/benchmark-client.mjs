@@ -22,13 +22,13 @@ export async function benchmarkClient(original){
  const savedTransport={...githubTransport},originalFetch=globalThis.fetch;
  Object.assign(githubTransport,createGithubTransport({writeInterval:0,requestInterval:0,shareAcrossTabs:false,retries:0}));
  localStorage.setItem('gitvault_git_service_v1',JSON.stringify({mode:'rest',url:''}));
- let source=original,sourceCommit='source-1',sequence=0,partialZip=false,dropRead=false,dropWriteAt=0,blobWrites=0;
+ let source=original,sourceCommit='source-1',sequence=0,partialZip=false,dropRead=false,dropWriteAt=0,dropWriteOnce=false,blobWrites=0;
  let stats,handlerFailure;
  const originalDigest=crypto.subtle.digest.bind(crypto.subtle),originalPut=IDBObjectStore.prototype.put;
  crypto.subtle.digest=async(...args)=>{if(stats)stats.hashCalls++;return originalDigest(...args);};
  IDBObjectStore.prototype.put=function(...args){if(stats&&this.name==='file_contents')stats.bodyWrites++;return originalPut.apply(this,args);};
  const empty=await gitTreeSha([]),trees=new Map([[empty,[]]]),commits=new Map([['seed',{tree:{sha:empty},parents:[]}]]),blobs=new Map();
- const targets=new Map([['target',{id:77,refs:new Map([['main','seed']])}],['resume-target',{id:78,refs:new Map([['main','seed']])}]]);
+ const targets=new Map([['target',{id:77,refs:new Map([['main','seed']]),objects:new Set()}],['resume-target',{id:78,refs:new Map([['main','seed']]),objects:new Set()}]]);
  const manifest=files=>files.map(({path,sha,mode,size})=>({path,sha,mode,size,type:'blob'}));
  const refresh=async()=>{const tree=await gitTreeSha(source);trees.set(tree,manifest(source));commits.set(sourceCommit,{tree:{sha:tree},message:'source',author:{}});for(const file of source)blobs.set(file.sha,file.bytes);};
  await refresh();let zip=zipSync(Object.fromEntries(source.map(file=>['root/'+file.path,file.bytes])),{level:1});
@@ -46,18 +46,18 @@ export async function benchmarkClient(original){
    if(target&&!suffix)return send({id:target.id,owner:{login:'me'},name:match[1],default_branch:'main',private:true});
    if(target&&suffix.startsWith('/git/ref/heads/')){const sha=target.refs.get(suffix.slice('/git/ref/heads/'.length));return sha?send({object:{sha}}):send({message:'Not Found'},404);}
    if(target&&suffix==='/git/blobs'&&method==='POST'){
-    if(dropWriteAt&&++blobWrites===dropWriteAt){stats.interruptions++;req.socket.destroy();return;}
-    const bytes=Buffer.from(payload.content,payload.encoding==='base64'?'base64':'utf8'),sha=await gitBlobSha(bytes);blobs.set(sha,bytes);stats.blobWrites++;return send({sha});
+    if(dropWriteAt&&++blobWrites>=dropWriteAt){stats.interruptions++;if(dropWriteOnce)dropWriteAt=0;req.socket.destroy();return;}
+    const bytes=Buffer.from(payload.content,payload.encoding==='base64'?'base64':'utf8'),sha=await gitBlobSha(bytes);blobs.set(sha,bytes);target.objects.add(sha);stats.blobWrites++;return send({sha});
    }
    if(path.includes('/git/blobs/')){
     if(dropRead){stats.interruptions++;req.socket.destroy();return;}
-    const sha=path.split('/').at(-1),bytes=blobs.get(sha);stats.blobReads++;return bytes?send({sha,encoding:'base64',content:Buffer.from(bytes).toString('base64')}):send({message:'Not Found'},404);
+    const sha=path.split('/').at(-1),bytes=target&&!target.objects.has(sha)?undefined:blobs.get(sha);stats.blobReads++;return bytes?send({sha,encoding:'base64',content:Buffer.from(bytes).toString('base64')}):send({message:'Not Found'},404);
    }
    if(target&&suffix==='/git/trees'&&method==='POST'){
-    const entries=[];for(const item of payload.tree){let sha=item.sha;if(item.content!==undefined){const bytes=Buffer.from(item.content);sha=await gitBlobSha(bytes);blobs.set(sha,bytes);}entries.push({path:item.path,sha,mode:item.mode,size:blobs.get(sha).length,type:'blob'});}
+    const entries=[];for(const item of payload.tree){let sha=item.sha;if(item.content!==undefined){const bytes=Buffer.from(item.content);sha=await gitBlobSha(bytes);blobs.set(sha,bytes);}target.objects.add(sha);entries.push({path:item.path,sha,mode:item.mode,size:blobs.get(sha).length,type:'blob'});}
     const sha=await gitTreeSha(entries);trees.set(sha,entries);return send({sha});
    }
-   if(path.includes('/git/trees/'))return send({tree:trees.get(path.split('/').at(-1)),truncated:false});
+   if(path.includes('/git/trees/'))return send({sha:path.split('/').at(-1),tree:trees.get(path.split('/').at(-1)),truncated:false});
    if(target&&suffix==='/git/commits'&&method==='POST'){const sha=createHash('sha1').update(JSON.stringify(payload)+ ++sequence).digest('hex');commits.set(sha,{tree:{sha:payload.tree},parents:payload.parents});return send({sha});}
    if(path.includes('/git/commits/'))return send(commits.get(path.split('/').at(-1)));
    if(target&&suffix==='/git/refs'&&method==='POST'){assert.ok(!target.refs.has(payload.ref.slice(11)));target.refs.set(payload.ref.slice(11),payload.sha);return send({object:{sha:payload.sha}});}
@@ -97,6 +97,8 @@ export async function benchmarkClient(original){
   const updated=await measure('small-update-upload',()=>push('target',cached(source)));assert.equal(commits.get(updated.commitSha).parents[0],initial.commitSha);assert.equal(results.at(-1).blobWrites,4);
   dropWriteAt=9;blobWrites=0;await measure('interrupted-upload',()=>push('resume-target',cached(source)),true);assert.ok(!targets.get('resume-target').refs.has('release'));
   dropWriteAt=0;const resumedUpload=await measure('resume-upload',()=>push('resume-target',cached(source)));assert.equal(resumedUpload.treeSha,await gitTreeSha(source));assert.equal(results.at(-1).blobWrites,new Set(cached(source).filter(file=>file.isBase64).map(file=>file.sha)).size-8);assert.equal(results.at(-1).blobReads,8);
+  targets.set('auto-target',{id:79,refs:new Map([['main','seed']]),objects:new Set()});dropWriteAt=9;dropWriteOnce=true;blobWrites=0;
+  const auto=await measure('automatic-upload-recovery',()=>push('auto-target',cached(source)));assert.equal(auto.treeSha,await gitTreeSha(source));assert.equal(results.at(-1).interruptions,1);assert.equal(results.at(-1).blobWrites,new Set(cached(source).filter(file=>file.isBase64).map(file=>file.sha)).size);dropWriteOnce=false;
   await transferCache.clearAll();partialZip=true;dropRead=true;
   await measure('interrupted-pull',()=>githubClient.fetchRepo('source/project',undefined,'benchmark-placeholder'),true);
   const checkpoint=await transferCache.load('source/project@'+sourceCommit);

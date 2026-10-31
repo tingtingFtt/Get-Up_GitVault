@@ -2,6 +2,7 @@ import { test, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import 'fake-indexeddb/auto';
+import {gitTreeSha} from '../src/utils/gitFiles';
 import { githubClient, beginGithubOperation, cancelGithubOperation, gitBlobSha, parseRepository, TargetRepositoryError } from '../src/utils/githubClient';
 import { transferCache, localCache, uploadCache } from '../src/utils/localCache';
 import type { CachedFile } from '../src/utils/localCache';
@@ -263,16 +264,17 @@ test('uploads exact snapshot to the selected branch without force and verifies i
 test('an interrupted upload resumes acknowledged blobs from IndexedDB and verifies them before reuse', async () => {
   destination(); const base = handler;
   const files = [file('first.txt', 'first bytes'), file('second.txt', 'second bytes')];
-  const acknowledged = new Map<string, string>(); let interrupted = false;
+  const acknowledged = new Map<string, string>(); let interrupted = 0;
   handler = (path, init) => {
     if (path === '/repos/me/backup') return response({ id: 77, default_branch: 'main' });
     if (path.endsWith('/git/blobs') && init.method === 'POST') {
       const payload = JSON.parse(String(init.body));
-      if (payload.content === 'second bytes' && !interrupted) { interrupted = true; throw new TypeError('connection interrupted'); }
+      if (payload.content === 'second bytes' && interrupted++ < 3) throw new TypeError('connection interrupted');
       acknowledged.set(sha(payload.content), payload.content);
     }
     if (path.includes('/git/blobs/')) {
       const hash = path.split('/').pop()!;
+      if (!acknowledged.has(hash)) return response({message:'Not Found'},404);
       return response({ sha: hash, content: Buffer.from(acknowledged.get(hash)!).toString('base64'), encoding: 'base64' });
     }
     return base(path, init);
@@ -447,6 +449,49 @@ test('lost successful update response is verified without sending another write'
   };
   const result = await githubClient.push('me', 'backup', 'release', 'token', [file('a', 'new')], 'sync');
   assert.equal(result.verified, true); assert.equal(calls.filter(c => c.init.method === 'PATCH').length, 1);
+});
+
+test('lost successful blob and tree responses recover by content hash without duplicate object writes',async()=>{
+  destination();const base=handler,entry=file('a.txt','new'),tree=await gitTreeSha([{path:entry.path,mode:entry.mode!,sha:entry.sha!}]);let blobWrites=0,treeWrites=0;
+  handler=(path,init)=>{
+    if(path==='/repos/me/backup')return response({id:77,default_branch:'main'});
+    if(path.endsWith('/git/blobs')&&init.method==='POST'){blobWrites++;throw new TypeError('blob response lost');}
+    if(path.endsWith('/git/blobs/'+entry.sha))return response({sha:entry.sha,content:Buffer.from('new').toString('base64'),encoding:'base64'});
+    if(path.endsWith('/git/trees')&&init.method==='POST'){treeWrites++;throw new TypeError('tree response lost');}
+    if(path.endsWith('/git/trees/'+tree))return response({sha:tree,tree:[{path:entry.path,mode:entry.mode,type:'blob',sha:entry.sha}]});
+    if(path.endsWith('/git/commits/new-commit'))return response({tree:{sha:tree}});
+    return base(path,init);
+  };
+  const result=await githubClient.push('me','backup','release','token',[entry],'sync');
+  assert.ok(result.verified);assert.equal(blobWrites,1);assert.equal(treeWrites,1);assert.deepEqual([...await uploadCache.load(77)],[entry.sha]);
+});
+test('a failed branch write retries the same commit only after confirming the old head',async()=>{
+  destination();const base=handler;let patches=0,refs=0;
+  handler=(path,init)=>{
+    if(path==='/repos/me/backup')return response({id:77,default_branch:'main'});
+    if(init.method==='PATCH'&&++patches===1)throw new TypeError('connection reset before write');
+    if(path.endsWith('/git/ref/heads/release'))refs++;
+    return base(path,init);
+  };
+  const result=await githubClient.push('me','backup','release','token',[file('a','new')],'sync');
+  assert.ok(result.verified);assert.equal(patches,2);assert.ok(refs>=4);
+  const writes=calls.filter(call=>call.init.method==='PATCH');assert.equal(writes[0].init.body,writes[1].init.body);
+  assert.equal(calls.filter(call=>call.path.endsWith('/git/commits')&&call.init.method==='POST').length,1);
+});
+test('recovery refuses a recreated repository and cancellation stops upload backoff',async()=>{
+  for(const cancel of [false,true]){
+    beginGithubOperation();destination();const base=handler;let identityReads=0,patches=0;
+    handler=(path,init)=>{
+      if(path==='/repos/me/backup')return response({id:++identityReads>1?88:77,default_branch:'main'});
+      if(init.method==='PATCH'){patches++;throw new TypeError('connection reset');}
+      if(path.includes('/git/blobs/'))return response({message:'Not Found'},404);
+      return base(path,init);
+    };
+    const rejected=assert.rejects(githubClient.push('me','backup','release','token',[file('a','new')],'sync'),cancel?{name:'AbortError'}:/身份已变化/);
+    if(cancel){while(!patches)await new Promise(resolve=>setImmediate(resolve));cancelGithubOperation();}
+    await rejected;
+    assert.equal(patches,1);
+  }
 });
 
 test('reference reads bypass stale caches and new commits use the target parent', async () => {

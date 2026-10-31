@@ -155,3 +155,45 @@ test('production policy survives more than two rate rejections and resumes the s
  const response=await f.request('POST');assert.equal(response.status,200);assert.equal(f.calls.length,6);
  assert.deepEqual(f.calls.map(call=>call.at-origin),[0,60000,180000,420000,900000,1860000]);
 });
+
+test('safe reads recover transient disconnects and gateway errors with bounded backoff', async()=>{
+  const f=fixture();let count=0;
+  f.handle(async()=>{if(++count===1)throw new TypeError('connection reset');return count===2?ok({message:'gateway'},503):ok({ready:true});});
+  assert.deepEqual(await (await f.request()).json(),{ready:true});
+  assert.equal(f.calls.length,3);assert.equal(f.calls[1].at-origin,1000);assert.equal(f.calls[2].at-origin,3000);
+  assert.ok(f.waits.every(message=>message.includes('可取消')));
+  const denied=fixture();denied.handle(async()=>ok({message:'Forbidden'},403));await assert.rejects(denied.request());assert.equal(denied.calls.length,1);
+});
+test('safe reads stop after two reconnect attempts and cancellation stops backoff immediately',async()=>{
+  const f=fixture();f.handle(async()=>{throw new TypeError('offline');});await assert.rejects(f.request(),/offline/);assert.equal(f.calls.length,3);
+  const other=fixture(),controller=new AbortController();other.handle(async()=>{throw new TypeError('offline');});
+  other.clock.sleep=async(_ms,signal)=>{controller.abort();signal.throwIfAborted();};
+  await assert.rejects(other.request('GET',controller.signal),{name:'AbortError'});assert.equal(other.calls.length,1);
+});
+test('buffered reads discard truncated responses and recover without exposing partial JSON',async()=>{
+  const f=fixture();let count=0;
+  f.handle(async()=>++count===1?new Response(new ReadableStream({start(controller){controller.enqueue(new TextEncoder().encode('{"partial":'));controller.error(new TypeError('unexpected end of stream'));}})):ok({complete:true}));
+  assert.deepEqual(await (await f.request()).json(),{complete:true});assert.equal(f.calls.length,2);
+});
+test('buffered request deadline tracks activity rather than total response duration',async()=>{
+  const f=fixture({requestInterval:0});let chunks=0;
+  f.handle(async()=>new Response(new ReadableStream({async pull(controller){await new Promise(resolve=>setTimeout(resolve,30));if(chunks++<4)controller.enqueue(new Uint8Array([32]));else controller.close();}})));
+  const response=await f.transport.request('https://api.github.com/slow',{},new AbortController().signal,100);
+  assert.equal((await response.text()).length,4);assert.equal(f.calls.length,1);
+});
+test('timed out safe reads reconnect but user cancellation and mutations never do',async()=>{
+  for(const method of ['GET','POST']){
+    const f=fixture({requestInterval:0});let count=0;
+    f.handle(async()=>++count===1?new Response(new ReadableStream({start(){}})):ok({recovered:true}));
+    const pending=f.transport.request('https://api.github.com/stalled',{method},new AbortController().signal,15);
+    if(method==='GET'){assert.deepEqual(await(await pending).json(),{recovered:true});assert.equal(count,2);}
+    else{await assert.rejects(pending,{name:'TimeoutError'});assert.equal(count,1);}
+  }
+});
+test('streamed consumers are not replayed after producing partial output or storage errors',async()=>{
+  const f=fixture();let consumers=0;
+  await assert.rejects(f.transport.stream('https://api.github.com/archive',{},new AbortController().signal,async()=>{consumers++;throw new DOMException('idle','TimeoutError');}),{name:'TimeoutError'});
+  assert.equal(consumers,1);assert.equal(f.calls.length,1);
+  await assert.rejects(f.transport.stream('https://api.github.com/archive',{},new AbortController().signal,async()=>{throw new DOMException('full','QuotaExceededError');}),{name:'QuotaExceededError'});
+  assert.equal(f.calls.length,2);
+});
