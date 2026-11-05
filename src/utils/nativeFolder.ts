@@ -2,7 +2,7 @@ import {Capacitor} from '@capacitor/core';
 import {androidPlugin} from './androidPlugin';
 import {appDialog} from './appDialog';
 import {gitBlobSha} from './gitFiles';
-import {reportProgress, cooperate} from './operation';
+import {reportProgress, noteTransferActivity, cooperate} from './operation';
 import {rememberVerifiedFile} from './verifiedFiles';
 import {appendOperationLog} from './operationLog';
 import type {CachedFile} from './localCache';
@@ -16,18 +16,35 @@ export const folderBridge={
 export async function folderTask<T=any>(run:(options:any)=>Promise<T>,options:any,signal?:AbortSignal,progress=false):Promise<T>{
  signal?.throwIfAborted();if(!signal)return run(options);
  const taskId=crypto.randomUUID();let listener:any;
- if(progress)try{listener=await folderBridge.listen(event=>{if(event.taskId===taskId&&!signal.aborted)reportProgress(event.message);});}catch{}
+ if(progress)try{listener=await folderBridge.listen(event=>{if(event.taskId===taskId&&!signal.aborted)reportProgress(event.message,true,signal);});}catch{}
  const abort=()=>{void folderBridge.cancel({taskId}).catch(()=>{});};
  try{
   signal.throwIfAborted();
   const pending=run({...options,taskId});signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();
-  try{const result=await pending;signal.throwIfAborted();return result;}catch(error){signal.throwIfAborted();throw error;}
+  try{const result=await pending;signal.throwIfAborted();noteTransferActivity(signal);return result;}catch(error){signal.throwIfAborted();throw error;}
  }finally{signal.removeEventListener('abort',abort);await listener?.remove().catch(()=>{});}
 }
 export const folderRoot=()=>typeof localStorage==='undefined'?'':localStorage.getItem('gitvault_apk_download_dir')||'';
 export const hasFolderApi=()=>Capacitor.isNativePlatform()&&Capacitor.getPlatform()==='android'&&Capacitor.isPluginAvailable('GitVaultNative');
 export const usesNativeFolder=()=>hasFolderApi()&&folderRoot().startsWith('content://');
 export type FolderFiles=CachedFile[]&{nativeSnapshot?:{version:string;dirty:boolean;location?:string}};
+const nativeScans=new WeakMap<CachedFile,{signal?:AbortSignal;identity:string}>();
+const scanIdentity=(file:CachedFile)=>JSON.stringify([file.nativeRef?.version,file.nativeRef?.path,file.path,file.sha,file.size,file.mode]);
+export function hasCurrentNativeScan(file:CachedFile,signal?:AbortSignal){const proof=nativeScans.get(file);return !!file.nativeRef&&!!proof&&proof.signal===signal&&proof.identity===scanIdentity(file);}
+/** One real source scan; persistent handles / caller supplied flags cannot skip it. */
+export async function verifiedNativeManifest(files:CachedFile[],signal:AbortSignal):Promise<CachedFile[]>{
+ const scans=new Map<string,Map<string,CachedFile>>();const result:CachedFile[]=[];
+ for(const file of files){
+  signal.throwIfAborted();if(!file.nativeRef||hasCurrentNativeScan(file,signal)){result.push(file);continue;}
+  const version=file.nativeRef.version;let scan=scans.get(version);
+  if(!scan){const current=await folderFiles(version,true,signal);scan=new Map(current.map(value=>[value.path,value]));scans.set(version,scan);}
+  const current=scan.get(file.nativeRef.path);
+  if(!current||current.sha!==file.sha||current.size!==file.size||(current.mode||'100644')!==(file.mode||'100644'))throw new Error('目录文件在上传准备期间变化，请刷新后重试：'+file.path);
+  const verified=file.path===current.path?current:{...current,path:file.path};
+  nativeScans.set(verified,{signal,identity:scanIdentity(verified)});result.push(verified);
+ }
+ return result;
+}
 export async function withFolderConfirmation<T>(run:(force:boolean)=>Promise<T>,message:string,signal?:AbortSignal):Promise<T>{
  try{return await run(false);}catch(error){if((error as {code?:string}).code!=='LOCAL_CHANGES')throw error;if(!await appDialog.confirm(`${message}\n${(error as Error).message}\n确认后继续；取消会保留现有文件。`,{signal}))throw new DOMException('目录操作已取消','AbortError');return run(true);}
 }
@@ -58,13 +75,13 @@ export async function putFolderFile(version:string,file:CachedFile,signal?:Abort
  const bytes=!file.nativeRef?(file.isBase64?Uint8Array.from(atob(file.content.replace(/\s/g,'')),c=>c.charCodeAt(0)):new TextEncoder().encode(file.content)):undefined;
  const sha=file.sha||await gitBlobSha(bytes!);const size=file.size??bytes?.length;if(size===undefined)throw new Error('目录文件缺少大小');
  await cooperate(signal);
- if(file.nativeRef){await folderTask(folderBridge.copy,{version,nativeRef:file.nativeRef,path:file.path,sha,mode:file.mode||'100644',size},signal);}
+ if(file.nativeRef){await folderTask(folderBridge.copy,{version,nativeRef:file.nativeRef,path:file.path,sha,mode:file.mode||'100644',size},signal,true);}
  else if(file.isBase64){const text=file.content.replace(/\s/g,''),step=CHUNK/3*4;let offset=0;for(let at=0;at<text.length||at===0;at+=step){signal?.throwIfAborted();const data=text.slice(at,at+step);await folderTask(folderBridge.put,{version,path:file.path,sha,mode:file.mode||'100644',offset,data,done:at+step>=text.length},signal);offset+=data.length/4*3-(data.endsWith('==')?2:data.endsWith('=')?1:0);}}
  else{const bytes=new TextEncoder().encode(file.content);for(let offset=0;offset<bytes.length||offset===0;offset+=CHUNK){signal?.throwIfAborted();await folderTask(folderBridge.put,{version,path:file.path,sha,mode:file.mode||'100644',offset,data:encode(bytes.subarray(offset,offset+CHUNK)),done:offset+CHUNK>=bytes.length},signal);}}
  return {...file,sha,size,content:'',isBase64:true,nativeRef:{version,path:file.path}};
 }
 export async function folderFiles(version:string,scan=true,signal?:AbortSignal):Promise<FolderFiles>{
- const state=await folderTask(folderBridge.list,{version,scan},signal,scan);const files=(state.files||[]) as FolderFiles;if(!state.missing)files.nativeSnapshot={version,dirty:!!state.dirty,location:state.location};return files;
+ const state=await folderTask(folderBridge.list,{version,scan},signal,scan);const files=(state.files||[]) as FolderFiles;if(!state.missing){files.nativeSnapshot={version,dirty:!!state.dirty,location:state.location};if(scan)for(const file of files)if(file.nativeRef)nativeScans.set(file,{signal,identity:scanIdentity(file)});}return files;
 }
 export async function hydrateFile(file:CachedFile,maxBytes=Number.POSITIVE_INFINITY,signal?:AbortSignal):Promise<CachedFile>{
  if(!file.nativeRef)return file;if((file.size||0)>maxBytes)throw new Error('文件超过预览范围，请从项目主存储目录打开或使用文件下载');

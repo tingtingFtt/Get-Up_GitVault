@@ -35,3 +35,9 @@ export function planFileChanges(previous: FileIdentity[], next: FileIdentity[]) 
 export function shouldUseNativeBlobDelta(entries:SizedEntry[],missing:SizedEntry[]) {
  return missing.length>0&&missing.length<entries.length&&missing.length<=32&&missing.every(file=>Number.isSafeInteger(file.size)&&file.size!>=0)&&missing.reduce((sum,file)=>sum+file.size!,0)<=16*1024*1024;
 }
+/** Only updates to an existing destination; cold uploads remain native Git. */
+export function shouldUseNativePushDelta(previous:FileIdentity[],next:FileIdentity[]){
+ const plan=planFileChanges(previous,next),paths=new Set([...plan.added,...plan.modified]);
+ const changed=next.filter(file=>paths.has(file.path));
+ return plan.added.length+plan.modified.length+plan.removed.length<=32&&changed.every(file=>Number.isSafeInteger(file.size)&&file.size!>=0)&&changed.reduce((sum,file)=>sum+file.size!,0)<=16*1024*1024;
+}

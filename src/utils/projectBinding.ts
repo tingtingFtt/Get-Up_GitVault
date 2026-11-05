@@ -2,10 +2,25 @@ import { sourceOf, type ProjectSource, type RemoteSnapshot, type UploadTarget } 
 import type { TargetHistory } from './accountRegistry';
 import { sameTarget, targetHealthOf, type TargetHealth } from './targetLifecycle';
 export interface BindingProject extends ProjectSource {
-  origin?: ProjectSource; uploadTarget?: UploadTarget; forkScope?: 'current'|'full'; forkTarget?: UploadTarget;
+  origin?: ProjectSource; uploadTarget?: UploadTarget; forkScope?: 'current'|'full'; forkTarget?: Pick<UploadTarget,'id'|'owner'|'repo'|'branch'|'private'>;
   privateRepoUrl?: string; latestCommitSha: string; remoteSnapshot?: RemoteSnapshot;
   cloudPending?: unknown[]; creationReservation?: unknown; pendingSwitch?: unknown;
   targetHealth?: Record<string,TargetHealth>; accountState?: string; verification?: 'unchecked'|'checking'|'ready'|'error';
+  branchUploadPending?:boolean; hasUpdate?:boolean; upstreamStatus?:{hasUpdate?:boolean};
+}
+function hasVersionReceipt(project:BindingProject) {
+  const target=project.uploadTarget||project.forkTarget,receipt=project.remoteSnapshot;
+  return !!(target&&receipt?.commitSha&&receipt.sourceSha===project.latestCommitSha&&receipt.branch===target.branch&&sameTarget({...receipt,id:receipt.repoId},target)&&!project.branchUploadPending);
+}
+export function hasVerifiedSync(project:BindingProject) {
+ const target=project.uploadTarget||project.forkTarget;return hasVersionReceipt(project)&&!!target&&(!targetHealthOf(project,target)||targetHealthOf(project,target)?.status==='available');
+}
+export function isPrivateSynced(project:BindingProject) {
+  const target=project.uploadTarget||project.forkTarget;
+  return !!target&&!project.pendingSwitch&&hasVerifiedSync(project)&&(target.private===true||target.private===undefined&&!!project.privateRepoUrl);
+}
+export function needsProjectUpdate(project:BindingProject) {
+  return !!(project.hasUpdate||project.branchUploadPending||project.uploadTarget&&!hasVersionReceipt(project));
 }
 export function bindingLabel(project: BindingProject) {
   const target = project.uploadTarget || project.forkTarget;
@@ -14,12 +29,12 @@ export function bindingLabel(project: BindingProject) {
   const pending=project.cloudPending?.length || project.creationReservation ? ' · 账号记录待完成' : '';
   const health = targetHealthOf(project,target);
   if (health && health.status !== 'available') return '远端目标异常';
-  const synced = project.remoteSnapshot?.sourceSha === project.latestCommitSha && project.remoteSnapshot.branch === target.branch && sameTarget({...project.remoteSnapshot,id:project.remoteSnapshot.repoId},target);
+  const synced = hasVerifiedSync(project);
   if (project.forkScope === 'full' || project.forkTarget) return (synced ? '已分叉 · 已同步' : '已分叉 · 待同步') + pending;
   const privateRepo = target.private === true || target.private === undefined && !!project.privateRepoUrl;
   return (synced ? privateRepo ? '私人仓库已同步' : '已关联仓库 · 已同步' : '已绑定 · 待更新／待上传') + pending;
 }
-export function switchedHistory(project: { uploadTarget?: UploadTarget; forkTarget?: UploadTarget; forkScope?: 'current'|'full'; branchTargets?: Record<string,UploadTarget>; targetHistory?: TargetHistory[] }, now: string) {
+export function switchedHistory(project: { uploadTarget?: UploadTarget; forkTarget?: Pick<UploadTarget,'id'|'owner'|'repo'|'branch'|'private'>; forkScope?: 'current'|'full'; branchTargets?: Record<string,UploadTarget>; targetHistory?: TargetHistory[] }, now: string) {
   const target = project.uploadTarget || project.forkTarget;
   if (!target) return project.targetHistory || [];
   return [...(project.targetHistory || []), {target:{id:target.id,owner:target.owner,repo:target.repo,private:target.private},kind:project.forkScope || 'upload' as const,bindings:Object.fromEntries(Object.entries(project.branchTargets || {}).filter(([,binding])=>sameTarget(binding,target)).map(([branch,binding])=>[branch,{branch:binding.branch,updatedAt:now}])),changedAt:now}];

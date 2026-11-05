@@ -1,6 +1,13 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';
-import {bindingLabel,switchedHistory} from '../src/utils/projectBinding';
+import {bindingLabel,switchedHistory,isPrivateSynced,needsProjectUpdate} from '../src/utils/projectBinding';
 const project={owner:'source',repo:'project',url:'https://github.com/source/project',branch:'main',latestCommitSha:'s1',uploadTarget:{id:77,owner:'me',repo:'project',branch:'main',private:true,purgeAfterUpload:false},remoteSnapshot:{repoId:77,owner:'me',repo:'project',branch:'main',sourceSha:'s1',commitSha:'t1',htmlUrl:''}};
+test('dashboard private counts require matching branch and repository receipts instead of an address',()=>{
+ assert.equal(isPrivateSynced(project),true);assert.equal(needsProjectUpdate(project),false);
+ for(const extra of [{remoteSnapshot:undefined,privateRepoUrl:'https://github.com/me/project'},{remoteSnapshot:{...project.remoteSnapshot,repoId:78}},{remoteSnapshot:{...project.remoteSnapshot,branch:'dev'}},{branchUploadPending:true}])assert.equal(isPrivateSynced({...project,...extra}),false);
+ assert.equal(isPrivateSynced({...project,uploadTarget:{...project.uploadTarget,private:false},privateRepoUrl:'stale-url'}),false);
+ assert.equal(isPrivateSynced({...project,targetHealth:{'id:77':{...project.uploadTarget,status:'unavailable',message:'deleted',checkedAt:''}}}),false);
+ assert.equal(needsProjectUpdate({...project,hasUpdate:true}),true);assert.equal(needsProjectUpdate({...project,upstreamStatus:{hasUpdate:true}}),false);
+});
 test('labels use verified repository type, branch and receipt and preserve partial-cloud information',()=>{
  assert.equal(bindingLabel(project),'私人仓库已同步');assert.equal(bindingLabel({...project,uploadTarget:{...project.uploadTarget,private:false}}),'已关联仓库 · 已同步');assert.equal(bindingLabel({...project,forkScope:'full'}),'已分叉 · 已同步');assert.equal(bindingLabel({...project,remoteSnapshot:undefined}),'已绑定 · 待更新／待上传');assert.equal(bindingLabel({...project,cloudPending:[{}]}),'私人仓库已同步 · 账号记录待完成');assert.equal(bindingLabel({...project,pendingSwitch:{}}),'另存切换待完成');
  assert.equal(bindingLabel({...project,remoteSnapshot:{...project.remoteSnapshot,branch:'other'}}),'已绑定 · 待更新／待上传');

@@ -271,7 +271,7 @@ test('a switch lease preserves the old target until verified completion and reje
   const next=project({target:{...target,id:99},kind:'upload',bindings:{main:{branch:'main',sourceSha:'s2',commitSha:'t2',updatedAt:'later'}}});
   await assert.rejects(f.registry.completeSwitch(next,'stale','token'),/预留已改变/);
   await f.registry.completeSwitch(next,lease.id,'token');
-  assert.equal(f.document().projects[0].target.id,99);assert.equal(f.document().projects[0].primary,true);assert.equal(f.document().projects[0].history[0].target.id,77);
+  assert.equal(f.document().projects[0].target.id,99);assert.equal(f.document().projects[0].primary,true);assert.equal(f.document().projects[0].sourceMode,'target');assert.equal(f.document().projects[0].history[0].target.id,77);
   await f.registry.completeSwitch(next,lease.id,'token');assert.equal(f.document().projects[0].history.length,1);
   await assert.rejects(f.registry.reserveSwitch(source,{owner:'me',repo:'third'},'main',project().target,'token'),ExistingSourceError);
 });

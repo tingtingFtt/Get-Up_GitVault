@@ -79,14 +79,14 @@ test('immutable task reads are reused while repository identity and mutable head
  const {githubApi,githubClient}=await import('../src/utils/githubClient');
  const {immediateTransport}=await import('./transportFixture');immediateTransport();beginGithubOperation();
  const calls:string[]=[];const commit='a'.repeat(40),tree='b'.repeat(40);
- mock.method(globalThis,'fetch',async(input:any)=>{const path=new URL(String(input)).pathname;calls.push(path);return new Response(JSON.stringify(path.endsWith('/user')?{login:'me'}:path.endsWith('/repos/source/project')?{id:42}:path.includes('/commits/')?{sha:commit,commit:{tree:{sha:tree},author:{}}}:{tree:[]}));});
+ mock.method(globalThis,'fetch',async(input:any)=>{const path=new URL(String(input)).pathname;calls.push(path);return new Response(JSON.stringify(path.endsWith('/user')?{login:'me'}:path.endsWith('/repos/source/project')?{id:42}:path.includes('/git/ref/heads/')?{object:{sha:commit}}:path.includes('/commits/')?{sha:commit,commit:{tree:{sha:tree},author:{}}}:{tree:[]}));});
  await githubClient.checkUpdate('source','project','main','old','token');
  const first=await githubApi(`/repos/source/project/commits/${commit}`,'token');first.commit.tree.sha='tampered';
  assert.equal((await githubApi(`/repos/source/project/commits/${commit}`,'token')).commit.tree.sha,tree);
  await githubClient.checkUpdate('source','project','main','old','token');
  await githubClient.repository('source','project','token',42);await githubClient.repository('source','project','token',42);
  await githubApi('/user','token');await githubApi('/user','token');await githubApi('/user','another-token');
- assert.equal(calls.filter(path=>path.endsWith('/commits/main')).length,2);assert.equal(calls.filter(path=>path.endsWith('/commits/'+commit)).length,0);
+ assert.equal(calls.filter(path=>path.includes('/git/ref/heads/')).length,1);assert.equal(calls.filter(path=>path.endsWith('/commits/main')).length,0);assert.equal(calls.filter(path=>path.endsWith('/commits/'+commit)).length,1);
  assert.equal(calls.filter(path=>path.endsWith('/repos/source/project')).length,2);assert.equal(calls.filter(path=>path==='/user').length,2);
  beginGithubOperation();await githubApi('/user','token');assert.equal(calls.filter(path=>path==='/user').length,3);
 });

@@ -20,16 +20,17 @@ const RepoHeatmap = React.lazy(() => import('./components/RepoHeatmap'));
 import { localCache, transferCache, CachedFile } from './utils/localCache';
 import { githubApi, githubClient, beginGithubOperation, cancelGithubOperation, isOperationCancelled, operationSignal, parseRepository, gitBlobSha, GitHubError, TargetRepositoryError } from './utils/githubClient';
 import { safeFetchJson } from './utils/api';
-import { sourceOf, pullSourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget } from './utils/projectModel';
+import { sourceOf, pullSourceOf, savedSnapshot, archiveVersion, renamedProject, targetForBranch, assertBranchTarget, followsSavedTarget, restoreImplicitSource } from './utils/projectModel';
 import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import {reportProgress,cooperate} from './utils/operation';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
+import {runStatusChecks} from './utils/statusChecks';
 import { importCandidates, compareImportTrees, sameRepository, candidateExclusion, isExcludedCandidate, type CandidateExclusion, type ImportCandidate } from './utils/importAssociation';
 import { projectSelections } from './utils/projectSelection';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
 import { accountRegistry, AccountRecordPendingError, ExistingSourceError, REGISTRY_REPO, sameSource, type AccountProject, type TargetHistory } from './utils/accountRegistry';
 import { appendOperationLog, readOperationLogs, clearOperationLogs, type OperationLog } from './utils/operationLog';
-import { bindingLabel, switchedHistory } from './utils/projectBinding';
+import { bindingLabel, switchedHistory, isPrivateSynced, needsProjectUpdate } from './utils/projectBinding';
 import type { ProjectSource, UploadTarget, RemoteSnapshot, BackupVersion } from './utils/projectModel';
 import AppDialogs from './components/AppDialogs';
 import { appDialog } from './utils/appDialog';
@@ -52,6 +53,9 @@ interface PendingSwitch { manifest?: Pick<TrackedRepo,'tree'|'commitMessage'|'co
 interface TrackedRepo {
   excludedCandidates?: CandidateExclusion[];
   primarySource?: ProjectSource;
+  sourceMode?: 'origin'|'target';
+  originSyncedSha?:string;
+  originSyncedBranch?:string;
   targetHistory?: TargetHistory[];
   pendingSwitch?: PendingSwitch;
   verification?: 'unchecked'|'checking'|'ready'|'error';
@@ -82,6 +86,10 @@ interface TrackedRepo {
   tags: string[];
   checkInterval: number;
   lastCheckedAt?: string;
+  lastCheckAttemptAt?: string;
+  checkError?: string;
+  checkCancelled?: boolean;
+  upstreamStatus?: {sha?:string;hasUpdate?:boolean;checkedAt?:string;error?:string};
   latestCommitSha: string;
   commitMessage: string;
   commitAuthor: string;
@@ -180,7 +188,7 @@ function publicProjectRecord({ token, uploadTarget, branchTargets, forkTarget, .
 function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
 export default function App() {
-  const [repos, setRepos] = useState<TrackedRepo[]>(() => readProjectRecords<TrackedRepo>());
+  const [repos, setRepos] = useState<TrackedRepo[]>(() => readProjectRecords<TrackedRepo>().map(restoreImplicitSource));
 
   // Global settings state
   const [globalToken, setGlobalToken] = useState<string>(() => {
@@ -430,9 +438,15 @@ export default function App() {
   const reposRef = useRef(repos);
   reposRef.current = repos;
   const checkingRepos = useRef(new Set<string>());
+  const [statusChecking,setStatusChecking]=useState<string[]>([]);
+  const globalTokenRef=useRef(globalToken);globalTokenRef.current=globalToken;
+  const statusBackground=useRef<AbortController | null>(null);
+  const statusBackgroundActive=useRef(false);
+  const statusMutating=useRef(false);statusMutating.current=isLoading||importLock.current||batchTaskLock.current||batchUploadLock.current;
+
   const fileRequest = useRef(0);
   const [visibleFileCount, setVisibleFileCount] = useState(150);
-  const startOperation = () => { beginGithubOperation(); setIsLoading(true); };
+  const startOperation = () => { statusMutating.current=true;beginGithubOperation(); setIsLoading(true); };
   useEffect(() => {
     const listener = (event: Event) => {if(!operationSignal().aborted)setLoadingText((event as CustomEvent<string>).detail);};
     const lifecycle=(event:Event)=>{const cancelling=(event as CustomEvent<string>).detail==='cancelling';setIsCancelling(cancelling);if(cancelling)setLoadingText('正在取消，等待当前文件操作停止；已完成结果会保留…');};
@@ -455,6 +469,7 @@ export default function App() {
     reposRef.current = next;
     setRepos(next);
   };
+  useEffect(()=>{const saved=readProjectRecords<TrackedRepo>();if(saved.some(item=>restoreImplicitSource(item)!==item))persistRepos(saved.map(restoreImplicitSource));},[]);
   const patchRepo = (id: string, patch: Partial<TrackedRepo>) => {
     persistRepos(reposRef.current.map(repo => repo.id === id ? { ...repo, ...patch } : repo));
   };
@@ -508,7 +523,7 @@ export default function App() {
     await flushCloudPending(repo, token);
     await flushCredentials();
   };
-  const accountRecord = (repo: TrackedRepo, target: TargetIdentity, kind: AccountProject['kind'], sourceBranch: string, branch: string, sourceSha?: string, commitSha?: string): AccountProject => ({ source: { ...sourceOf(repo), branch: sourceBranch }, target: { id: target.id, owner: target.owner, repo: target.repo, private:target.private }, kind, state: 'active', createdByApp: true, primary: !!repo.primarySource, profile: {tags:repo.tags,remark:repo.remark,description:repo.description || '',updatedAt:new Date().toISOString()}, history:repo.targetHistory, bindings: { [sourceBranch]: { branch, sourceSha, commitSha, updatedAt: new Date().toISOString() } }, branches: kind === 'full' ? repo.forkTarget?.branches : undefined, updatedAt: new Date().toISOString() });
+  const accountRecord = (repo: TrackedRepo, target: TargetIdentity, kind: AccountProject['kind'], sourceBranch: string, branch: string, sourceSha?: string, commitSha?: string): AccountProject => ({ source: { ...sourceOf(repo), branch: sourceBranch }, target: { id: target.id, owner: target.owner, repo: target.repo, private:target.private }, kind, state: 'active', createdByApp: true, primary: !!repo.primarySource, sourceMode:repo.primarySource?'target':'origin', profile: {tags:repo.tags,remark:repo.remark,description:repo.description || '',updatedAt:new Date().toISOString()}, history:repo.targetHistory, bindings: { [sourceBranch]: { branch, sourceSha, commitSha, originSha:repo.originSyncedBranch===sourceBranch?repo.originSyncedSha:undefined, updatedAt: new Date().toISOString() } }, branches: kind === 'full' ? repo.forkTarget?.branches : undefined, updatedAt: new Date().toISOString() });
   useEffect(() => {
     const listener = (event: Event) => {
       const { target, health, identity, checkId } = (event as CustomEvent<{ target: TargetIdentity; health: TargetHealth; identity?: { id?: number; owner: string; repo: string; htmlUrl: string }; checkId: number }>).detail;
@@ -519,7 +534,7 @@ export default function App() {
       const next = reposRef.current.map(project => {
         if (!projectTargets(project).some(item => sameTarget(item, target))) return project;
         changed = true;
-        const renamed = identity && target.id && identity.id === target.id && !sameRepository(target, identity)
+        const renamed = identity && target.id && identity.id === target.id && (target.owner.toLowerCase()!==identity.owner.toLowerCase()||target.repo.toLowerCase()!==identity.repo.toLowerCase())
           ? renamedProject(project, { ...target, branch: '', purgeAfterUpload: false }, identity) : project;
         return { ...renamed, targetHealth: { ...renamed.targetHealth, [targetKey(health)]: health } };
       });
@@ -612,9 +627,6 @@ export default function App() {
     await localCache.saveSyncReceipt(repo.id, sourceSha, snapshot);
     const current = reposRef.current.find(r => r.id === repo.id) || repo;
     const sourceBranch = version?.branch || sourceOf(repo).branch;
-    if(bindTarget && !version && !current.uploadTarget && result.repo.toLowerCase()!==sourceOf(repo).repo.toLowerCase()) {
-      extra={...extra,origin:sourceOf(repo),primarySource:{owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,branch:result.branch,repositoryId:result.repoId},owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repoMeta:{...repo.repoMeta,htmlUrl:`https://github.com/${result.owner}/${result.repo}`}};
-    }
     const binding: UploadTarget = { ...current.uploadTarget, private: result.repoPrivate ?? current.uploadTarget?.private, id: result.repoId || current.uploadTarget?.id, owner: result.owner, repo: result.repo, branch: result.branch, purgeAfterUpload: purge, token: uploadToken || current.uploadTarget?.token };
     const targetHealth = { ...current.targetHealth, [targetKey(binding)]: { id: binding.id, owner: binding.owner, repo: binding.repo, status: 'available' as const, checkedAt: new Date().toISOString(), message: '远端上传已验证成功' } };
     const branchTargets = bindTarget ? { ...current.branchTargets, [sourceBranch]: binding } : current.branchTargets;
@@ -943,8 +955,9 @@ export default function App() {
         if (!shouldMerge && !await appDialog.confirm('覆盖本设备现有全部项目记录？远端仓库不删除，当前项目记录会被备份替换。', { accept: '确认覆盖', cancel: '取消恢复' })) return;
 
         // Metadata restored from another device does not imply cached files exist.
-        const imported = data.projects.map((project: TrackedRepo) => ({ ...project, isCachePurged: true, cachedFilesCount: 0 }));
+        let imported = data.projects.map((project: TrackedRepo) => ({ ...project, isCachePurged: true, cachedFilesCount: 0 }));
         const existingIds = new Set(reposRef.current.map(repo => repo.id));
+        imported=imported.map(restoreImplicitSource);
         persistRepos(shouldMerge ? [...imported.filter((project: TrackedRepo) => !existingIds.has(project.id)), ...reposRef.current] : imported);
 
         // Restore settings if included
@@ -1184,21 +1197,19 @@ export default config;
     } catch(error){logOperation('保存项目标签与资料','partial',next,(error as Error).message,'保存账号资料',error);appDialog.notify((localSaved?'本设备资料已保存，跨设备记录待重试：':'本设备项目记录尚未保存，请重试或导出当前备份：')+(error as Error).message);}
   };
 
-  // Scheduled polling for auto status checks
+  // Background checks have an independent lifetime and share the HTTP read
+  // queue; they never replace a foreground upload's AbortController.
   useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now();
-      repos.forEach(repo => {
-        if (repo.checkInterval > 0) {
-          const lastChecked = repo.lastCheckedAt ? new Date(repo.lastCheckedAt).getTime() : 0;
-          if (now - lastChecked >= repo.checkInterval * 60 * 1000) {
-            checkSingleRepoStatus(repo.id, true);
-          }
-        }
-      });
-    }, 30000); // Check every 30s
-    return () => clearInterval(interval);
-  }, [repos]);
+    const controller=new AbortController();statusBackground.current=controller;
+    const interval=setInterval(()=>{
+      if(document.hidden||statusMutating.current||statusBackgroundActive.current||controller.signal.aborted)return;
+      const now=Date.now();
+      const due=reposRef.current.filter(repo=>repo.checkInterval>0&&!checkingRepos.current.has(repo.id)&&now-(new Date(repo.lastCheckAttemptAt||repo.lastCheckedAt||0).getTime()||0)>=Math.max(repo.checkInterval*60000,repo.checkError?60000:0));
+      statusBackgroundActive.current=true;
+      void runStatusChecks(due,{signal:controller.signal,run:async repo=>{await checkSingleRepoStatus(repo.id,true,{signal:controller.signal});}}).catch(()=>{}).finally(()=>{statusBackgroundActive.current=false;});
+    },30000);
+    return()=>{clearInterval(interval);controller.abort();if(statusBackground.current===controller)statusBackground.current=null;};
+  },[globalToken]);
 
   const activeRepo = repos.find(r => r.id === activeRepoId);
   const targetManagerRepo = repos.find(r => r.id === targetManagerId);
@@ -1229,7 +1240,7 @@ export default config;
       const logicalBranch=repo.primarySource ? Object.entries(branchTargets).find(([,binding])=>sameTarget(binding,repo.uploadTarget!) && binding.branch===branch)?.[0] || branch : branch;
       const nextTarget = targetForBranch({ ...repo, uploadTarget: previousTarget, branchTargets }, logicalBranch);
       const cached = await localCache.getProjectFiles(repo.id, repo.latestCommitSha,{scan:false,signal:operationSignal()});
-      const data = await githubClient.fetchRepo(`${source.owner}/${source.repo}`, branch, repo.primarySource ? auth || repo.token : repo.token || globalToken, { cachedFiles: cached });
+      const data = await githubClient.fetchRepo(`${source.owner}/${source.repo}`, branch, repo.primarySource ? auth || repo.token : repo.token || globalToken, { cachedFiles: cached,expectedId:source.repositoryId });
       if(repo.primarySource?.repositoryId && data.repositoryId!==repo.primarySource.repositoryId)throw new Error('固定主仓库身份已变化，保留原分支和缓存，请先处理远端目标');
       operationSignal().throwIfAborted();
       await localCache.saveProjectFiles(repo.id, data.files, data.latestCommitSha,{signal:operationSignal()});
@@ -1255,34 +1266,56 @@ export default config;
     finally { setIsLoading(false); }
   };
 
-  // Status check logic
-  const checkSingleRepoStatus = async (repoId: string, isBackground = false) => {
-    const repo = reposRef.current.find(r => r.id === repoId);
-    if (!repo || checkingRepos.current.has(repoId)) return;
-    if (operationSignal().aborted && isBackground) return;
-    checkingRepos.current.add(repoId);
-    if (!isBackground) { startOperation(); setLoadingText(`正在检测 ${repo.repo} 的更新…`); }
-    try {
-      await checkRepoTargets(repo);
-      const source = pullSourceOf(repo);
-      const data = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, repo.primarySource ? repo.uploadTarget?.token || globalToken || repo.token : repo.token || globalToken);
-      const current = reposRef.current.find(item => item.id === repoId);
-      if (!current || pullSourceOf(current).branch !== source.branch) return;
-      patchRepo(repo.id, { hasUpdate: data.hasUpdate, latestRemoteCommit: data.latestCommit, lastCheckedAt: new Date().toISOString() });
-    } catch (error) {
-      patchRepo(repo.id, { lastCheckedAt: new Date().toISOString() });
-      logOperation('检测更新', operationSignal().aborted ? 'cancelled' : 'error', repo, (error as Error).message, '检测来源与目标', error);
-      if (!isBackground) appDialog.notify('检测失败：' + (error as Error).message);
-    } finally { checkingRepos.current.delete(repoId); if (!isBackground) setIsLoading(false); }
+  // Status checks read only the tracked branch head. Target health and account
+  // registration belong to explicit target checks / writes, not this fast path.
+  const checkSingleRepoStatus = async (repoId:string,isBackground=false,options:{signal?:AbortSignal;force?:boolean;upstream?:boolean}={}):Promise<'updated'|'latest'|'failed'|'cancelled'|'skipped'> => {
+    const repo=reposRef.current.find(item=>item.id===repoId);
+    if(!repo||checkingRepos.current.has(repoId))return 'skipped';
+    if(!isBackground){if(statusMutating.current)return 'skipped';startOperation();setLoadingText(`正在快速检测 ${repo.repo} 的更新…`);}
+    const signal=options.signal||operationSignal();if(signal.aborted)return 'cancelled';
+    checkingRepos.current.add(repoId);setStatusChecking([...checkingRepos.current]);
+    const source=options.upstream?sourceOf(repo):pullSourceOf(repo);
+    const token=(options.upstream?repo.token||globalTokenRef.current:repo.primarySource?repo.uploadTarget?.token||globalTokenRef.current||repo.token:repo.token||globalTokenRef.current)||'';
+    const baseline=options.upstream?(repo.originSyncedBranch===source.branch?repo.originSyncedSha||'':''):repo.latestCommitSha;
+    const context=JSON.stringify([source.owner.toLowerCase(),source.repo.toLowerCase(),source.branch,source.repositoryId,repo.latestCommitSha]);
+    const stillCurrent=()=>{
+      const current=reposRef.current.find(item=>item.id===repoId);if(!current)return undefined;
+      const now=options.upstream?sourceOf(current):pullSourceOf(current);
+      const currentToken=(options.upstream?current.token||globalTokenRef.current:current.primarySource?current.uploadTarget?.token||globalTokenRef.current||current.token:current.token||globalTokenRef.current)||'';if(currentToken!==token)return undefined;
+      return JSON.stringify([now.owner.toLowerCase(),now.repo.toLowerCase(),now.branch,now.repositoryId,current.latestCommitSha])===context?current:undefined;
+    };
+    try{
+      const data=await githubClient.checkUpdate(source.owner,source.repo,source.branch,baseline,token,{signal,force:options.force,expectedId:source.repositoryId});
+      signal.throwIfAborted();const current=stillCurrent();if(!current)return 'skipped';
+      let repaired=current;
+      if(data.resolved){
+        const resolved={...source,...data.resolved};
+        if(options.upstream||!current.primarySource)repaired=current.origin?{...current,origin:resolved}:{...current,...resolved};
+        else repaired={...current,primarySource:resolved};
+      }
+      const checkedAt=data.checkedAt||new Date().toISOString();
+      patchRepo(repoId,{...repaired,...(options.upstream?{upstreamStatus:{sha:data.latestSha,hasUpdate:baseline?data.hasUpdate:undefined,checkedAt,error:undefined}}:{hasUpdate:data.hasUpdate,latestRemoteCommit:data.latestCommit,lastCheckedAt:checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,checkCancelled:false})});
+      return data.hasUpdate?'updated':'latest';
+    }catch(error){
+      const cancelled=isOperationCancelled(error,signal),current=stillCurrent();
+      if(current)patchRepo(repoId,options.upstream?{upstreamStatus:{...current.upstreamStatus,error:cancelled?'已取消检测':(error as Error).message}}:{lastCheckAttemptAt:new Date().toISOString(),checkError:cancelled?undefined:(error as Error).message,checkCancelled:cancelled});
+      logOperation('检测更新',cancelled?'cancelled':'error',repo,(error as Error).message,options.upstream?'轻量检测原始上游':'轻量检测跟踪分支',error);
+      if(!isBackground&&!cancelled)appDialog.notify('检测失败：'+(error as Error).message);
+      return cancelled?'cancelled':'failed';
+    }finally{checkingRepos.current.delete(repoId);setStatusChecking([...checkingRepos.current]);if(!isBackground)setIsLoading(false);}
   };
 
-  const checkAllUpdates = async () => {
-    startOperation();
-    setLoadingText('正在批量检测所有已链接项目状态...');
-    for (const r of repos) {
-      await checkSingleRepoStatus(r.id, true);
-    }
-    setIsLoading(false);
+  const checkAllUpdates = async (force=false) => {
+    if(statusMutating.current)return;
+    startOperation();const signal=operationSignal(),items=[...reposRef.current];
+    const counts={updated:0,latest:0,failed:0,cancelled:0,skipped:0};
+    try{
+      setLoadingText(`正在快速检测 0/${items.length} 个项目…`);
+      const result=await runStatusChecks(items,{signal,run:async repo=>{counts[await checkSingleRepoStatus(repo.id,true,{signal,force})]++;},onProgress:(done,total)=>{if(!signal.aborted)setLoadingText(`快速检测 ${done}/${total} · 有更新 ${counts.updated} · 失败 ${counts.failed}；可取消`);}});
+      await flushCredentials();
+      appDialog.notify(`${result.cancelled?'检测已取消，已完成结果保留':'检测完成'}：有更新 ${counts.updated} · 最新 ${counts.latest} · 失败 ${counts.failed} · 未执行 ${items.length-result.done+counts.skipped}`);
+    }catch(error){appDialog.notify('检测结果保存未完成：'+(error as Error).message);}
+    finally{setIsLoading(false);}
   };
 
   const sourceExclusions = (source: ProjectSource) => reposRef.current.filter(project => sameSource(sourceOf(project), source)).flatMap(project => Array.isArray(project.excludedCandidates) ? project.excludedCandidates : []);
@@ -1483,8 +1516,8 @@ export default config;
     operationSignal().throwIfAborted();
     if (choice === 'skip') return { choice, data: undefined };
     if(typeof choice==='object') await saveCandidateExclusions({...manifest,url:source.url},choice.excluded || []);
-    const selected = !isImportBinding(choice) ? { ...source, branch: manifest.branch } : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? {owner:choice.comparison.target!.owner,repo:choice.comparison.target!.repo,url:`https://github.com/${choice.comparison.target!.owner}/${choice.comparison.target!.repo}`,branch:choice.comparison.target!.branch} : choice.candidate.source;
-    const sha = !isImportBinding(choice) ? manifest.latestCommitSha : choice.candidate.accountRecord?.primary && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? choice.comparison.commitSha : choice.comparison.sourceSha;
+    const selected = !isImportBinding(choice) ? { ...source, branch: manifest.branch } : followsSavedTarget(choice.candidate.accountRecord) && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? {owner:choice.comparison.target!.owner,repo:choice.comparison.target!.repo,url:`https://github.com/${choice.comparison.target!.owner}/${choice.comparison.target!.repo}`,branch:choice.comparison.target!.branch} : choice.candidate.source;
+    const sha = !isImportBinding(choice) ? manifest.latestCommitSha : followsSavedTarget(choice.candidate.accountRecord) && !choice.comparison.targetHealth && !choice.updateNow && !choice.newName ? choice.comparison.commitSha : choice.comparison.sourceSha;
     if (!sha) throw new Error('来源提交未完成校验，请重新对比');
     const previous = reposRef.current.find(project => sameRepository(sourceOf(project), selected) && sourceOf(project).branch === selected.branch);
     const cachedFiles = previous ? await localCache.getProjectFiles(previous.id, sha) : [];
@@ -1528,10 +1561,12 @@ export default config;
       if (!newRepo.description) next.description=candidate.accountRecord.profile.description;
     }
     next.targetHistory=candidate.accountRecord?.history || previous?.targetHistory;
-    if(candidate.accountRecord?.primary) next.origin=candidate.source;
-    next.primarySource=candidate.accountRecord?.primary ? {owner:target.owner,repo:target.repo,repositoryId:target.id,url:`https://github.com/${target.owner}/${target.repo}`,branch:target.branch} : undefined;
+    if(followsSavedTarget(candidate.accountRecord)) next.origin=candidate.source;
+    next.sourceMode=followsSavedTarget(candidate.accountRecord)?'target':'origin';
+    next.originSyncedSha=candidate.accountRecord?.bindings[newRepo.branch]?.originSha;next.originSyncedBranch=next.originSyncedSha?newRepo.branch:undefined;
+    next.primarySource=followsSavedTarget(candidate.accountRecord) ? {owner:target.owner,repo:target.repo,repositoryId:target.id,url:`https://github.com/${target.owner}/${target.repo}`,branch:target.branch} : undefined;
     next.verification='ready';
-    if ((comparison.equal || candidate.accountRecord?.primary && newRepo.latestCommitSha===comparison.commitSha) && comparison.commitSha) {
+    if ((comparison.equal || followsSavedTarget(candidate.accountRecord) && newRepo.latestCommitSha===comparison.commitSha) && comparison.commitSha) {
       next.remoteSnapshot={repoId:target.id,owner:target.owner,repo:target.repo,branch:target.branch,sourceSha:newRepo.latestCommitSha,commitSha:comparison.commitSha,htmlUrl:`https://github.com/${target.owner}/${target.repo}/tree/${target.branch}`};
       next.accountState=candidate.fullFork?'forked':'synced';
     }
@@ -1559,7 +1594,8 @@ export default config;
     const receipt = entry?.bindings[source.branch];
     const remoteSnapshot = choice.comparison.equal && choice.comparison.commitSha ? {repoId:target.id,owner:target.owner,repo:target.repo,branch:target.branch,sourceSha:repo.latestCommitSha,commitSha:choice.comparison.commitSha,htmlUrl:`https://github.com/${target.owner}/${target.repo}/tree/${target.branch}`} : !choice.comparison.targetHealth && receipt?.sourceSha && receipt.commitSha && choice.comparison.commitSha === receipt.commitSha ? { repoId: target.id, owner: target.owner, repo: target.repo, branch: target.branch, sourceSha: receipt.sourceSha, commitSha: receipt.commitSha, htmlUrl: `https://github.com/${target.owner}/${target.repo}/tree/${target.branch}` } : sameReceipt ? old : undefined;
     const next: TrackedRepo = { ...repo, excludedCandidates:mergeCandidateExclusions(repo.excludedCandidates || [],choice.excluded || []), ...(entry?.profile?{tags:entry.profile.tags,remark:entry.profile.remark,description:entry.profile.description}:{}), uploadTarget: target, branchTargets: { ...repo.branchTargets, ...Object.fromEntries(Object.entries(entry?.bindings || {}).map(([branch, binding]) => [branch, { ...target, branch: binding.branch }])), [source.branch]: target }, branchUploadPending: !!choice.comparison.missingBranch,
-      primarySource: entry?.primary ? {owner:target.owner,repo:target.repo,url:`https://github.com/${target.owner}/${target.repo}`,repositoryId:target.id,branch:target.branch} : repo.primarySource, targetHistory:entry?.history || repo.targetHistory,
+      originSyncedSha:entry?.bindings[source.branch]?.originSha||repo.originSyncedSha,originSyncedBranch:entry?.bindings[source.branch]?.originSha?source.branch:repo.originSyncedBranch,
+      sourceMode:followsSavedTarget(entry)?'target':'origin', primarySource: followsSavedTarget(entry) ? {owner:target.owner,repo:target.repo,url:`https://github.com/${target.owner}/${target.repo}`,repositoryId:target.id,branch:target.branch} : entry ? undefined : repo.primarySource, targetHistory:entry?.history || repo.targetHistory,
       remoteSnapshot, savedCopies: old && !sameReceipt ? [...(repo.savedCopies || []), old] : repo.savedCopies,
       forkScope: choice.candidate.fullFork ? 'full' : 'current',
       forkTarget: choice.candidate.fullFork ? { ...target, htmlUrl: `https://github.com/${target.owner}/${target.repo}`, branches: entry?.branches || [source.branch] } : undefined,
@@ -1567,7 +1603,7 @@ export default config;
       accountState: choice.comparison.targetHealth || entry?.state === 'reserved' ? 'pending' : remoteSnapshot?.sourceSha === repo.latestCommitSha ? choice.candidate.fullFork ? 'forked' : 'synced' : 'bound',
       targetHealth: choice.comparison.targetHealth ? { ...repo.targetHealth, [targetKey(target)]: choice.comparison.targetHealth } : repo.targetHealth,
       creationReservation: entry?.state === 'reserved' ? entry : undefined,
-      ...(repo.origin ? { owner: target.owner, repo: target.repo, url: `https://github.com/${target.owner}/${target.repo}`, repoMeta: { ...repo.repoMeta, htmlUrl: `https://github.com/${target.owner}/${target.repo}` } } : {}),
+      ...(repo.origin ? followsSavedTarget(entry)||repo.forkScope ? { owner: target.owner, repo: target.repo, url: `https://github.com/${target.owner}/${target.repo}`, repoMeta: { ...repo.repoMeta, htmlUrl: `https://github.com/${target.owner}/${target.repo}` } } : {...source,repoMeta:{...repo.repoMeta,htmlUrl:source.url}} : {}),
     };
     assertDestinationBranch(next, target); patchRepo(repo.id, next);
     if (save) await finishAccountBinding(next, choice, token);
@@ -1688,7 +1724,7 @@ export default config;
     }
     if (entry) {
       const target=repo.uploadTarget,binding=entry.bindings[source.branch];
-      if(repo.verification==='ready'&&target?.id&&entry.target.id===target.id&&binding?.branch===target.branch&&entry.target.owner===target.owner&&entry.target.repo===target.repo&&!!entry.primary===!!repo.primarySource&&((entry.kind==='full')===(repo.forkScope==='full'))&&!repo.creationReservation&&!hasTargetIssue(repo)){
+      if(repo.verification==='ready'&&target?.id&&entry.target.id===target.id&&binding?.branch===target.branch&&entry.target.owner===target.owner&&entry.target.repo===target.repo&&followsSavedTarget(entry)===!!repo.primarySource&&((entry.kind==='full')===(repo.forkScope==='full'))&&!repo.creationReservation&&!hasTargetIssue(repo)){
         reportProgress('已确认账号来源与固定分支映射，沿用已有关系；写入前仍核验仓库身份与分支…');
         return {repo,boundOnly:false};
       }
@@ -1927,7 +1963,7 @@ export default config;
     const now=new Date().toISOString(), history=switchedHistory(repo as any,now);
     const bindings:AccountProject['bindings']=Object.fromEntries(Object.entries(repo.branchTargets || {}).map(([branch,binding])=>[branch,{branch:binding.branch,updatedAt:now}]));
     bindings[pending.sourceBranch]={branch:result.branch,sourceSha:pending.sourceSha,commitSha:result.commitSha,updatedAt:now};
-    const entry={...accountRecord(repo,nextTarget,'upload',pending.sourceBranch,result.branch,pending.sourceSha,result.commitSha),bindings,primary:true,history};
+    const entry={...accountRecord(repo,nextTarget,'upload',pending.sourceBranch,result.branch,pending.sourceSha,result.commitSha),bindings,primary:true,sourceMode:'target' as const,history};
     try { await accountRegistry.completeSwitch(entry,pending.reservationId,token); }
     catch(error){logOperation('另存并切换固定仓库','partial',repo,`新仓库文件已验证，固定关系切换待完成：${(error as Error).message}`,'保存切换记录',error);throw new Error(`新仓库已上传并验证，旧固定关系保留；请继续完成切换，不会再次上传：${(error as Error).message}`);}
     signal.throwIfAborted();
@@ -1935,7 +1971,7 @@ export default config;
     const snapshot:RemoteSnapshot={repoId:result.repoId,owner:result.owner,repo:result.repo,branch:result.branch,sourceSha:pending.sourceSha,commitSha:result.commitSha,htmlUrl:result.htmlUrl};
     const branchTargets=Object.fromEntries(Object.entries(bindings).map(([branch,binding])=>[branch,{...nextTarget,branch:binding.branch}]));
     await localCache.saveSyncReceipt(repo.id,pending.sourceSha,snapshot);
-    patchRepo(repo.id,{...pending.manifest,branch:pending.sourceBranch,latestCommitSha:pending.sourceSha,origin:{...sourceOf(repo),branch:pending.sourceBranch},owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repoMeta:{...repo.repoMeta,htmlUrl:`https://github.com/${result.owner}/${result.repo}`},primarySource:{owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repositoryId:result.repoId,branch:result.branch},uploadTarget:nextTarget,branchTargets,branchUploadPending:false,forkTarget:undefined,forkScope:undefined,privateRepoUrl:nextTarget.private?`https://github.com/${result.owner}/${result.repo}`:undefined,remoteSnapshot:snapshot,savedCopies:[...(repo.savedCopies||[]),...(repo.remoteSnapshot?[repo.remoteSnapshot]:[])],backups:[archiveVersion(repo),...repo.backups],targetHistory:history,cloudPending:[],pendingSwitch:undefined,creationReservation:undefined,accountState:'synced',verification:'ready',isCachePurged:false,cachedFilesCount:(await localCache.getProjectFiles(repo.id,pending.sourceSha)).length});
+    patchRepo(repo.id,{...pending.manifest,branch:pending.sourceBranch,latestCommitSha:pending.sourceSha,origin:{...sourceOf(repo),branch:pending.sourceBranch},owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repoMeta:{...repo.repoMeta,htmlUrl:`https://github.com/${result.owner}/${result.repo}`},sourceMode:'target',primarySource:{owner:result.owner,repo:result.repo,url:`https://github.com/${result.owner}/${result.repo}`,repositoryId:result.repoId,branch:result.branch},uploadTarget:nextTarget,branchTargets,branchUploadPending:false,forkTarget:undefined,forkScope:undefined,privateRepoUrl:nextTarget.private?`https://github.com/${result.owner}/${result.repo}`:undefined,remoteSnapshot:snapshot,savedCopies:[...(repo.savedCopies||[]),...(repo.remoteSnapshot?[repo.remoteSnapshot]:[])],backups:[archiveVersion(repo),...repo.backups],targetHistory:history,cloudPending:[],pendingSwitch:undefined,creationReservation:undefined,accountState:'synced',verification:'ready',isCachePurged:false,cachedFilesCount:(await localCache.getProjectFiles(repo.id,pending.sourceSha)).length});
     if(request.purge){await flushCredentials(); await localCache.deleteProjectFiles(repo.id,pending.sourceSha,{signal:operationSignal()});patchRepo(repo.id,{isCachePurged:true,cachedFilesCount:0});}
     await flushCredentials();
     logOperation('另存并切换固定仓库','success',reposRef.current.find(item=>item.id===repo.id),`旧目标 ${pending.oldTarget?`${pending.oldTarget.owner}/${pending.oldTarget.repo}`:'无'} → ${result.owner}/${result.repo}:${result.branch}`);
@@ -2188,32 +2224,47 @@ export default config;
   };
 
   const updateProject = async (repo: TrackedRepo, authToken = '', syncOrigin = false): Promise<string> => {
-      const prepared = await updateAccountBinding(repo, authToken || repo.uploadTarget?.token || globalToken || repo.token || ''); repo = prepared.repo;
-      if (prepared.boundOnly) return '已比较并固定已有目标，本次未写入项目；请再次更新或同步。';
-      if (repo.forkScope === 'full' && repo.forkTarget && repo.uploadTarget) {
-        const auth = repo.uploadTarget?.token || authToken || globalToken || repo.token;
-        if (!auth) throw new Error('请填写 GitHub Token');
-        return syncFullProject(repo, auth);
+      const signal=operationSignal();
+      if(repo.cloudPending?.length||repo.cloudRemovals?.length){const auth=authToken||repo.uploadTarget?.token||globalToken||repo.token||'';await flushCloudRemovals(repo,auth);await flushCloudPending(repo,auth);repo=reposRef.current.find(item=>item.id===repo.id)||repo;}
+      const getSource=()=>syncOrigin?sourceOf(repo):pullSourceOf(repo);
+      const getToken=()=>(repo.primarySource&&!syncOrigin?authToken||repo.uploadTarget?.token||globalToken||repo.token:repo.token||authToken||globalToken)||'';
+      let source=getSource(),token=getToken();
+      let status=await githubClient.checkUpdate(source.owner,source.repo,source.branch,repo.latestCommitSha,token,{signal,force:true,expectedId:source.repositoryId});
+      if(status.resolved){
+        const current=reposRef.current.find(item=>item.id===repo.id)||repo,resolved={...source,...status.resolved};
+        repo=current.primarySource&&!syncOrigin?{...current,primarySource:resolved}:current.origin?{...current,origin:resolved}:{...current,...resolved};patchRepo(repo.id,repo);source=getSource();
       }
-      const source = syncOrigin ? sourceOf(repo) : pullSourceOf(repo);
-      const token = (repo.primarySource && !syncOrigin ? authToken || repo.uploadTarget?.token || globalToken || repo.token : repo.token || authToken || globalToken) || '';
-      if (repo.uploadTarget || repo.privateRepoUrl) await boundTarget(repo, repo.uploadTarget?.token || authToken || globalToken || token);
-      const status = await githubClient.checkUpdate(source.owner, source.repo, source.branch, repo.latestCommitSha, token);
-      if (!status.hasUpdate) {
-        if(repo.primarySource && !syncOrigin) return '固定主仓库当前已是最新版本；原始来源通过上游同步入口处理。';
-        patchRepo(repo.id, { hasUpdate: false, lastCheckedAt: new Date().toISOString() });
-        if (repo.uploadTarget && repo.remoteSnapshot?.sourceSha !== repo.latestCommitSha) {
-          const target = repo.uploadTarget;
-          const files = await versionFiles(repo);
-          const result = await pushSnapshot(repo, files, target.token || globalToken || token, `Sync ${repo.repo} @ ${repo.latestCommitSha}`);
-          await recordUpload(repo, result, target.purgeAfterUpload, undefined, {}, target.token || authToken || globalToken || token);
+      const hasMaintenance=!!(repo.pendingSwitch||repo.creationReservation||repo.cloudPending?.length||repo.cloudRemovals?.length||repo.accountState==='pending');
+      const pendingUpload=!!(repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha));
+      const checkPatch={hasUpdate:status.hasUpdate,latestRemoteCommit:status.hasUpdate?status.latestCommit:undefined,lastCheckedAt:status.checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,checkCancelled:false};
+      patchRepo(repo.id,checkPatch);repo={...repo,...checkPatch};
+      if(!status.hasUpdate&&!hasMaintenance&&!pendingUpload&&!(repo.forkScope==='full'&&repo.forkTarget))return repo.primarySource&&!syncOrigin?'固定主仓库当前已是最新版本；原始来源通过上游同步入口处理。':'当前已是最新版本';
+      const before=JSON.stringify([source.owner,source.repo,source.branch]);
+      const prepared=await updateAccountBinding(repo,authToken||repo.uploadTarget?.token||globalToken||repo.token||'');repo=prepared.repo;
+      if(prepared.boundOnly)return '已比较并固定已有目标，本次未写入项目；请再次更新或同步。';
+      if(repo.forkScope==='full'&&repo.forkTarget&&repo.uploadTarget){
+        const auth=repo.uploadTarget?.token||authToken||globalToken||repo.token;if(!auth)throw new Error('请填写 GitHub Token');return syncFullProject(repo,auth);
+      }
+      source=getSource();token=getToken();
+      if(JSON.stringify([source.owner,source.repo,source.branch])!==before)status=await githubClient.checkUpdate(source.owner,source.repo,source.branch,repo.latestCommitSha,token,{signal,force:true,expectedId:source.repositoryId});
+      if(repo.uploadTarget||repo.privateRepoUrl)await boundTarget(repo,repo.uploadTarget?.token||authToken||globalToken||token);
+      repo=reposRef.current.find(item=>item.id===repo.id)||repo;source=getSource();token=getToken();
+      if(!status.hasUpdate){
+        if(repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha)){
+          const target=repo.uploadTarget,files=await versionFiles(repo);
+          const result=await pushSnapshot(repo,files,target.token||globalToken||token,`Sync ${repo.repo} @ ${repo.latestCommitSha}`);
+          await recordUpload(repo,result,target.purgeAfterUpload,undefined,{},target.token||authToken||globalToken||token);
           return '已完成上次待上传的版本，并验证成功。';
         }
-        return '当前已是最新版本';
+        return '当前已是最新版本，待办记录已处理';
       }
       let cached = await localCache.getProjectFiles(repo.id, repo.latestCommitSha,{scan:false,signal:operationSignal()});
       if (!cached.length && !repo.isCachePurged && repo.latestCommitSha !== 'HEAD') cached = await versionFiles(repo);
-      const data = await githubClient.fetchRepo(source.url, source.branch, token, { ref: status.latestSha, cachedFiles: cached });
+      const data = await githubClient.fetchRepo(source.url, source.branch, token, { ref: status.latestSha, cachedFiles: cached, expectedId:source.repositoryId });
+      if(data.owner.toLowerCase()!==source.owner.toLowerCase()||data.repo.toLowerCase()!==source.repo.toLowerCase()){
+        const resolved={...source,owner:data.owner,repo:data.repo,url:`https://github.com/${data.owner}/${data.repo}`,repositoryId:data.repositoryId};
+        repo=repo.primarySource&&!syncOrigin?{...repo,primarySource:resolved}:repo.origin?{...repo,origin:resolved}:{...repo,...resolved};patchRepo(repo.id,repo);source=resolved;
+      }
       await localCache.saveProjectFiles(repo.id, data.files, data.latestCommitSha,{signal:operationSignal()});
       const old = archiveVersion(repo);
       const updated: TrackedRepo = { ...repo, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree, repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl }, backups: repo.latestCommitSha === 'HEAD' ? repo.backups : [old, ...repo.backups], remoteSnapshot: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString(), hasUpdate: true };
@@ -2228,7 +2279,7 @@ export default config;
       if (repo.uploadTarget) {
         const target = repo.uploadTarget;
         const result = await pushSnapshot(updated, data.files, target.token || globalToken || token, `Sync ${repo.repo} @ ${data.latestCommitSha}`);
-        await recordUpload(updated, result, target.purgeAfterUpload, undefined, {}, target.token || authToken || globalToken || token);
+        await recordUpload(updated, result, target.purgeAfterUpload, undefined, syncOrigin?{originSyncedSha:data.latestCommitSha,originSyncedBranch:source.branch}:{}, target.token || authToken || globalToken || token);
         message = '新版本已更新并验证上传；旧版本记录已保留。';
       }
       if (activeRepoId === repo.id) { setFileContent(null); setSelectedFilePath(null); setViewingBackup(null); }
@@ -2329,7 +2380,7 @@ export default config;
     try {
       const batchId = crypto.randomUUID();
       saveProjectTask(items);
-      await runProjectBatch(items, { signal, onChange: items => { saveProjectTask(items); setBatchTaskItems(items); }, onResult: (item, error) => logOperation(`批量${batchTask === 'fork' ? '分叉' : batchTask === 'sync' ? '同步' : '更新'}`, item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === item.id), item.message || '', '批量任务', error, batchId), run: async item => {
+      await runProjectBatch(items, { signal, stallMs:batchTask==='update'||batchTask==='sync'?120000:undefined, onChange: items => { saveProjectTask(items); setBatchTaskItems(items); }, onResult: (item, error) => logOperation(`批量${batchTask === 'fork' ? '分叉' : batchTask === 'sync' ? '同步' : '更新'}`, item.status as OperationLog['status'], reposRef.current.find(repo => repo.id === item.id), item.message || '', '批量任务', error, batchId), run: async item => {
         const repo = reposRef.current.find(project => project.id === item.id);
         if (!repo) throw new Error('项目已移除，未执行');
         assertTaskContext(repo, 'projects');
@@ -2777,6 +2828,7 @@ export default config;
 
   const allTags = Array.from(new Set(repos.flatMap(r => r.tags)));
 
+  const openProjectList=(filter:string)=>{setSearchFilter('');setSelectedTagFilter('all');setProjectTypeFilter(filter);setSelectedProjectIds([]);setCurrentView('projects');};
   // Global search filtering across Project Name, Owner, Remark, Description, and Tags
   const filteredRepos = repos.filter(repo => {
     const source=sourceOf(repo),targets=projectTargets(repo);
@@ -2784,7 +2836,7 @@ export default config;
     const matchSearch=[repo.repo,repo.owner,repo.url,`${repo.owner}/${repo.repo}`,source.url,`${source.owner}/${source.repo}`,repo.branch,source.branch,repo.remark,repo.description,repo.repoMeta?.description,...repo.tags,...targets.map(target=>`https://github.com/${target.owner}/${target.repo}`)].filter(Boolean).join(' ').toLowerCase().includes(q);
     const bound=targets.length>0 || !!repo.privateRepoUrl || !!repo.accountState;
     const fullFork=repo.forkScope==='full'||repo.uploadTarget?.kind==='full'||!!repo.forkTarget?.branches?.length&&repo.forkScope!=='current';
-    const matchType=projectTypeFilter==='all'||projectTypeFilter==='bound'&&bound||projectTypeFilter==='unbound'&&!bound||projectTypeFilter==='pending'&&(repo.accountState==='pending'||!!repo.creationReservation||!!repo.pendingSwitch)||projectTypeFilter==='fork'&&fullFork||projectTypeFilter==='upload'&&bound&&!fullFork;
+    const matchType=projectTypeFilter==='all'||projectTypeFilter==='private-synced'&&isPrivateSynced(repo)||projectTypeFilter==='updates'&&needsProjectUpdate(repo)||projectTypeFilter==='bound'&&bound||projectTypeFilter==='unbound'&&!bound||projectTypeFilter==='pending'&&(repo.accountState==='pending'||!!repo.creationReservation||!!repo.pendingSwitch)||projectTypeFilter==='fork'&&fullFork||projectTypeFilter==='upload'&&bound&&!fullFork;
     const matchTag = selectedTagFilter === 'all' || repo.tags.includes(selectedTagFilter);
     return matchSearch && matchTag && matchType;
   });
@@ -3187,7 +3239,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   <span>拉取新项目链接</span>
                 </button>
                 <button
-                  onClick={() => setCurrentView('projects')}
+                  onClick={() => openProjectList('all')}
                   className="px-4 py-2.5 bg-[#FFFFFF] hover:bg-[#FAF8F5] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DFD8CE] shadow-xs transition flex flex-row items-center justify-center gap-2 whitespace-nowrap shrink-0"
                 >
                   <FolderGit2 className="w-4 h-4 text-[#8E9F8B] shrink-0" />
@@ -3198,7 +3250,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
             {/* Quick Metrics Bar */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs flex flex-row items-center justify-between">
+              <button type="button" aria-label="查看托管项目总数" onClick={()=>openProjectList('all')} className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs text-left hover:border-[#8E9F8B] transition flex flex-row items-center justify-between">
                 <div>
                   <span className="text-xs text-[#7A7367]">托管项目总数</span>
                   <p className="text-2xl font-serif font-bold text-[#2B2723] mt-0.5">{repos.length}</p>
@@ -3206,31 +3258,31 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 <div className="w-9 h-9 rounded-xl bg-[#8E9F8B]/15 text-[#5D6F5A] flex items-center justify-center shrink-0">
                   <FolderGit2 className="w-4 h-4 shrink-0" />
                 </div>
-              </div>
+              </button>
 
-              <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs flex flex-row items-center justify-between">
+              <button type="button" aria-label="查看已同步私人仓库" onClick={()=>openProjectList('private-synced')} className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs text-left hover:border-[#8E9F8B] transition flex flex-row items-center justify-between">
                 <div>
                   <span className="text-xs text-[#7A7367]">已同步私人仓库</span>
                   <p className="text-2xl font-serif font-bold text-[#5D6F5A] mt-0.5">
-                    {repos.filter(r => r.privateRepoUrl).length}
+                    {repos.filter(isPrivateSynced).length}
                   </p>
                 </div>
                 <div className="w-9 h-9 rounded-xl bg-[#8E9F8B]/15 text-[#5D6F5A] flex items-center justify-center shrink-0">
                   <ShieldCheck className="w-4 h-4 shrink-0" />
                 </div>
-              </div>
+              </button>
 
-              <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs flex flex-row items-center justify-between">
+              <button type="button" aria-label="查看待更新版本" onClick={()=>openProjectList('updates')} className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs text-left hover:border-[#8E9F8B] transition flex flex-row items-center justify-between">
                 <div>
                   <span className="text-xs text-[#7A7367]">待更新版本</span>
                   <p className="text-2xl font-serif font-bold text-[#8C5D54] mt-0.5">
-                    {repos.filter(r => r.hasUpdate).length}
+                    {repos.filter(needsProjectUpdate).length}
                   </p>
                 </div>
                 <div className="w-9 h-9 rounded-xl bg-[#C7A39B]/20 text-[#8C5D54] flex items-center justify-center shrink-0">
                   <RefreshCw className="w-4 h-4 shrink-0" />
                 </div>
-              </div>
+              </button>
 
               <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 shadow-xs flex flex-row items-center justify-between">
                 <div>
@@ -3244,6 +3296,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 </div>
               </div>
             </div>
+
+            <p className="text-xs text-[#7A7367] leading-relaxed">总数按本地项目记录统计；私人仓库数只计当前版本已有同步回执的项目，公开分叉、未上传及待同步项目不计入。待更新包含当前拉取来源更新及待上传版本。点击数字可查看对应项目。</p>
 
             {/* Recent Repos Preview */}
             <div className="flex flex-col gap-4">
@@ -3354,12 +3408,14 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
               <div className="flex flex-row items-center gap-2 flex-wrap sm:flex-wrap whitespace-nowrap">
                 <button
-                  onClick={checkAllUpdates}
+                  disabled={isLoading}
+                  onClick={() => void checkAllUpdates()}
                   className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#474239] rounded-xl text-xs font-medium border border-[#DFD8CE] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <RefreshCw className="w-3.5 h-3.5 text-[#B6847A] shrink-0" />
                   <span>全部检测</span>
                 </button>
+                <button type="button" disabled={isLoading} onClick={()=>void checkAllUpdates(true)} className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#474239] rounded-xl text-xs border border-[#DFD8CE] shadow-xs">强制刷新</button>
               </div>
             </div>
 
@@ -3466,7 +3522,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 />
               </div>
 
-              <select aria-label="项目类型筛选" value={projectTypeFilter} onChange={event=>setProjectTypeFilter(event.target.value)} className="w-full xl:w-auto max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#554F45]"><option value="all">全部类型</option><option value="bound">已绑定</option><option value="unbound">未绑定</option><option value="pending">待完成</option><option value="upload">上传／分支副本</option><option value="fork">完整分叉</option></select>
+              <select aria-label="项目类型筛选" value={projectTypeFilter} onChange={event=>setProjectTypeFilter(event.target.value)} className="w-full xl:w-auto max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#554F45]"><option value="all">全部类型</option><option value="private-synced">已同步私人仓库</option><option value="updates">待更新版本</option><option value="bound">已绑定</option><option value="unbound">未绑定</option><option value="pending">待完成</option><option value="upload">上传／分支副本</option><option value="fork">完整分叉</option></select>
               <div className="flex flex-row items-center gap-2 overflow-x-auto pb-1 md:pb-0 whitespace-nowrap">
                 <span className="text-xs text-[#7A7367] flex flex-row items-center gap-1 shrink-0">
                   <Filter className="w-3.5 h-3.5 shrink-0" /> 标签:
@@ -3579,16 +3635,19 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                             {repo.hasUpdate ? (
                               <span className="text-[10px] bg-[#B6847A]/20 text-[#8C5D54] px-2.5 py-0.5 rounded-full font-bold border border-[#B6847A]/30 flex flex-row items-center gap-1 shrink-0">
                                 <AlertCircle className="w-3 h-3 shrink-0" />
-                                <span>远程有更新</span>
+                                <span>{repo.primarySource?'固定主仓库有更新':'远程有更新'}</span>
                               </span>
                             ) : (
                               <span className="text-[10px] bg-[#8E9F8B]/20 text-[#4D5E4A] px-2.5 py-0.5 rounded-full font-medium border border-[#8E9F8B]/30 flex flex-row items-center gap-1 shrink-0">
                                 <Check className="w-3 h-3 shrink-0" />
-                                <span>最新</span>
+                                <span>{statusChecking.includes(repo.id)?'检测中…':repo.checkError?'检测失败，保留上次结果':repo.checkCancelled?'检测已取消':repo.lastCheckedAt?repo.primarySource?'固定主仓库最新':'最新':'待检测'}</span>
                               </span>
                             )}
                           </div>
 
+                          {repo.checkError&&<p role="status" className="text-xs text-[#8C5D54] break-all">检测失败：{repo.checkError}</p>}
+                          {repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha)&&<p className="text-xs text-[#7A7367]">当前来源版本待上传至固定目标</p>}
+                          {repo.primarySource&&<div className="flex flex-wrap items-center gap-2 text-xs text-[#7A7367]"><span className="break-all">原始上游：{repo.upstreamStatus?.error?`检测失败：${repo.upstreamStatus.error}`:repo.upstreamStatus?.checkedAt?repo.upstreamStatus.hasUpdate===undefined?'已获取上游版本，尚未确认同步基线':repo.upstreamStatus.hasUpdate?'有更新':'已同步的来源版本没有新提交':'尚未检测'}</span><button type="button" disabled={statusChecking.includes(repo.id)} onClick={()=>void checkSingleRepoStatus(repo.id,false,{upstream:true,force:true})} className="px-2 py-1 border border-[#DFD8CE] rounded-lg bg-white text-[#5D6F5A] disabled:opacity-40">检测原始上游</button></div>}
                           {/* Description display */}
                           {repo.description && (
                             <p className="text-xs text-[#554F45] leading-relaxed line-clamp-2">
@@ -3599,6 +3658,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
                           {/* Tags & meta line */}
                           {(repo.accountState || repo.uploadTarget || repo.forkTarget) && <p className="text-xs text-[#5D6F5A] break-words">{bindingLabel(repo as any)} · 固定目标 {(repo.uploadTarget || repo.forkTarget || repo.creationReservation?.target)?.owner}/{(repo.uploadTarget || repo.forkTarget || repo.creationReservation?.target)?.repo}</p>}
+                          <p className="text-xs text-[#7A7367] break-all">拉取来源：<a href={pullSourceOf(repo).url} target="_blank" rel="noreferrer" className="text-[#5D6F5A] hover:underline">{pullSourceOf(repo).owner}/{pullSourceOf(repo).repo}</a> · {pullSourceOf(repo).branch}</p>
                           {targetWarning(repo)}
                           <div className="flex flex-row items-center gap-2 flex-wrap">
                             {repo.tags.map(t => (
@@ -3615,7 +3675,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           </div>
 
                           <p className="text-[11px] text-[#91887C] font-mono flex flex-wrap gap-2">
-                            <span>最后检测: {repo.lastCheckedAt ? new Date(repo.lastCheckedAt).toLocaleTimeString() : '从未'}</span>
+                            <span>上次检测成功: {repo.lastCheckedAt ? new Date(repo.lastCheckedAt).toLocaleTimeString() : '从未'}</span>
                             <span>| 归档: {repo.backups.length} 个版本</span>
                             {repo.lastUploadedToPrivateAt && <span>| 上传私人仓: {new Date(repo.lastUploadedToPrivateAt).toLocaleString()}</span>}
                           </p>
@@ -3768,6 +3828,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
                   <div className="flex flex-row flex-wrap items-center gap-2 mt-2">
                     <span className="text-xs text-[#5D6F5A] font-mono">当前分支：{activeRepo.branch}</span>
+                    <span className="text-xs text-[#7A7367] break-all">拉取来源：{pullSourceOf(activeRepo).owner}/{pullSourceOf(activeRepo).repo} · {pullSourceOf(activeRepo).branch}</span>
+                    {activeRepo.uploadTarget&&<span className="text-xs text-[#5D6F5A] break-all">固定上传目标：{activeRepo.uploadTarget.owner}/{activeRepo.uploadTarget.repo} · {activeRepo.uploadTarget.branch}</span>}
                     <button type="button" onClick={() => handleOpenProjectSettings(activeRepo, 'basic')} className="text-xs text-[#5D6F5A] hover:underline">编辑备注与描述</button><button type="button" onClick={()=>openSwitch(activeRepo)} className="text-xs text-[#5D6F5A] hover:underline">另存并切换固定仓库</button><span className="text-xs text-[#5D6F5A]">{bindingLabel(activeRepo as any)}</span>
                   </div>
                   <div className="flex flex-row flex-wrap items-center gap-2 mt-2">

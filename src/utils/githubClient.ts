@@ -1,10 +1,10 @@
 import { sourceMarker } from './projectProvenance';
-import {usesNativeFolder, beginFolder, putFolderFile, finishFolder, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, type FolderFiles} from './nativeFolder';
+import {usesNativeFolder, beginFolder, putFolderFile, finishFolder, hasLocalFolderChanges, confirmFolderUpload, hydrateFile, hasCurrentNativeScan, verifiedNativeManifest, type FolderFiles} from './nativeFolder';
 import { gitBlobSha, gitTreeSha } from './gitFiles';
-import {beginGithubOperation, cancelGithubOperation, operationSignal, cooperate} from './operation';
+import {beginGithubOperation, cancelGithubOperation, operationSignal, operationGroup, reportProgress, cooperate} from './operation';
 export {beginGithubOperation, cancelGithubOperation, operationSignal} from './operation';
 import {verifiedBlobSha, rememberVerifiedFile} from './verifiedFiles';
-import {planFileChanges,shouldUseNativeBlobDelta} from './transferPlan';
+import {planFileChanges,shouldUseNativeBlobDelta,shouldUseNativePushDelta} from './transferPlan';
 export { gitBlobSha } from './gitFiles';
 import { transferCache, uploadCache } from './localCache';
 import type { CachedFile } from './localCache';
@@ -15,6 +15,7 @@ import { gitServiceConfig, gitServiceTransfer } from './gitService';
 import { measureTransfer } from './transferMetrics';
 import {shouldUseArchive} from './transferPlan';
 import {markTransferFailure, transferFailureKind, transferFailureLabel, isStorageFailure} from './transferFailure';
+import {branchStatus} from './branchStatus';
 
 export interface RepoEntry {
   path: string;
@@ -28,6 +29,7 @@ export interface TransferOptions {
   onProgress?: (message: string) => void;
   cachedFiles?: CachedFile[];
   ref?: string;
+  expectedId?:number;
 }
 
 export function isOperationCancelled(error: unknown, signal: AbortSignal) {
@@ -36,7 +38,7 @@ export function isOperationCancelled(error: unknown, signal: AbortSignal) {
 }
 function progress(message: string, options?: TransferOptions) {
   options?.onProgress?.(message);
-  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('gitvault-progress', { detail: message }));
+  reportProgress(message,true,options?.signal||operationSignal());
 }
 function headers(token?: string, raw = false): Record<string, string> {
   return {
@@ -60,7 +62,7 @@ async function request(path: string, token?: string, init: RequestInit = {}, sig
   }, signal, timeout);
 }
 const taskReads=new WeakMap<AbortSignal,Map<string,Promise<any>>>();
-function reads(signal:AbortSignal){let values=taskReads.get(signal);if(!values){values=new Map();taskReads.set(signal,values);}return values;}
+function reads(signal:AbortSignal){const group=operationGroup(signal);let values=taskReads.get(group);if(!values){values=new Map();taskReads.set(group,values);}return values;}
 async function json(path: string, token?: string, init: RequestInit = {}, signal=operationSignal()) {
   signal.throwIfAborted();
   // A token identifies one account for this task. Only immutable full-SHA Git
@@ -202,12 +204,24 @@ export const githubClient = {
 
   async fetchRepo(url: string, branch?: string, token?: string, options: TransferOptions = {}) {
     const signal = options.signal || operationSignal();
-    const { owner, repo, linkedRef } = parseRepository(url);
+    let { owner, repo, linkedRef } = parseRepository(url);
     return measureTransfer({action:'拉取',project:`${owner}/${repo}`,branch,mode:gitServiceConfig().mode,signal}, async trace => {
     progress('正在识别仓库和分支…', options);
-    const meta = await json(root(owner, repo), token, {}, signal);
+    let meta;
+    try{meta=await json(root(owner, repo),token,{},signal);}
+    catch(error){
+      if(!(error instanceof GitHubError)||error.status!==404||!options.expectedId)throw error;
+      const identity=await githubClient.repository(owner,repo,token,options.expectedId,signal);owner=identity.owner;repo=identity.repo;
+      meta=await json(root(owner,repo),token,{cache:'no-store'},signal);
+    }
+    if(options.expectedId&&meta.id!==options.expectedId)throw new GitHubError('来源仓库身份已变化，未下载或上传同名替代仓库；请先核对固定来源',409);
+    owner=meta.owner?.login||owner;repo=meta.name||repo;
     const ref = options.ref || await resolveRef(owner, repo, linkedRef, branch, token, signal) || meta.default_branch;
-    const commit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(ref)}`, token, {}, signal);
+    // Pinned updates need commit metadata, not the potentially large file diff
+    // returned by /commits/{ref}. Branch/tag imports retain normal resolution.
+    const rawCommit = await json(`${root(owner, repo)}/${options.ref&&/^[a-f0-9]{40}$/.test(ref)?'git/commits':'commits'}/${encodeURIComponent(ref)}`, token, {}, signal);
+    const commit=rawCommit.commit?rawCommit:{sha:rawCommit.sha,commit:{tree:rawCommit.tree,message:rawCommit.message,author:rawCommit.author}};
+    if(/^[a-f0-9]{40}$/.test(commit.sha))reads(signal).set(JSON.stringify([token||'',`${root(owner,repo)}/commits/${commit.sha}`]),Promise.resolve(structuredClone(commit)));
     const tree = await getTree(owner, repo, commit.commit.tree.sha, token, signal);
     // ZIPs do not include submodule contents. Never claim those projects are completely cached.
     if (tree.some(item => item.type === 'commit')) throw new Error('项目包含 Git 子模块，需要单独获取子模块内容；本次未标记为完整下载');
@@ -349,7 +363,7 @@ export const githubClient = {
       repoMeta: { description: meta.description || '', stars: meta.stargazers_count || 0, forks: meta.forks_count || 0, language: meta.language || 'Unknown', updatedAt: meta.updated_at, htmlUrl: meta.html_url },
       tree, files: completedFiles, cachedFilesCount: files.size, isFullyCached: true,
     };
-    });
+    }).then(result=>{branchStatus.invalidate(owner,repo,result.branch);return result;});
   },
 
   async getFile(owner: string, repo: string, path: string, token?: string, ref?: string) {
@@ -362,17 +376,31 @@ export const githubClient = {
     return { type: file.isBase64 ? 'base64' : 'text', content: file.content };
   },
 
-  async checkUpdate(owner: string, repo: string, branch: string, currentSha: string, token?: string) {
-    const commit = await json(`${root(owner, repo)}/commits/${encodeURIComponent(branch)}`, token);
-    if(/^[a-f0-9]{40}$/.test(commit.sha))reads(operationSignal()).set(JSON.stringify([token||'',`${root(owner,repo)}/commits/${commit.sha}`]),Promise.resolve(commit));
-    return { hasUpdate: commit.sha !== currentSha, latestSha: commit.sha, latestCommit: { sha: commit.sha, message: commit.commit.message, author: commit.commit.author?.name, date: commit.commit.author?.date } };
+  async checkUpdate(owner: string, repo: string, branch: string, currentSha: string, token?: string, options:{signal?:AbortSignal;force?:boolean;expectedId?:number}={}) {
+    const signal=options.signal||operationSignal();let resolved:{owner:string;repo:string;repositoryId?:number;url:string}|undefined;
+    let head;
+    try{head=await branchStatus.read(owner,repo,branch,token,signal,options.force);}
+    catch(error){
+      if(!(error instanceof GitHubError)||error.status!==404||!options.expectedId)throw error;
+      const identity=await githubClient.repository(owner,repo,token,options.expectedId,signal);
+      if(identity.owner.toLowerCase()===owner.toLowerCase()&&identity.repo.toLowerCase()===repo.toLowerCase())throw error;
+      resolved={owner:identity.owner,repo:identity.repo,repositoryId:identity.id,url:identity.htmlUrl};
+      head=await branchStatus.read(identity.owner,identity.repo,branch,token,signal,true);
+    }
+    return {hasUpdate:head.sha!==currentSha,latestSha:head.sha,latestCommit:{sha:head.sha,message:'',author:'',date:''},checkedAt:head.checkedAt,cached:head.cached,resolved};
   },
 
   async repository(owner: string, repo: string, token?: string, expectedId?: number, signal = operationSignal()) {
     const target = { id: expectedId, owner, repo };
     const checkId = ++repositoryCheckSequence;
     try {
-      const meta = await json(root(owner, repo), token, { cache: 'no-store' }, signal);
+      let meta;
+      try{meta=await json(root(owner, repo), token, { cache: 'no-store' }, signal);}
+      catch(error){
+        if(!(error instanceof GitHubError)||![301,302,404].includes(error.status)||!Number.isSafeInteger(expectedId)||!expectedId||expectedId<=0)throw error;
+        try{meta=await json(`/repositories/${expectedId}`,token,{cache:'no-store'},signal);}
+        catch(lookupError){if(lookupError instanceof GitHubError&&lookupError.status===404)throw error;throw lookupError;}
+      }
       if (expectedId && meta.id !== expectedId) throw new TargetRepositoryError({ ...target, status: 'identity-changed', checkedAt: new Date().toISOString(), message: '目标仓库身份已变化，身份校验失败，已停止操作；可能删除后创建了同名仓库。请通过“管理远端目标”确认解除旧绑定后重新设置，避免误写新仓库。' }, 409);
       const identity = { id: meta.id as number | undefined, owner: meta.owner?.login || owner, repo: meta.name || repo, defaultBranch: meta.default_branch || 'main', htmlUrl: meta.html_url || `https://github.com/${owner}/${repo}`, private: meta.private, forkParentId: meta.fork ? meta.parent?.id as number | undefined : undefined, forkParent: meta.fork ? (meta.parent?.full_name || (meta.parent?.owner?.login && meta.parent?.name ? `${meta.parent.owner.login}/${meta.parent.name}` : undefined)) as string | undefined : undefined };
       targetHealthEvent(target, { id: identity.id, owner: identity.owner, repo: identity.repo, status: 'available', checkedAt: new Date().toISOString(), message: '远端仓库可访问，身份校验通过' }, checkId, { id: identity.id, owner: identity.owner, repo: identity.repo, htmlUrl: identity.htmlUrl });
@@ -456,8 +484,9 @@ export const githubClient = {
     const signal = operationSignal();
     return measureTransfer({action:'上传',project:`${targetOwner}/${targetRepo}`,branch:targetBranch,target:`${targetOwner}/${targetRepo}:${targetBranch}`,mode:gitServiceConfig().mode,signal}, async trace => {
     await confirmFolderUpload(files,signal);signal.throwIfAborted();
-    const base = root(targetOwner, targetRepo);
     const identity = await githubClient.repository(targetOwner, targetRepo, token, options.expectedRepoId, signal);
+    targetOwner=identity.owner;targetRepo=identity.repo;
+    const base = root(targetOwner, targetRepo);
     const meta = { id: identity.id, default_branch: identity.defaultBranch };
     const branch = targetBranch || meta.default_branch || 'main';
     trace.branch(branch);
@@ -479,7 +508,23 @@ export const githubClient = {
       if (!file.path || file.path.startsWith('/') || file.path.split('/').some(p => p === '..' || !p) || paths.has(file.path)) throw new Error(`无效或重复的文件路径: ${file.path}`);
       paths.add(file.path);
     }
-    if (gitServiceConfig().mode !== 'rest') {
+    let parentTree = '';
+    const existing = new Map<string, RepoEntry>();
+    const loadParent=async()=>{
+      if(parent&&!parentTree){const commit=await json(`${base}/git/commits/${parent}`,token,{},signal);parentTree=commit.tree.sha;for(const item of await getTree(targetOwner,targetRepo,parentTree,token,signal))existing.set(item.path,item);}
+    };
+    let lightUpdate=false;
+    if(gitServiceConfig().mode==='native'&&parent){
+      trace.phase('规划小范围更新');await loadParent();
+      const planned=[];
+      for(const file of allFiles){const checked=file.nativeRef?{sha:file.sha,size:file.size}:await verifiedBlobSha(file,signal);planned.push({path:file.path,sha:checked.sha,size:checked.size,mode:file.mode||'100644'});}
+      if(shouldUseNativePushDelta([...existing.values()],planned)){
+        const verified=await verifiedNativeManifest(allFiles,signal);allFiles.splice(0,allFiles.length,...verified);lightUpdate=true;
+        const delta=planFileChanges([...existing.values()],planned);trace.count('增量上传文件',delta.added.length+delta.modified.length);
+        progress(`小范围更新：新增 ${delta.added.length} · 修改 ${delta.modified.length} · 删除 ${delta.removed.length}，使用增量 API，跳过 Git 对象包…`);
+      }
+    }
+    if (gitServiceConfig().mode !== 'rest'&&!lightUpdate) {
       if (!Number.isSafeInteger(identity.id) || !identity.id || identity.id <= 0) throw new Error('目标仓库缺少可信 ID，未开始 Git 推送');
       progress(`正在通过 Git 推送 ${allFiles.length} 个文件到 ${targetOwner}/${targetRepo}:${branch}…`);
       const prepared: CachedFile[] = [];
@@ -498,13 +543,7 @@ export const githubClient = {
       return { success: true, verified: true, repoPrivate: identity.private as boolean | undefined, repoId: identity.id, commitSha: result.commitSha as string, treeSha: result.treeSha as string, branch, owner: targetOwner, repo: targetRepo, htmlUrl: `https://github.com/${targetOwner}/${targetRepo}/tree/${branch}`, uploadedFilesCount: files.length, ...(localFiles?{localFiles}:{}) };
     }
     trace.phase('比较目标并合并上传文件（含排队等待）');
-    let parentTree = '';
-    const existing = new Map<string, RepoEntry>();
-    if (parent) {
-      const commit = await json(`${base}/git/commits/${parent}`, token);
-      parentTree = commit.tree.sha;
-      for (const item of await getTree(targetOwner, targetRepo, commit.tree.sha, token)) existing.set(item.path, item);
-    }
+    await loadParent();
     let done = 0;
     const checkpointId = meta.id || 0;
     const checkpoints = typeof indexedDB !== 'undefined' && Number.isSafeInteger(checkpointId) && checkpointId > 0 ? uploadCache : undefined;
@@ -548,6 +587,10 @@ export const githubClient = {
     const expectedFiles: Array<{path:string;mode:string;sha:string}> = [];
     const treeItems = await mapConcurrent(allFiles, 1, async file => {
       signal.throwIfAborted();
+      if(file.nativeRef&&hasCurrentNativeScan(file,signal)&&file.sha&&verifiedBlobs.has(file.sha)){
+        const entry={path:file.path,mode:file.mode||'100644',sha:file.sha};expectedFiles.push(entry);
+        progress(`正在复用已校验对象 ${++done}/${allFiles.length}：${file.path}`);return {...entry,type:'blob'};
+      }
       file=await hydrateFile(file,Infinity,signal);
       const hash = (await verifiedBlobSha(file,signal)).sha;
       expectedFiles.push({path:file.path,mode:file.mode || '100644',sha:hash});
@@ -640,7 +683,7 @@ export const githubClient = {
       progress('目标分支出现新提交，正在接续最新历史创建覆盖更新…');
     }
     throw new Error('目标分支持续变化，已停止重试并保留本地文件');
-    });
+    }).then(result=>{branchStatus.invalidate(result.owner,result.repo,result.branch);return result;});
   },
 
   async fetchBranches(url: string, token?: string, signal?: AbortSignal): Promise<string[]> {

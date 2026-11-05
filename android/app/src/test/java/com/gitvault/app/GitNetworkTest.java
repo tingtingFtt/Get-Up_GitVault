@@ -10,6 +10,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.eclipse.jgit.transport.http.HttpConnection;
 
 public class GitNetworkTest {
+    @Test public void bytesAdvanceActivityWhileAnUnchangedHeartbeatDoesNot()throws Exception{
+        List<String> messages=new ArrayList<>();List<Boolean> activity=new ArrayList<>();ByteArrayOutputStream written=new ByteArrayOutputStream();
+        HttpURLConnection response=new HttpURLConnection(new URL("https://github.com")){
+            public InputStream getInputStream(){return new ByteArrayInputStream(new byte[2*1024*1024]);}
+            public OutputStream getOutputStream(){return written;}
+            public void disconnect(){}public boolean usingProxy(){return false;}public void connect(){}
+        };
+        URL url=new URL(null,"https://github.com/repo",new URLStreamHandler(){protected URLConnection openConnection(URL value){return response;}protected URLConnection openConnection(URL value,Proxy proxy){return response;}});
+        try(GitNetwork network=new GitNetwork(new AtomicBoolean(),(message,active)->{messages.add(message);activity.add(active);})){
+            network.endTask();assertFalse(activity.get(activity.size()-1));HttpConnection connection=network.create(url);
+            try(InputStream input=connection.getInputStream()){assertEquals(2*1024*1024,input.readAllBytes().length);}
+            try(OutputStream output=connection.getOutputStream()){output.write(new byte[]{1,2,3,4});}
+            network.endTask();assertTrue(activity.get(activity.size()-1));assertTrue(messages.get(messages.size()-1).contains("Git 接收 2.0 MiB / 发送 4 B"));
+            network.endTask();assertFalse(activity.get(activity.size()-1));assertEquals(4,written.size());
+        }
+    }
     @Test public void cancellingTaskDisconnectsItsBlockedRequestWithoutWaitingForTheReadDeadline()throws Exception{
         AtomicBoolean stop=new AtomicBoolean();CountDownLatch reading=new CountDownLatch(1),disconnected=new CountDownLatch(1);
         HttpURLConnection blocked=new HttpURLConnection(new URL("https://github.com")){
@@ -27,7 +43,7 @@ public class GitNetworkTest {
     }
     @Test public void progressIncludesObjectCountsAndCancellationState(){
         AtomicBoolean stop=new AtomicBoolean();List<String> messages=new ArrayList<>();
-        try(GitNetwork network=new GitNetwork(stop,messages::add)){
+        try(GitNetwork network=new GitNetwork(stop,message->messages.add(message))){
             network.beginTask("Receiving objects",10);network.update(4);network.endTask();
             assertTrue(messages.stream().anyMatch(message->message.contains("4/10")&&message.contains("秒")&&message.contains("可取消")));
             stop.set(true);assertTrue(network.isCancelled());

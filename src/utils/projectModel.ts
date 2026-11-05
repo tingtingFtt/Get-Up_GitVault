@@ -16,6 +16,15 @@ export function sourceOf(project: ProjectSource & { origin?: ProjectSource }): P
 export function pullSourceOf(project: ProjectSource & { origin?: ProjectSource; primarySource?: ProjectSource }): ProjectSource {
   return project.primarySource || sourceOf(project);
 }
+/** An upload destination alone is not consent to follow that repository. */
+export function followsSavedTarget(record?: {primary?:boolean; sourceMode?:'origin'|'target'; history?:unknown[]}):boolean {
+  return !!record?.primary && (record.sourceMode==='target'||record.sourceMode!=='origin'&&!!record.history?.length);
+}
+/** Repair the legacy implicit switch caused solely by changing the first upload name. */
+export function restoreImplicitSource<T extends ProjectSource & {origin?:ProjectSource;primarySource?:ProjectSource;sourceMode?:'origin'|'target';targetHistory?:unknown[];repoMeta:{htmlUrl?:string};hasUpdate?:boolean;lastCheckedAt?:string;lastCheckAttemptAt?:string;checkError?:string;checkCancelled?:boolean;latestRemoteCommit?:unknown}>(project:T):T {
+  if(!project.origin||!project.primarySource||followsSavedTarget({primary:true,sourceMode:project.sourceMode,history:project.targetHistory}))return project;
+  return {...project,...project.origin,repositoryId:project.origin.repositoryId,primarySource:undefined,sourceMode:'origin',repoMeta:{...project.repoMeta,htmlUrl:project.origin.url},hasUpdate:undefined,lastCheckedAt:undefined,lastCheckAttemptAt:undefined,checkError:undefined,checkCancelled:false,latestRemoteCommit:undefined};
+}
 export function savedSnapshot(project: { remoteSnapshot?: RemoteSnapshot; backups: BackupVersion[]; savedCopies?: RemoteSnapshot[] }, sha: string) {
   return [project.remoteSnapshot, ...project.backups.map(b => b.remoteSnapshot), ...(project.savedCopies || [])].find(s => s?.sourceSha === sha);
 }

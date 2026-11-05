@@ -6,7 +6,7 @@ export interface TransferTrace {
   phase: (name: string) => void;
   native: (timings: unknown) => void;
   branch: (name: string) => void;
-  count: (name:'新增文件'|'修改文件'|'删除文件'|'复用文件'|'ZIP 尝试'|'ZIP 失败'|'ZIP 接收字节'|'补拉文件',amount:number) => void;
+  count: (name:'新增文件'|'修改文件'|'删除文件'|'复用文件'|'ZIP 尝试'|'ZIP 失败'|'ZIP 接收字节'|'补拉文件'|'增量上传文件',amount:number) => void;
   recovery: (error: unknown) => void;
 }
 
@@ -33,7 +33,7 @@ export async function measureTransfer<T>(context: TransferContext, work: (trace:
     },
   };
   try { const result = await work(trace); status = 'success'; return result; }
-  catch (error) { if (context.signal.aborted || (error as Error)?.name === 'AbortError' || (error as { code?: string })?.code === 'CANCELLED') status = 'cancelled'; failure=status==='cancelled'?'用户取消':transferFailureLabel(error); throw error; }
+  catch (error) { if (context.signal.reason?.name!=='TimeoutError'&&(context.signal.aborted || (error as Error)?.name === 'AbortError' || (error as { code?: string })?.code === 'CANCELLED')) status = 'cancelled'; failure=status==='cancelled'?'用户取消':transferFailureLabel(error); throw error; }
   finally {
     if(typeof window!=='undefined')window.removeEventListener('gitvault-transport-metric',metric);
     const end = now(); durations.push({ name: current, ms: end - since });

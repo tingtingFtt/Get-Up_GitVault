@@ -1,6 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sourceOf, savedSnapshot, renamedProject, archiveVersion, targetForBranch, assertBranchTarget } from '../src/utils/projectModel';
+import { sourceOf, savedSnapshot, renamedProject, archiveVersion, targetForBranch, assertBranchTarget, restoreImplicitSource, followsSavedTarget, pullSourceOf } from '../src/utils/projectModel';
+
+test('legacy renamed first upload restores the original source but preserves target, current bytes and history',()=>{
+  const origin={owner:'xiaolongbao0709',repo:'ai-virtual-phone',url:'https://github.com/xiaolongbao0709/ai-virtual-phone',branch:'main',repositoryId:42};
+  const primarySource={owner:'t356tye-lab',repo:'ai-virtual-phone_xiaolongbao',url:'https://github.com/t356tye-lab/ai-virtual-phone_xiaolongbao',branch:'main',repositoryId:77};
+  const project={...primarySource,origin,primarySource,repoMeta:{htmlUrl:primarySource.url},latestCommitSha:'target-sha',tree:[{}],remoteSnapshot:{sourceSha:'target-sha'},uploadTarget:{id:77},backups:[{}],hasUpdate:true,lastCheckedAt:'old'};
+  const repaired=restoreImplicitSource(project);
+  assert.equal(repaired.owner,origin.owner);assert.equal(repaired.repo,origin.repo);assert.deepEqual(pullSourceOf(repaired),origin);
+  assert.equal(repaired.uploadTarget,project.uploadTarget);assert.equal(repaired.backups,project.backups);assert.equal(repaired.tree,project.tree);assert.equal(repaired.latestCommitSha,'target-sha');assert.equal(repaired.lastCheckedAt,undefined);
+  assert.equal(restoreImplicitSource(repaired),repaired);
+  for(const extra of [{sourceMode:'target' as const},{targetHistory:[{}]}]){const explicit={...project,...extra};assert.equal(restoreImplicitSource(explicit),explicit);}
+  assert.equal(followsSavedTarget({primary:true}),false);assert.equal(followsSavedTarget({primary:true,sourceMode:'origin',history:[{}]}),false);assert.equal(followsSavedTarget({primary:true,sourceMode:'target'}),true);
+});
 
 test('renaming a bound repository updates copies and all history links without changing source', () => {
   const target = { id: 77, owner: 'me', repo: 'chosen-name', branch: 'release', purgeAfterUpload: false };

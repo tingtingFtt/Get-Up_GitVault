@@ -3,6 +3,7 @@ import type { PluginListenerHandle } from '@capacitor/core';
 import type { CachedFile } from './localCache';
 import {noteFolderRepair} from './nativeFolder';
 import {nativeGitCacheEnabled} from './nativeGitCache';
+import {reportProgress} from './operation';
 export interface NativeGitFile { path: string; sha: string; mode: string; size?: number; encoding: 'base64'; content: string; nativeRef?: CachedFile['nativeRef'] }
 export interface NativeFetchOptions { onFile?: (file: NativeGitFile) => Promise<void>; paths?: string[] }
 interface NativeGit {
@@ -14,7 +15,7 @@ interface NativeGit {
  readChunk(options: Record<string, unknown>): Promise<{offset:number;bytes:number;done:boolean;content:string}>;
  release(options: {id:string}): Promise<void>;
  cancel(options: {id:string}): Promise<void>;
- addListener(name:'progress',listener:(event:{id:string;message:string})=>void):Promise<PluginListenerHandle>;
+ addListener(name:'progress',listener:(event:{id:string;message:string;active?:boolean})=>void):Promise<PluginListenerHandle>;
 }
 const plugin=registerPlugin<NativeGit>('GitVaultGit');
 export const nativeGitBridge: NativeGit={
@@ -29,12 +30,12 @@ export const NATIVE_CHUNK_BYTES=384*1024;
 const encodedChunkSize=NATIVE_CHUNK_BYTES/3*4;
 const base64Size=(text:string)=>text.length/4*3-(text.endsWith('==')?2:text.endsWith('=')?1:0);
 function encode(bytes:Uint8Array){let text='';for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(text);}
-const report=(message:string)=>window.dispatchEvent(new CustomEvent('gitvault-progress',{detail:message}));
+const report=(message:string,active=true,signal?:AbortSignal)=>reportProgress(message,active,signal);
 export async function nativeGitTransfer(action:'fetch'|'push',payload:{owner:string;repo:string;expectedRepoId:number;ref?:string;branch?:string;files?:CachedFile[];message?:string;rebaseOnConflict?:boolean;totalBytes?:number;folderVersion?:string},token:string,signal:AbortSignal,options:NativeFetchOptions={}){
  if(!hasNativeGit())throw new Error('当前安装包不含原生 Git，请更新 APK 或选择 REST');
  signal.throwIfAborted();const id=crypto.randomUUID();
  const abort=()=>{void nativeGitBridge.cancel({id}).catch(()=>{});};
- const listener=await nativeGitBridge.addListener('progress',event=>{if(event.id===id||!event.id)report(event.message);});
+ const listener=await nativeGitBridge.addListener('progress',event=>{if(event.id===id||!event.id)report(event.message,event.active!==false,signal);});
  signal.addEventListener('abort',abort,{once:true});
  const work=async()=>{
   signal.throwIfAborted();

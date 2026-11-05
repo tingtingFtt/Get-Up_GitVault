@@ -21,6 +21,9 @@ final class GitSnapshotStore implements Closeable {
     private final Map<String,DirCacheEntry> uploaded=new LinkedHashMap<>();
     private final Set<String> stagedBlobs=new HashSet<>();
     long newObjects,reusedObjects,sourceBytes;
+    private ManagedFolderStore.Progress sourceProgress;
+    private String sourcePath="";
+    private long sourceStart,sourceSize,sourceReported;
     private InputStream input;
     private String reading="",writing="";
     private long readOffset,writeOffset;
@@ -97,7 +100,9 @@ final class GitSnapshotStore implements Closeable {
         try(ObjectInserter insert=repository.newObjectInserter()){
             for(int i=0;i<files.length();i++){
                 check();JSONObject file=files.getJSONObject(i);
-                try(InputStream input=reader.open(file.getJSONObject("nativeRef"))){appendStream(file.getString("path"),file.getString("sha"),file.getString("mode"),file.getLong("size"),input,insert);}
+                sourceProgress=progress;sourcePath=file.getString("path");sourceStart=sourceBytes;sourceSize=file.getLong("size");sourceReported=0;reportSource();
+                try(InputStream input=reader.open(file.getJSONObject("nativeRef"))){appendStream(file.getString("path"),file.getString("sha"),file.getString("mode"),sourceSize,input,insert);}
+                finally{sourceProgress=null;}
                 progress.update("读取、校验并暂存 "+(i+1)+"/"+files.length());
             }insert.flush();
         }
@@ -117,7 +122,9 @@ final class GitSnapshotStore implements Closeable {
         stagedBlobs.add(sha);if(reuse)reusedObjects++;else newObjects++;
         DirCacheEntry entry=new DirCacheEntry(path);entry.setFileMode(FileMode.fromBits(bits));entry.setObjectId(blob);uploaded.put(path,entry);
     }
-    private InputStream checked(InputStream input){return new FilterInputStream(input){@Override public int read()throws IOException{check();int value=in.read();if(value!=-1)sourceBytes++;return value;}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();int count=in.read(bytes,offset,length);if(count>0)sourceBytes+=count;return count;}};}
+    private static String readSize(long bytes){return bytes>=1048576?String.format(Locale.ROOT,"%.1f MiB",bytes/1048576d):bytes>=1024?String.format(Locale.ROOT,"%.1f KiB",bytes/1024d):bytes+" B";}
+    private void reportSource(){if(sourceProgress==null)return;long now=System.nanoTime();if(sourceReported==0||now-sourceReported>=200000000L){sourceReported=now;sourceProgress.update("读取、校验并暂存 "+sourcePath+" · "+readSize(sourceBytes-sourceStart)+" / "+readSize(sourceSize));}}
+    private InputStream checked(InputStream input){return new FilterInputStream(input){@Override public int read()throws IOException{check();int value=in.read();if(value!=-1)sourceBytes++;reportSource();return value;}@Override public int read(byte[] bytes,int offset,int length)throws IOException{check();int count=in.read(bytes,offset,length);if(count>0)sourceBytes+=count;reportSource();return count;}};}
     static ObjectId writeTree(Repository repository,List<DirCacheEntry> entries)throws IOException{
         entries.sort((a,b)->{byte[] x=a.getRawPath(),y=b.getRawPath();for(int i=0;i<Math.min(x.length,y.length);i++)if(x[i]!=y[i])return (x[i]&255)-(y[i]&255);return x.length-y.length;});
         DirCache cache=DirCache.newInCore();DirCacheBuilder builder=cache.builder();for(DirCacheEntry entry:entries)builder.add(entry);builder.finish();

@@ -47,7 +47,7 @@ public class GitVaultGitPlugin extends Plugin {
         io.execute(()->{try{
             AtomicBoolean stop=cancelled.get(id);
             if(call.getBoolean("retainObjects",false)){
-                GitNetwork network=new GitNetwork(stop,message->progress(id,message));networkTasks.put(id,network);
+                GitNetwork network=new GitNetwork(stop,(message,active)->progress(id,message,active));networkTasks.put(id,network);
                 try{verifyIdentity(call.getString("owner",""),call.getString("repo",""),readRepositoryId(call),call.getString("token",""),stop,network,id);}
                 finally{networkTasks.remove(id,network);network.close();}
             }
@@ -70,7 +70,7 @@ public class GitVaultGitPlugin extends Plugin {
                 if(!owner.matches("[A-Za-z0-9_.-]+")||!name.matches("[A-Za-z0-9_.-]+")||!Arrays.asList("fetch","push").contains(action))throw new IOException("Git 仓库参数无效");
                 AtomicBoolean stop=cancelled.get(id); check(stop);
                 long expectedRepoId=readRepositoryId(call);
-                GitNetwork network=new GitNetwork(stop,message->progress(id,message));networkTasks.put(id,network);
+                GitNetwork network=new GitNetwork(stop,(message,active)->progress(id,message,active));networkTasks.put(id,network);
                 GitTransferRecovery recovery=new GitTransferRecovery(stop,message->network.beginTask(message,0));
                 verifyIdentity(owner,name,expectedRepoId,token,stop,network,id);
                 Staged staged=fetching?createSession(id,call):sessions.get(id);if(staged==null)throw new IOException("Git 上传暂存已结束，请重试");
@@ -86,7 +86,7 @@ public class GitVaultGitPlugin extends Plugin {
                         check(stop);result=staged.store.describe(ref);pinForCache(staged,id,"refs/gitvault/source",ObjectId.fromString(ref));
                         String folderVersion=call.getString("folderVersion","");
                         if(!folderVersion.isEmpty()){
-                            JSObject stored=new ManagedFolderStore(getContext()).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
+                            JSObject stored=new ManagedFolderStore(getContext()).task(stop,message->pacedProgress(id,message)).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
                             result.put("files",stored.getJSONArray("files"));result.put("folder",true);result.put("folderVersion",folderVersion);result.put("streamed",true);
                             result.put("repairedFiles",stored.optInt("repairedFiles",0));
                             timings.put("folderMs",android.os.SystemClock.elapsedRealtime()-phaseStart);
@@ -138,7 +138,8 @@ public class GitVaultGitPlugin extends Plugin {
             finally {GitNetwork network=networkTasks.remove(id);if(network!=null)network.close();if(!retain)releaseSession(id);}
         });
     }
-    private void progress(String id,String message){JSObject value=new JSObject();value.put("id",id);value.put("message","原生 Git："+message);notifyListeners("progress",value);}
+    private void progress(String id,String message){progress(id,message,true);}
+    private void progress(String id,String message,boolean active){JSObject value=new JSObject();value.put("id",id);value.put("message","原生 Git："+message);value.put("active",active);notifyListeners("progress",value);}
     private void pacedProgress(String id,String message){long now=android.os.SystemClock.elapsedRealtime(),previous=lastProgress.containsKey(id)?lastProgress.get(id):0;if(now-previous>=200){lastProgress.put(id,now);progress(id,message);}}
     private static void check(AtomicBoolean stop)throws IOException{if(stop.get()||Thread.currentThread().isInterrupted())throw new IOException("Git 任务已取消，本地文件保留");}
     private void verifyIdentity(String owner,String name,long expected,String token,AtomicBoolean stop,GitNetwork network,String id)throws Exception {

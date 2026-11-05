@@ -1,3 +1,4 @@
+import {operationGroup} from './operation';
 import { scanAccountDiscovery,discoveryStore,type DiscoveryRow } from './accountDiscovery';
 import { readMetadataSource } from './projectProvenance';
 import { githubApi, GitHubError, operationSignal } from './githubClient';
@@ -36,9 +37,9 @@ export interface AccountProject {
   discovery?: { kind: 'name' | 'fork' | 'metadata' | 'search'; source?: {owner:string;repo:string}; branches?: string[]; fork?:boolean };
   kind: 'upload' | 'current' | 'full'; state: 'reserved' | 'active';
   createdByApp: boolean; reservationId?: string; branches?: string[];
-  bindings: Record<string, { branch: string; sourceSha?: string; commitSha?: string; updatedAt: string }>;
+  bindings: Record<string, { branch: string; sourceSha?: string; commitSha?: string; originSha?: string; updatedAt: string }>;
   updatedAt: string;
-  primary?: boolean; profile?: { tags: string[]; remark: string; description: string; updatedAt: string };
+  primary?: boolean; sourceMode?: 'origin'|'target'; profile?: { tags: string[]; remark: string; description: string; updatedAt: string };
   history?: TargetHistory[];
   switchReservation?: { id: string; from?: TargetIdentity; target: TargetIdentity; branch: string; sourceSha?: string; sourceBranch?: string; createdAt: string };
 }
@@ -57,7 +58,7 @@ const missing = (error: unknown) => error instanceof GitHubError && error.status
 const cleanTarget = (target: TargetIdentity) => ({id:target.id,owner:target.owner,repo:target.repo, ...(typeof target.private === 'boolean' ? {private:target.private} : {})});
 const validName = (value: unknown) => typeof value === 'string' && /^[\w.-]+$/.test(value);
 function cleanProject(project: AccountProject): AccountProject {
-  return { source: { owner: project.source.owner, repo: project.source.repo, url: `https://github.com/${project.source.owner}/${project.source.repo}`, branch: project.source.branch, repositoryId: project.source.repositoryId }, target: cleanTarget(project.target), kind: project.kind, state: project.state, createdByApp: !!project.createdByApp, reservationId: project.reservationId, branches: project.branches?.filter(branch => typeof branch === 'string'), bindings: Object.fromEntries(Object.entries(project.bindings).map(([branch, binding]) => [branch, { branch: binding.branch, sourceSha: binding.sourceSha, commitSha: binding.commitSha, updatedAt: binding.updatedAt }])), updatedAt: project.updatedAt, primary: project.primary, profile: project.profile ? {tags: project.profile.tags.filter(tag => typeof tag === 'string'), remark: project.profile.remark, description: project.profile.description, updatedAt:project.profile.updatedAt} : undefined, history: project.history?.map(item => ({target:cleanTarget(item.target),kind:item.kind,bindings:cleanProject({...project,bindings:item.bindings,history:undefined,switchReservation:undefined}).bindings,changedAt:item.changedAt})), switchReservation: project.switchReservation ? {id:project.switchReservation.id,from:project.switchReservation.from ? cleanTarget(project.switchReservation.from) : undefined,target:cleanTarget(project.switchReservation.target),branch:project.switchReservation.branch,sourceSha:project.switchReservation.sourceSha,sourceBranch:project.switchReservation.sourceBranch,createdAt:project.switchReservation.createdAt} : undefined };
+  return { source: { owner: project.source.owner, repo: project.source.repo, url: `https://github.com/${project.source.owner}/${project.source.repo}`, branch: project.source.branch, repositoryId: project.source.repositoryId }, target: cleanTarget(project.target), kind: project.kind, state: project.state, createdByApp: !!project.createdByApp, reservationId: project.reservationId, branches: project.branches?.filter(branch => typeof branch === 'string'), bindings: Object.fromEntries(Object.entries(project.bindings).map(([branch, binding]) => [branch, { branch: binding.branch, sourceSha: binding.sourceSha, commitSha: binding.commitSha, originSha:binding.originSha, updatedAt: binding.updatedAt }])), updatedAt: project.updatedAt, primary: project.primary, sourceMode:project.sourceMode, profile: project.profile ? {tags: project.profile.tags.filter(tag => typeof tag === 'string'), remark: project.profile.remark, description: project.profile.description, updatedAt:project.profile.updatedAt} : undefined, history: project.history?.map(item => ({target:cleanTarget(item.target),kind:item.kind,bindings:cleanProject({...project,bindings:item.bindings,history:undefined,switchReservation:undefined}).bindings,changedAt:item.changedAt})), switchReservation: project.switchReservation ? {id:project.switchReservation.id,from:project.switchReservation.from ? cleanTarget(project.switchReservation.from) : undefined,target:cleanTarget(project.switchReservation.target),branch:project.switchReservation.branch,sourceSha:project.switchReservation.sourceSha,sourceBranch:project.switchReservation.sourceBranch,createdAt:project.switchReservation.createdAt} : undefined };
 }
 export class ExistingSourceError extends Error {
   constructor(public existing: AccountProject) { super(`账号已有同源目标 ${existing.target.owner}/${existing.target.repo}，请使用更新／同步，不可重复首次上传或分叉。`); }
@@ -111,7 +112,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     return { login: user.login as string, root, meta, sha: file?.sha as string | undefined, document,ref };
   };
   const lookupRead = async (token:string,signal:AbortSignal,fresh=false) => {
-    signal.throwIfAborted();let entries=taskAccounts.get(signal);if(!entries){entries=new Map();taskAccounts.set(signal,entries);}
+    signal.throwIfAborted();let entries=taskAccounts.get(operationGroup(signal));if(!entries){entries=new Map();taskAccounts.set(operationGroup(signal),entries);}
     let entry=entries.get(token);const reused=!!entry&&entry.epoch===epoch;
     if(!entry||entry.epoch!==epoch){entry={epoch,value:read(token,signal)};entries.set(token,entry);const current=entry;void entry.value.catch(()=>{if(entries!.get(token)===current)entries!.delete(token);});}
     const account=await entry.value;signal.throwIfAborted();
@@ -124,13 +125,13 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     return account;
   };
   const cachedName = async (path:string,token:string,signal:AbortSignal) => {
-    let entries=taskNames.get(signal);if(!entries){entries=new Map();taskNames.set(signal,entries);}
+    let entries=taskNames.get(operationGroup(signal));if(!entries){entries=new Map();taskNames.set(operationGroup(signal),entries);}
     const key=JSON.stringify([token,path]);let value=entries.get(key);
     if(!value){value=api(path,token,{cache:'no-store'},signal).catch(error=>{if(missing(error))return undefined;entries!.delete(key);throw error;});entries.set(key,value);}
     const result=await value;signal.throwIfAborted();return structuredClone(result);
   };
   const rememberAccount=(token:string,signal:AbortSignal,account:Awaited<ReturnType<typeof read>>)=>{
-    epoch++;let entries=taskAccounts.get(signal);if(!entries){entries=new Map();taskAccounts.set(signal,entries);}entries.set(token,{epoch,value:Promise.resolve(account)});
+    epoch++;let entries=taskAccounts.get(operationGroup(signal));if(!entries){entries=new Map();taskAccounts.set(operationGroup(signal),entries);}entries.set(token,{epoch,value:Promise.resolve(account)});
   };
   // Build identity maps once per account snapshot. Writes never use these maps.
   const indexes=new WeakMap<object,{sourceIds:Map<number,AccountProject[]>;sourceNames:Map<string,AccountProject[]>;targetIds:Map<number,AccountProject[]>;targetNames:Map<string,AccountProject[]>}>();
@@ -207,7 +208,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     for (const [branch, binding] of Object.entries(project.bindings)) {
       const previous = bindings[branch];
       if (old?.state === 'active' && previous && previous.branch !== binding.branch) throw new Error(`来源分支 ${branch} 已固定目标分支 ${previous.branch}，不能改写其他映射`);
-      bindings[branch] = { ...previous, ...binding, sourceSha: binding.sourceSha || previous?.sourceSha, commitSha: binding.commitSha || previous?.commitSha };
+      bindings[branch] = { ...previous, ...binding, sourceSha: binding.sourceSha || previous?.sourceSha, commitSha: binding.commitSha || previous?.commitSha, originSha:binding.originSha||previous?.originSha };
     }
     if (old?.profile && project.profile && old.profile.updatedAt !== project.profile.updatedAt && Date.parse(old.profile.updatedAt) > Date.parse(project.profile.updatedAt)) throw new Error('另一台设备的项目资料已更新，请重新读取后再保存标签');
     const merged = { ...old, ...project, primary: project.primary ?? old?.primary, profile: project.profile || old?.profile, history: project.history || old?.history, switchReservation: old?.switchReservation, kind: old?.kind === 'full' ? 'full' as const : project.kind, branches: project.branches || old?.branches, createdByApp: !!old?.createdByApp || project.createdByApp, bindings };
@@ -253,7 +254,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     if (!equalTarget(old.switchReservation.target,project.target)) throw new Error('新目标与切换预留不一致');
     if (document.projects.some(item=>!sameSource(item.source,project.source)&&equalTarget(item.target,project.target))) throw new Error('新目标已被其他来源绑定');
     const history = old.state==='active' && !equalTarget(old.target,project.target) ? [...(old.history||[]),{target:old.target,kind:old.kind,bindings:old.bindings,changedAt:project.updatedAt}] : old.history || [];
-    const next = {...project,profile:project.profile || old.profile,history,switchReservation:undefined,primary:true};
+    const next = {...project,profile:project.profile || old.profile,history,switchReservation:undefined,primary:true,sourceMode:'target' as const};
     return {...document,projects:[...document.projects.filter(item=>!sameSource(item.source,project.source)),next]};
   },signal);
   const remove = async (target: TargetIdentity, token: string, signal = operationSignal()) => {
@@ -280,7 +281,7 @@ export function createAccountRegistry(api = githubApi, wait = retryDelay) {
     const index=indexed(account.document);return list.filter(item=>![...(index.targetIds.get(item.target.id!)||[]),...(index.targetNames.get(nameKey(item.target))||[])].some(bound=>!sameSource(bound.source,source)));
   };
   const cachedDiscovery=async(login:string,signal:AbortSignal)=>{
-    let entries=discoveryReads.get(signal);if(!entries){entries=new Map();discoveryReads.set(signal,entries);}let entry=entries.get(login);
+    let entries=discoveryReads.get(operationGroup(signal));if(!entries){entries=new Map();discoveryReads.set(operationGroup(signal),entries);}let entry=entries.get(login);
     if(!entry||entry.epoch!==discoveryEpoch){entry={epoch:discoveryEpoch,value:discoveryStore.load(login.toLowerCase())};entries.set(login,entry);const current=entry;void entry.value.catch(()=>{if(entries!.get(login)===current)entries!.delete(login);});}
     return entry.value;
   };

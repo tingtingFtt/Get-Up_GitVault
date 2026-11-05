@@ -1,8 +1,9 @@
+import {needsProjectUpdate} from './projectBinding';
 import { sourceOf, type ProjectSource, type UploadTarget } from './projectModel';
 import { projectTargets, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './targetLifecycle';
 
 type SelectionProject = ProjectSource & {
-  id: string; origin?: ProjectSource; repoMeta: { htmlUrl?: string }; hasUpdate?: boolean;
+  id: string; origin?: ProjectSource; repoMeta: { htmlUrl?: string }; hasUpdate?: boolean; latestCommitSha?:string; remoteSnapshot?:import('./projectModel').RemoteSnapshot; upstreamStatus?:{hasUpdate?:boolean}; branchUploadPending?:boolean;
   uploadTarget?: UploadTarget; branchTargets?: Record<string, UploadTarget>; privateRepoUrl?: string;
   forkScope?: 'current' | 'full'; forkTarget?: TargetIdentity & { branch: string; htmlUrl: string };
   creationReservation?: { target: TargetIdentity }; pendingSwitch?: unknown;
@@ -40,5 +41,5 @@ export function projectSelections<T extends SelectionProject>(visible: T[], all:
     // Prefer the managed copy to its source row, so receipts and local snapshots stay current.
     if (!previous || !previous.uploadTarget && project.uploadTarget) sync.set(key, project);
   }
-  return { unuploaded: first, unforked: [...first], updates: visible.filter(project => project.hasUpdate).map(project => project.id), sync: [...sync.values()].map(project => project.id) };
+  return { unuploaded: first, unforked: [...first], updates: visible.filter(project => needsProjectUpdate({...project,latestCommitSha:project.latestCommitSha||''})).map(project => project.id), sync: [...sync.values()].map(project => project.id) };
 }

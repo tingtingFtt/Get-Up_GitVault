@@ -711,3 +711,25 @@ test('full Fork skip verification still rejects a deleted and recreated target w
   :response({sha:'a'.repeat(40),commit:{tree:{sha:tree}}});
  const receipt=await githubClient.syncAllForkBranches('me','copy','token');assert.equal(receipt[0].success,false);assert.match(receipt[0].error!,/身份已变化/);assert.ok(calls.every(call=>!call.init.method));
 });
+
+test('missing repository names recover their canonical address by fixed ID without writing or accepting replacements',async()=>{
+ handler=path=>path==='/repos/me/old'?response({message:'Not Found'},404):path==='/repositories/77'?response({id:77,name:'new',owner:{login:'me'},html_url:'https://github.com/me/new'}):response({},404);
+ const found=await githubClient.repository('me','old','token',77);assert.equal(found.repo,'new');assert.equal(found.id,77);assert.ok(calls.every(call=>!call.init.method));
+ beginGithubOperation();calls=[];handler=path=>path==='/repos/me/old'?response({id:88,name:'old',owner:{login:'me'}}):response({id:77,name:'new',owner:{login:'me'}});
+ await assert.rejects(githubClient.repository('me','old','token',77),(error:any)=>error.health.status==='identity-changed');assert.ok(!calls.some(call=>call.path==='/repositories/77'));
+ beginGithubOperation();calls=[];handler=()=>response({message:'Forbidden'},403);
+ await assert.rejects(githubClient.repository('me','old','token',77),(error:any)=>error.health.status==='forbidden');assert.equal(calls.length,1);
+});
+
+test('pinned downloads use compact git commit metadata and reject a changed source ID before reading files',async()=>{
+ const pinned='1'.repeat(40);
+ handler=path=>{
+  if(path==='/repos/source/project')return response({id:42,name:'project',owner:{login:'source'},default_branch:'main'});
+  if(path===`/repos/source/project/git/commits/${pinned}`)return response({sha:pinned,tree:{sha:'empty'},message:'pinned',author:{name:'author',date:'2026-11-01'}});
+  if(path.startsWith('/repos/source/project/git/trees/empty'))return response({tree:[]});
+  throw new Error('unexpected read '+path);
+ };
+ const result=await githubClient.fetchRepo('source/project','main','token',{ref:pinned,expectedId:42});assert.equal(result.latestCommitSha,pinned);assert.equal(result.commitMessage,'pinned');assert.ok(!calls.some(call=>call.path.includes('/project/commits/')));
+ beginGithubOperation();calls=[];handler=()=>response({id:99,name:'project',owner:{login:'source'}});
+ await assert.rejects(githubClient.fetchRepo('source/project','main','token',{ref:pinned,expectedId:42}),/来源仓库身份已变化/);assert.equal(calls.length,1);
+});

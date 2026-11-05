@@ -17,11 +17,12 @@ const fixture = {
   tree: [{ path: 'folder/'.repeat(20) + 'source.ts', sha: 'audit-blob', type: 'blob', mode: '100644', size: 100 }],
   backups: [{ id: 'audit-backup', branch: 'main', versionNumber: 1, tag: 'very-long-version-tag-'.repeat(8), annotation: '历史版本说明'.repeat(15), commitSha: 'audit-old', commitMessage: 'old', commitAuthor: 'author', commitDate: '2026-10-15T00:00:00Z', backedUpAt: '2026-10-15T00:00:00Z', tree: [], isCachePurged: true }],
 };
-const scenarios = ['dashboard', 'projects', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'import-unconfirmed', 'import-search-empty', 'import-search', 'import-search-error', 'import-search-running', 'import-search-cancelled', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release', 'records-storage-error', 'records-large', 'records-startup-error'];
+const scenarios = ['dashboard', 'projects', 'check-running', 'check-error', 'check-primary', 'check-upstream-error', 'workbench', 'history', 'changelog', 'add', 'import', 'private', 'fork', 'push', 'folders', 'metadata', 'storage', 'settings', 'git-service', 'backup', 'apk', 'batch-fork', 'batch-update', 'batch-sync', 'batch-upload', 'import-match', 'import-compare', 'import-files', 'import-error', 'import-unconfirmed', 'import-search-empty', 'import-search', 'import-search-error', 'import-search-running', 'import-search-cancelled', 'remote-target', 'remote-target-error', 'remote-target-detached', 'operation-logs', 'operation-logs-error', 'batch-upload-running', 'batch-upload-limited', 'batch-upload-error', 'batch-upload-cancelled', 'switch-create', 'switch-existing', 'switch-error', 'switch-pending', 'switch-history', 'app-confirm', 'app-prompt', 'task-recovery', 'release', 'records-storage-error', 'records-large', 'records-startup-error'];
 const widths = [320, 375, 480, 640, 768, 1024, 1440];
 const mockBlob = createHash('sha1').update('blob 3\0new').digest('hex');
 // Inject before the production bundle: real UI interactions, synthetic GitHub reads only.
 const importMock = `<script>
+if(new URLSearchParams(location.search).get('audit-check')==='check-running'){const original=window.fetch;window.fetch=async(input,init={})=>String(input).includes('api.github.com')?new Promise((resolve,reject)=>init.signal.addEventListener('abort',()=>reject(init.signal.reason),{once:true})):original(input,init);}
 if(new URLSearchParams(location.search).has('audit-records-error')){const original=indexedDB.open.bind(indexedDB);indexedDB.open=(name,...args)=>{if(name==='GitVault_Records_v1')throw new DOMException('测试存储空间不足','QuotaExceededError');return original(name,...args);};}
 if (new URLSearchParams(location.search).has('audit-batch')) {
   const original = window.fetch;
@@ -136,19 +137,29 @@ function inspect(doc, width, scenario) {
     localStorage.removeItem('gitvault_global_token');
     // Each iframe is an independent layout fixture; production cooldowns survive reloads.
     for (const key of ['gitvault_github_cooldown_v1','gitvault_github_writes_v1','gitvault_github_last_write_v1','gitvault_git_service_v1']) localStorage.removeItem(key);
+    if(scenario.startsWith('check-')){
+      const project={...fixture,hasUpdate:false,lastCheckedAt:'2026-10-16T00:00:00Z'};
+      if(scenario==='check-error')project.checkError='Resource not accessible · '+'检测失败原因和超长链接'.repeat(50);
+      if(scenario==='check-primary'||scenario==='check-upstream-error'){
+        project.sourceMode='target';project.origin={owner:fixture.owner,repo:fixture.repo,url:fixture.url,branch:fixture.branch};project.primarySource={owner:'destination',repo:'fixed-name-'.repeat(10),url:'https://github.com/destination/fixed',branch:fixture.branch,repositoryId:77};project.uploadTarget={id:77,owner:'destination',repo:project.primarySource.repo,branch:fixture.branch,purgeAfterUpload:false};
+        if(scenario==='check-upstream-error')project.upstreamStatus={error:'上游权限与网络错误 · '+'long-error-'.repeat(35)};
+      }
+      localStorage.setItem('gitvault_repos_v8',JSON.stringify([project]));
+    }
     if(scenario==='task-recovery')localStorage.setItem('gitvault_tasks_v1',JSON.stringify([{kind:'projects',action:'sync',updatedAt:'2026-10-16',items:[{id:fixture.id,label:fixture.remark,name:fixture.repo,status:'running',branch:fixture.branch,source:fixture.url}]}]));
     if (scenario === 'operation-logs-error') localStorage.setItem('gitvault_operation_logs_v1',JSON.stringify([{id:'audit-log',time:'2026-10-16T00:00:00Z',action:'批量分叉同步',status:'error',httpStatus:422,project:'owner/'+ 'long-project-'.repeat(20),branch:fixture.branch,target:'destination/'+ 'long-target-'.repeat(20),stage:'核对账号记录',message:'Update is not a fast forward；'+'很长的失败原因'.repeat(50)}]));
     const frame = document.createElement('iframe'); frame.style.cssText = 'border:0;width:' + width + 'px;height:900px';
     document.body.appendChild(frame);
     try {
-      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario==='records-startup-error'?'?audit-records-error=1':scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':scenario==='import-unconfirmed'?'unconfirmed':scenario.startsWith('import-search')?scenario.replace('import-',''):'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
+      await new Promise((resolve,reject) => { frame.onload=resolve; frame.onerror=reject; frame.src='/Get-Up_GitVault/' + (scenario==='records-startup-error'?'?audit-records-error=1':scenario.startsWith('check-')?'?audit-check='+scenario:scenario.startsWith('import-') ? '?audit-import=' + (scenario==='import-error'?'error':scenario==='import-unconfirmed'?'unconfirmed':scenario.startsWith('import-search')?scenario.replace('import-',''):'match') : scenario.startsWith('batch-upload-') ? '?audit-batch='+scenario.replace('batch-upload-','') : scenario.startsWith('switch-') ? '?audit-target='+(scenario==='switch-error'?'error':'available')+'&audit-switch='+scenario : scenario.startsWith('remote-target') ? '?audit-target='+(scenario==='remote-target'?'available':scenario==='remote-target-error'?'error':'detached') : ''); }); await pause();
       let doc = frame.contentDocument;
       const ready=()=>scenario==='records-startup-error'?buttons(doc).some(button=>button.textContent==='导出可读取记录备份'):doc.querySelector('.app-header');
       for(let tries=0;tries<100&&!ready();tries++)await pause();
       if(!ready())throw new Error('App bootstrap did not finish: '+doc.body.textContent.slice(0,250));
       if(scenario==='records-startup-error'&&(frame.contentWindow.localStorage.getItem('gitvault_repos_v8')===null||!doc.body.textContent.includes('原数据未清除')))throw new Error('Startup recovery lost the legacy record');
-      if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-')) {
+      if (['projects','batch-fork','batch-update','batch-sync','batch-upload'].includes(scenario) || scenario.startsWith('batch-upload-') || scenario.startsWith('check-')) {
         await click(doc,'仓库已有项目 (1)');
+        if(scenario==='check-running'){await click(doc,'全部检测');for(let tries=0;tries<100&&!doc.querySelector('span[title].whitespace-pre-wrap');tries++)await pause();if(!doc.querySelector('span[title].whitespace-pre-wrap'))throw new Error('Quick status loading state missing');}
         if (scenario === 'projects') {
           for (const text of ['仅选未上传','仅选未分叉','仅选有更新','仅选可分叉同步']) {
             if (!buttons(doc).some(button => button.textContent.trim() === text)) throw new Error('Missing quick selection: ' + text);

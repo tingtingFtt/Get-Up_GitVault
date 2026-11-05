@@ -198,7 +198,7 @@ final class ManagedFolderStore {
     private void write(String id,String path,long size,String sha,String mode,InputStream stream,AtomicBoolean stop,FolderAccess access)throws Exception{
         synchronized(LOCK){check(stop);JSONObject value=load(id);if(value==null||!value.getString("state").equals("staging"))throw new IOException("目录下载任务已结束");JSONObject trusted=expected(value).get(path);if(trusted==null||!trusted.getString("sha").equals(sha)||!trusted.getString("mode").equals(mode)||trusted.has("size")&&trusted.getLong("size")!=size)throw new IOException("写入文件与固定快照不一致："+path);DocumentFile target=access==null?file(value,path,true):access.file(path,true);if(target==null)throw new IOException("无法创建项目文件："+path);
             MessageDigest digest=MessageDigest.getInstance("SHA-1");digest.update(("blob "+size+"\0").getBytes(StandardCharsets.UTF_8));long count=0;
-            try(OutputStream output=output(target)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);output.write(buffer,0,n);digest.update(buffer,0,n);count+=n;}}
+            try(OutputStream output=output(target)){byte[] buffer=new byte[65536];int n;while((n=stream.read(buffer))!=-1){check(stop);output.write(buffer,0,n);digest.update(buffer,0,n);count+=n;progress("正在写入 "+path+" · "+String.format(Locale.ROOT,"%.1f / %.1f MiB",count/1048576d,size/1048576d));}}
             if(count!=size||!hex(digest.digest()).equals(sha)){target.delete();throw new IOException("项目文件校验失败："+path);}
             JSONObject entry=new JSONObject();entry.put("path",path);entry.put("sha",sha);entry.put("mode",mode);entry.put("size",size);checkpoint(value,entry);
         }
@@ -259,7 +259,7 @@ final class ManagedFolderStore {
             JSObject result=new JSObject();result.put("retained",retained);return result;
         }
     }
-    private void deleteTree(DocumentFile doc,List<String> failures)throws IOException{check(null);if(doc==null)return;if(doc.isDirectory())for(DocumentFile child:doc.listFiles())deleteTree(child,failures);if(!doc.delete())failures.add(String.valueOf(doc.getName()));}
+    private void deleteTree(DocumentFile doc,List<String> failures)throws IOException{check(null);if(doc==null)return;if(doc.isDirectory())for(DocumentFile child:doc.listFiles())deleteTree(child,failures);if(!doc.delete())failures.add(String.valueOf(doc.getName()));else progress("正在清理本地目录："+String.valueOf(doc.getName()));}
     private void erase(JSONObject value,boolean force)throws Exception{
         if(!force){JSObject state=describe(value.getString("id"),true,null);if(state.optBoolean("dirty"))throw new Changed("检测到本地修改或额外文件："+state.getJSONArray("changes").toString());}
         List<String> failures=new ArrayList<>();DocumentFile directory=versionDir(value,false);if(directory!=null){deleteTree(directory.findFile("files"),failures);for(String markerName:Arrays.asList(".gitvault-snapshot.json",".gitvault-diagnostic.json")){DocumentFile marker=directory.findFile(markerName);if(marker!=null&&!marker.delete())failures.add(markerName);}if(directory.listFiles().length==0&&!directory.delete())failures.add("版本目录");}
