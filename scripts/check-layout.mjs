@@ -192,8 +192,11 @@ function inspect(doc, width, scenario) {
       } else if(scenario.startsWith('remote-target')) {
         await click(doc,'工作台'); await click(doc,'管理远端目标');
         if(!doc.querySelector('[aria-label="管理远端目标"]')) throw new Error('Target manager did not open');
+        // Recovering an old address by immutable ID adds an asynchronous read.
+        // Assert the settled state instead of racing it after a fixed 60 ms.
+        if(scenario!=='remote-target')for(let tries=0;tries<100&&!doc.body.textContent.includes('可能已删除');tries++)await pause();
         if(scenario==='remote-target-error'&&!doc.body.textContent.includes('可能已删除')) throw new Error('Missing inaccessible target explanation');
-        if(scenario==='remote-target-detached') { await click(doc,'解除此目标的所有绑定'); await click(doc,'确定'); if(!doc.body.textContent.includes('重新设置上传')) throw new Error('Missing target recovery controls'); }
+        if(scenario==='remote-target-detached') { await click(doc,'解除此目标的所有绑定'); await click(doc,'确定');for(let tries=0;tries<100&&!doc.body.textContent.includes('重新设置上传');tries++)await pause(); if(!doc.body.textContent.includes('重新设置上传')) throw new Error('Missing target recovery controls'); }
       } else if(scenario.startsWith('import-')) {
         await click(doc,'新建链接/拉取项目');
         const fields = [...doc.querySelectorAll('input')];
