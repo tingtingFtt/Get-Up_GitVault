@@ -38,6 +38,10 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
+    sourceSets {
+        test.java.srcDir 'src/sharedTest/java'
+        androidTest.java.srcDir 'src/sharedTest/java'
+    }
 }
 
 repositories {
@@ -46,8 +50,22 @@ repositories {
     }
 }
 
+// Resolve the normal upstream graph, but package only the Android-compatible JGit
+// artifact. Keeping its transitive jars avoids losing codec/bitmap dependencies.
+configurations { jgitUpstream }
+dependencies { jgitUpstream "org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r" }
+def compatibleJgit = tasks.register('compatibleJgit') {
+    def upstream = configurations.jgitUpstream.filter { it.name.startsWith('org.eclipse.jgit-') }
+    inputs.files(upstream)
+    outputs.file(layout.buildDirectory.file('compatible-jgit/jgit-android.jar'))
+    doLast {
+        com.gitvault.buildtools.JgitAndroidJar.rewrite(upstream.singleFile, outputs.files.singleFile)
+    }
+}
+
 dependencies {
-    implementation "org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r"
+    implementation files(compatibleJgit)
+    implementation files(configurations.jgitUpstream.filter { !it.name.startsWith('org.eclipse.jgit-') })
     implementation "org.slf4j:slf4j-nop:1.7.36"
     implementation "androidx.documentfile:documentfile:1.1.0"
     implementation fileTree(include: ['*.jar'], dir: 'libs')

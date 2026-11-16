@@ -26,7 +26,7 @@ public class GitVaultGitPlugin extends Plugin {
     private final Map<String,Staged> sessions=new HashMap<>();
     private final Map<String,Long> lastProgress=new HashMap<>();
     private static final class Staged {
-        final File folder;final GitObjectCache.Lease lease;final Git git;final GitSnapshotStore store;final ManagedFolderStore.ReadBatch reader;long preparationMs;boolean invalidCache;
+        final File folder;final GitObjectCache.Lease lease;final Git git;final GitSnapshotStore store;final ManagedFolderStore.ReadBatch reader;String project="",branch="";long preparationMs;boolean invalidCache;
         Staged(GitObjectCache.Lease lease,AtomicBoolean stop,android.content.Context context)throws Exception{this.lease=lease;folder=lease.folder;git=Git.init().setBare(true).setDirectory(folder).call();store=new GitSnapshotStore(git.getRepository(),folder,stop);reader=new ManagedFolderStore(context).readBatch();git.getRepository().getConfig().setString("gc",null,"auto","0");GitMemoryBudget.configure(git.getRepository().getConfig());}
     }
     private Staged createSession(String id,PluginCall call)throws Exception{
@@ -37,10 +37,19 @@ public class GitVaultGitPlugin extends Plugin {
         catch(IOException failure){lease=cache.acquire(readRepositoryId(call),false);progress(id,"Git 加速缓存暂不可用，本次使用临时对象");}
         File folder=lease.folder;
         Staged staged=null;
-        try{staged=new Staged(lease,cancelled.get(id),getContext());long total=call.getData().optLong("totalBytes",0);if(total<0||total>Long.MAX_VALUE/3)throw new IOException("项目大小无效");staged.store.ensureSpace(total*3);sessions.put(id,staged);return staged;}
+        try{staged=new Staged(lease,cancelled.get(id),getContext());staged.project=call.getString("owner","")+"/"+call.getString("repo","");staged.branch=call.getString("branch",call.getString("ref",""));long total=call.getData().optLong("totalBytes",0);if(total<0||total>Long.MAX_VALUE/3)throw new IOException("项目大小无效");staged.store.ensureSpace(total*3);sessions.put(id,staged);return staged;}
         catch(Exception error){if(staged!=null){staged.git.close();}remove(folder);throw error;}
     }
-    private void releaseSession(String id){Staged staged=sessions.remove(id);if(staged!=null){try{staged.store.close();staged.reader.close();}catch(Exception ignored){}staged.git.close();try{new GitObjectCache(getContext().getCacheDir()).release(staged.invalidCache?new GitObjectCache.Lease(staged.folder,staged.lease.repositoryId,false,false):staged.lease);}catch(IOException ignored){remove(staged.folder);}}cancelled.remove(id);lastProgress.remove(id);}
+    private void releaseSession(String id){
+        Staged staged=sessions.remove(id);
+        try{if(staged!=null){
+            try{staged.store.close();}catch(Exception error){staged.invalidCache=true;CrashDiagnostics.gitFailure(id,"关闭快照读取流",staged.project,staged.branch,error,"");}
+            try{staged.reader.close();}catch(Exception error){staged.invalidCache=true;CrashDiagnostics.gitFailure(id,"关闭目录读取流",staged.project,staged.branch,error,"");}
+            try{staged.git.close();}catch(Exception error){staged.invalidCache=true;CrashDiagnostics.gitFailure(id,"关闭 Git 仓库",staged.project,staged.branch,error,"");}
+            try{new GitObjectCache(getContext().getCacheDir()).release(staged.invalidCache?new GitObjectCache.Lease(staged.folder,staged.lease.repositoryId,false,false):staged.lease);}catch(IOException ignored){remove(staged.folder);}
+        }}finally{cancelled.remove(id);lastProgress.remove(id);}
+    }
+    private void recordFailure(String id,String stage,PluginCall call,Throwable error){Staged staged=sessions.get(id);CrashDiagnostics.gitFailure(id,stage,staged==null?call.getString("owner","")+"/"+call.getString("repo",""):staged.project,staged==null?call.getString("branch",call.getString("ref","")):staged.branch,error,call.getString("token",""));}
     private static final long PROCESS_START=System.currentTimeMillis();
     @Override public void load(){java.util.concurrent.ExecutorService cleanup=Executors.newSingleThreadExecutor();cleanup.execute(()->{try{File[] leftovers=getContext().getCacheDir().listFiles((dir,name)->name.startsWith("gitvault-session-")&&new File(dir,name).lastModified()<PROCESS_START);if(leftovers!=null)for(File file:leftovers)remove(file);CrashDiagnostics.event("startup-cleanup",new org.json.JSONObject());}finally{cleanup.shutdown();}});}
     public void requestStopAll(){for(AtomicBoolean stop:cancelled.values())stop.set(true);for(GitNetwork network:networkTasks.values())cancelIo.execute(network::disconnect);}
@@ -55,19 +64,19 @@ public class GitVaultGitPlugin extends Plugin {
                 finally{networkTasks.remove(id,network);network.close();}
             }
             createSession(id,call);call.resolve();
-        }catch(Exception error){releaseSession(id);String token=call.getString("token","");call.reject(token.isEmpty()?error.getMessage():String.valueOf(error.getMessage()).replace(token,"[redacted]"));}});
+        }catch(Exception error){recordFailure(id,"准备上传暂存",call,error);releaseSession(id);String token=call.getString("token","");call.reject(token.isEmpty()?error.getMessage():String.valueOf(error.getMessage()).replace(token,"[redacted]"));}});
     }
     @PluginMethod public void clearObjectCache(PluginCall call){io.execute(()->{try{if(!sessions.isEmpty())throw new IOException("Git 传输正在进行，请结束后清理缓存");GitObjectCache cache=new GitObjectCache(getContext().getCacheDir());long bytes=cache.bytes();cache.clear();JSObject result=new JSObject();result.put("bytes",bytes);call.resolve(result);}catch(Exception error){call.reject(error.getMessage(),"GIT_CACHE");}});}
     @PluginMethod public void readChunk(PluginCall call){chunkCall(call,false);}
     @PluginMethod public void appendChunk(PluginCall call){chunkCall(call,true);}
-    @PluginMethod public void appendDocument(PluginCall call){String id=call.getString("id","");io.execute(()->{try{Staged staged=sessions.get(id);if(staged==null)throw new IOException("Git 上传任务已结束");org.json.JSONObject ref=call.getObject("nativeRef");if(ref==null)throw new IOException("目录引用缺失");try(InputStream input=new ManagedFolderStore(getContext()).open(ref.getString("version"),ref.getString("path"))){staged.store.appendStream(call.getString("path",""),call.getString("sha",""),call.getString("mode","100644"),call.getData().getLong("size"),input);}call.resolve();}catch(Exception error){call.reject(error.getMessage(),"GIT_TRANSFER");}});}
-    @PluginMethod public void appendDocuments(PluginCall call){String id=call.getString("id","");io.execute(()->{long start=android.os.SystemClock.elapsedRealtime();Staged staged=sessions.get(id);try{if(staged==null)throw new IOException("Git 上传任务已结束");staged.store.appendDocuments(call.getArray("files",new JSArray()),staged.reader,message->pacedProgress(id,message));call.resolve();}catch(Exception error){call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}finally{if(staged!=null)staged.preparationMs+=android.os.SystemClock.elapsedRealtime()-start;}});}
-    private void chunkCall(PluginCall call,boolean upload){String id=call.getString("id","");io.execute(()->{long start=android.os.SystemClock.elapsedRealtime();Staged staged=sessions.get(id);try{if(staged==null)throw new IOException("Git 临时任务已结束，请重试");if(upload){staged.store.append(call.getData());call.resolve();}else call.resolve(staged.store.readChunk(call.getString("path",""),call.getData().getLong("offset")));}catch(Exception error){call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}finally{if(upload&&staged!=null)staged.preparationMs+=android.os.SystemClock.elapsedRealtime()-start;}});}
+    @PluginMethod public void appendDocument(PluginCall call){String id=call.getString("id","");io.execute(()->{try{Staged staged=sessions.get(id);if(staged==null)throw new IOException("Git 上传任务已结束");org.json.JSONObject ref=call.getObject("nativeRef");if(ref==null)throw new IOException("目录引用缺失");try(InputStream input=new ManagedFolderStore(getContext()).open(ref.getString("version"),ref.getString("path"))){staged.store.appendStream(call.getString("path",""),call.getString("sha",""),call.getString("mode","100644"),call.getData().getLong("size"),input);}call.resolve();}catch(Exception error){recordFailure(id,"读取目录并暂存上传文件",call,error);call.reject(error.getMessage(),"GIT_TRANSFER");}});}
+    @PluginMethod public void appendDocuments(PluginCall call){String id=call.getString("id","");io.execute(()->{long start=android.os.SystemClock.elapsedRealtime();Staged staged=sessions.get(id);try{if(staged==null)throw new IOException("Git 上传任务已结束");staged.store.appendDocuments(call.getArray("files",new JSArray()),staged.reader,message->pacedProgress(id,message));call.resolve();}catch(Exception error){recordFailure(id,"批量读取并暂存上传文件",call,error);call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}finally{if(staged!=null)staged.preparationMs+=android.os.SystemClock.elapsedRealtime()-start;}});}
+    private void chunkCall(PluginCall call,boolean upload){String id=call.getString("id","");io.execute(()->{long start=android.os.SystemClock.elapsedRealtime();Staged staged=sessions.get(id);try{if(staged==null)throw new IOException("Git 临时任务已结束，请重试");if(upload){staged.store.append(call.getData());call.resolve();}else call.resolve(staged.store.readChunk(call.getString("path",""),call.getData().getLong("offset")));}catch(Exception error){recordFailure(id,upload?"暂存上传文件块":"读取 Git 文件块",call,error);call.reject(error.getMessage(),cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":"GIT_TRANSFER");}finally{if(upload&&staged!=null)staged.preparationMs+=android.os.SystemClock.elapsedRealtime()-start;}});}
     @PluginMethod public void release(PluginCall call){String id=call.getString("id","");io.execute(()->{releaseSession(id);call.resolve();});}
     @PluginMethod public void cancel(PluginCall call) { String id=call.getString("id","");if(!id.isEmpty()){cancelled.computeIfAbsent(id,key->new AtomicBoolean()).set(true);GitNetwork network=networkTasks.get(id);if(network!=null)cancelIo.execute(network::disconnect);}call.resolve(); }
     @PluginMethod public void transfer(PluginCall call) {
         String id=call.getString("id","");boolean fetching="fetch".equals(call.getString("action",""));if(id.isEmpty()||(fetching?cancelled.putIfAbsent(id,new AtomicBoolean())!=null:!cancelled.containsKey(id))){call.reject("Git 任务 ID 无效");return;}
-        io.execute(()->{boolean retain=false;String token=call.getString("token","");
+        io.execute(()->{boolean retain=false;String token=call.getString("token","");String stage="核对固定仓库并建立会话";
             try {
                 String owner=call.getString("owner",""),name=call.getString("repo",""),action=call.getString("action","");
                 if(!owner.matches("[A-Za-z0-9_.-]+")||!name.matches("[A-Za-z0-9_.-]+")||!Arrays.asList("fetch","push").contains(action))throw new IOException("Git 仓库参数无效");
@@ -84,38 +93,39 @@ public class GitVaultGitPlugin extends Plugin {
                     JSObject result;JSObject timings=new JSObject();timings.put("preparationMs",staged.preparationMs);long phaseStart=android.os.SystemClock.elapsedRealtime();
                     if(action.equals("fetch")) {
                         String ref=call.getString("ref","");if(!ref.matches("[a-f0-9]{40}"))throw new IOException("拉取必须固定完整提交 SHA");
+                        stage="接收并解析上游 Git 对象";
                         recovery.read("获取固定版本",timeout->{network.disconnect();return git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(timeout).setTransportConfigCallback(network::configure).setDepth(1).setTagOpt(TagOpt.NO_TAGS).setRefSpecs(new RefSpec("+"+ref+":refs/gitvault/source")).setProgressMonitor(monitor).call();});
                         timings.put("fetchMs",android.os.SystemClock.elapsedRealtime()-phaseStart);phaseStart=android.os.SystemClock.elapsedRealtime();
-                        check(stop);result=staged.store.describe(ref);pinForCache(staged,id,"refs/gitvault/source",ObjectId.fromString(ref));
+                        stage="读取 Git 快照清单与文件前缀";check(stop);result=staged.store.describe(ref);pinForCache(staged,id,"refs/gitvault/source",ObjectId.fromString(ref));
                         String folderVersion=call.getString("folderVersion","");
                         if(!folderVersion.isEmpty()){
-                            JSObject stored=new ManagedFolderStore(getContext()).task(stop,message->pacedProgress(id,message)).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
+                            stage="解压并写入项目目录";JSObject stored=new ManagedFolderStore(getContext()).task(stop,message->pacedProgress(id,message)).fetch(folderVersion,git.getRepository(),new JSArray(result.getJSONArray("files").toString()),stop,message->pacedProgress(id,message));
                             result.put("files",stored.getJSONArray("files"));result.put("folder",true);result.put("folderVersion",folderVersion);result.put("streamed",true);
                             result.put("repairedFiles",stored.optInt("repairedFiles",0));
                             timings.put("folderMs",android.os.SystemClock.elapsedRealtime()-phaseStart);
                         }else retain=true;
                     } else {
                         String branch=call.getString("branch","");if(!Repository.isValidRefName("refs/heads/"+branch))throw new IOException("Git 分支名称无效");
-                        ObjectId tree=staged.store.writeTree(call.getArray("files",new JSArray()));
+                        stage="生成上传文件树";ObjectId tree=staged.store.writeTree(call.getArray("files",new JSArray()));
                         result=null;
                         for(int attempt=0;attempt<3;attempt++) {
-                            check(stop);String head=recovery.read("读取目标分支",timeout->remoteHead(remote,branch,credentials,timeout,network));
+                            stage="读取目标分支";check(stop);String head=recovery.read("读取目标分支",timeout->remoteHead(remote,branch,credentials,timeout,network));
                             ObjectId parent=null;
                             if(!head.isEmpty()) {
                                 if(!hasCommitTree(git.getRepository(),head)){
-                                    FetchResult fetched=recovery.read("获取目标分支",timeout->{network.disconnect();return git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(timeout).setTransportConfigCallback(network::configure).setDepth(1).setTagOpt(TagOpt.NO_TAGS).setRefSpecs(new RefSpec("+refs/heads/"+branch+":refs/gitvault/target")).setProgressMonitor(monitor).call();});
+                                    stage="接收并解析目标 Git 对象";FetchResult fetched=recovery.read("获取目标分支",timeout->{network.disconnect();return git.fetch().setRemote(remote).setCredentialsProvider(credentials).setTimeout(timeout).setTransportConfigCallback(network::configure).setDepth(1).setTagOpt(TagOpt.NO_TAGS).setRefSpecs(new RefSpec("+refs/heads/"+branch+":refs/gitvault/target")).setProgressMonitor(monitor).call();});
                                     Ref advertised=fetched.getAdvertisedRef("refs/heads/"+branch);
                                     if(advertised==null||!hasCommitTree(git.getRepository(),advertised.getObjectId().name()))throw new IOException("目标分支获取结果不完整，未创建提交");
                                     parent=advertised.getObjectId();
                                 }else{parent=ObjectId.fromString(head);progress(id,"目标提交已在当前对象库，跳过重复获取");}
                                 pinForCache(staged,id,"refs/gitvault/target",parent);
                             }
-                            ObjectId commit;
+                            stage="生成保留历史的同步提交";ObjectId commit;
                             try(RevWalk walk=new RevWalk(git.getRepository());ObjectInserter insert=git.getRepository().newObjectInserter()) {
                                 if(parent!=null&&walk.parseCommit(parent).getTree().equals(tree))commit=parent;
                                 else { CommitBuilder builder=new CommitBuilder();builder.setTreeId(tree);if(parent!=null)builder.setParentId(parent);PersonIdent author=new PersonIdent("GitVault","gitvault@users.noreply.github.com");builder.setAuthor(author);builder.setCommitter(author);builder.setMessage(call.getString("message","Sync project snapshot via GitVault"));commit=insert.insert(builder);insert.flush(); }
                             }
-                            verifyIdentity(owner,name,expectedRepoId,token,stop,network,id);check(stop);
+                            stage="推送并核对目标提交";verifyIdentity(owner,name,expectedRepoId,token,stop,network,id);check(stop);
                             final ObjectId pendingCommit=commit;
                             String actual;
                             if(commit.equals(parent))actual=recovery.read("核对目标分支",timeout->remoteHead(remote,branch,credentials,timeout,network));
@@ -137,7 +147,7 @@ public class GitVaultGitPlugin extends Plugin {
                     result.put("timings",timings);
                     check(stop);call.resolve(result);
                 }
-            }catch(Exception exception){Staged active=sessions.get(id);for(Throwable cause=exception;cause!=null;cause=cause.getCause())if(active!=null&&(cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException))active.invalidCache=true;String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");if(exception instanceof ManagedFolderStore.Verification)call.reject(message,"FOLDER_STORAGE",((ManagedFolderStore.Verification)exception).details);else call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":GitTransferRecovery.transientFailure(exception)?"GIT_NETWORK":"GIT_TRANSFER");}
+            }catch(Exception exception){recordFailure(id,stage,call,exception);Staged active=sessions.get(id);for(Throwable cause=exception;cause!=null;cause=cause.getCause())if(active!=null&&(cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException))active.invalidCache=true;String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");if(exception instanceof ManagedFolderStore.Verification)call.reject(message,"FOLDER_STORAGE",((ManagedFolderStore.Verification)exception).details);else call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":GitTransferRecovery.transientFailure(exception)?"GIT_NETWORK":"GIT_TRANSFER");}
             finally {GitNetwork network=networkTasks.remove(id);if(network!=null)network.close();if(!retain)releaseSession(id);}
         });
     }

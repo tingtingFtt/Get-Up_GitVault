@@ -8,6 +8,12 @@ import java.util.concurrent.atomic.*;
 import static org.junit.Assert.*;
 @RunWith(AndroidJUnit4.class)
 public class DiagnosticsIntegrationTest {
+ @Test public void handledGitFailuresKeepNativeCauseAndSuppressedStacksWithoutTheToken()throws Exception{
+  String token="custom-diagnostic-fixture-secret";java.io.IOException failure=new java.io.IOException("fetch failed "+token,new IllegalStateException("Inflater has been closed "+token));failure.addSuppressed(new java.io.IOException("cleanup failed "+token));
+  CrashDiagnostics.gitFailure("native-fixture-task","接收并解析上游 Git 对象","owner/fixture","dev",failure,token);
+  CrashDiagnostics.IO.submit(()->{}).get(10,java.util.concurrent.TimeUnit.SECONDS);
+  JSONObject report=CrashDiagnostics.report().getJSONObject("lastGitFailure");assertEquals("native-fixture-task",report.getString("taskId"));assertEquals("dev",report.getString("branch"));String text=report.toString();assertTrue(text.contains("Inflater has been closed"));assertTrue(text.contains("Suppressed:"));assertTrue(text.contains("Caused by:"));assertFalse(text.contains(token));
+ }
  private void ready(ActivityScenario<MainActivity> scenario)throws Exception{AtomicBoolean ready=new AtomicBoolean();for(int i=0;i<150&&!ready.get();i++){scenario.onActivity(activity->activity.getBridge().getWebView().evaluateJavascript("Boolean(document.querySelector('.app-header'))",value->ready.set("true".equals(value))));if(!ready.get())Thread.sleep(100);}assertTrue("Page did not recover",ready.get());}
  @Test public void realBridgePersistsTaskPhaseAndExportsStartupVersionWithoutCredentials()throws Exception{
   try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){

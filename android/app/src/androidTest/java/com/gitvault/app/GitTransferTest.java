@@ -29,6 +29,7 @@ public class GitTransferTest {
     }
     private JSObject file(String path,String content,String mode){JSObject file=new JSObject();file.put("path",path);file.put("content",content);file.put("mode",mode);return file;}
     @Test public void diskBackedSnapshotExceeds100MiBWithBoundedChunks()throws Exception{
+        GitMemoryBudget.install();
         File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-large-test-"+System.nanoTime());
         AtomicBoolean stop=new AtomicBoolean();long total=0;
         try(Git git=Git.init().setBare(true).setDirectory(folder).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),folder,stop)){
@@ -44,6 +45,9 @@ public class GitTransferTest {
             try(ObjectInserter insert=git.getRepository().newObjectInserter()){
                 CommitBuilder commit=new CommitBuilder();PersonIdent author=new PersonIdent("GitVault","gitvault@example.invalid");commit.setAuthor(author);commit.setCommitter(author);commit.setTreeId(tree);commit.setMessage("large snapshot");commitId=insert.insert(commit);insert.flush();
             }
+            // Both real loose and packed large objects must survive prefix inspection.
+            assertEquals(101,store.describe(commitId.name()).getJSONArray("files").length());
+            RefUpdate pin=git.getRepository().updateRef("refs/gitvault/source");pin.setNewObjectId(commitId);pin.update();git.gc().call();
             JSObject manifest=store.describe(commitId.name());assertEquals(101,manifest.getJSONArray("files").length());
             for(int i=0;i<101;i++){
                 org.json.JSONObject entry=manifest.getJSONArray("files").getJSONObject(i);assertFalse(entry.has("content"));long offset=0;

@@ -43,7 +43,20 @@ final class CrashDiagnostics {
     }
     static void pulse(boolean visible){webBeat=SystemClock.elapsedRealtime();webVisible=visible;}
     static String safe(String text,int maximum){if(text==null)return "";String result=text.replaceAll("(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+","[已隐藏凭证]").replaceAll("(?i)(Bearer\\s+)[^\\s,;\"']+","$1[已隐藏凭证]").replaceAll("(?i)([?&](?:access_token|token|auth)=)[^&\\s]+","$1[已隐藏凭证]").replaceAll("https?://[^/@\\s]+:[^/@\\s]+@","https://[已隐藏凭证]@");return result.substring(0,Math.min(maximum,result.length()));}
-    private static String stack(Throwable error){StringBuilder trace=new StringBuilder(4096);for(int cause=0;error!=null&&cause<3;cause++,error=error.getCause()){trace.append(error.getClass().getName()).append(':').append(safe(error.getMessage(),1000)).append('\n');StackTraceElement[] frames=error.getStackTrace();for(int i=0;i<Math.min(frames.length,24)&&trace.length()<7000;i++)trace.append(frames[i]).append('\n');}return safe(trace.toString(),8000);}
+    private static String stack(Throwable error){return stack(error,"");}
+    private static String stack(Throwable error,String token){StringBuilder trace=new StringBuilder(4096);Set<Throwable> seen=Collections.newSetFromMap(new IdentityHashMap<>());appendStack(trace,error,"",token,seen);return safe(trace.toString(),8000);}
+    private static void appendStack(StringBuilder trace,Throwable error,String relation,String token,Set<Throwable> seen){
+        if(error==null||seen.size()>=8||trace.length()>=7000||!seen.add(error))return;
+        String message=String.valueOf(error.getMessage());if(!token.isEmpty())message=message.replace(token,"[已隐藏凭证]");
+        trace.append(relation).append(error.getClass().getName()).append(':').append(safe(message,1000)).append('\n');
+        StackTraceElement[] frames=error.getStackTrace();for(int i=0;i<Math.min(frames.length,24)&&trace.length()<7000;i++)trace.append(frames[i]).append('\n');
+        appendStack(trace,error.getCause(),"Caused by: ",token,seen);
+        Throwable[] suppressed=error.getSuppressed();for(int i=0;i<Math.min(3,suppressed.length);i++)appendStack(trace,suppressed[i],"Suppressed: ",token,seen);
+    }
+    static void gitFailure(String id,String stage,String project,String branch,Throwable error,String token){
+        if(directory==null)return;
+        try{String message=String.valueOf(error.getMessage());if(!token.isEmpty())message=message.replace(token,"[已隐藏凭证]");JSONObject value=new JSONObject().put("taskId",safe(id,100)).put("stage",safe(stage,200)).put("project",safe(project,300)).put("branch",safe(branch,200)).put("message",safe(message,1200)).put("stack",stack(error,token));IO.execute(()->{try{synchronized(CrashDiagnostics.class){write("git-failure.json",value);eventNow("native-git-error",value);}}catch(Exception ignored){}});}catch(Exception ignored){}
+    }
     static void event(String kind,JSONObject data){if(directory==null)return;IO.execute(()->{try{eventNow(kind,data);}catch(Exception ignored){}});}
     static synchronized void checkpoint(JSONObject incoming)throws Exception{
         JSONObject entry=new JSONObject();for(String key:new String[]{"time","kind","stage","project","branch","action","status","message","stack"})if(incoming.has(key))entry.put(key,safe(incoming.optString(key),key.equals("stack")?5000:1200));if(incoming.has("elapsedMs"))entry.put("elapsedMs",Math.max(0,incoming.optDouble("elapsedMs")));
@@ -62,7 +75,7 @@ final class CrashDiagnostics {
         JSONObject result=new JSONObject().put("packageId",context.getPackageName()).put("android",Build.VERSION.RELEASE).put("sdk",Build.VERSION.SDK_INT).put("manufacturer",Build.MANUFACTURER).put("model",Build.MODEL);
         android.content.pm.PackageInfo info=context.getPackageManager().getPackageInfo(context.getPackageName(),0);result.put("versionName",info.versionName).put("versionCode",Build.VERSION.SDK_INT>=28?info.getLongVersionCode():info.versionCode);
         if(Build.VERSION.SDK_INT>=26){android.content.pm.PackageInfo web=android.webkit.WebView.getCurrentWebViewPackage();if(web!=null)result.put("webViewVersion",web.versionName);}
-        result.put("startupExitInfo",read("exits.json"));result.put("lastCrash",read("crash.json")).put("lastTask",read("task.json")).put("previousTask",read("previous-task.json"));
+        result.put("startupExitInfo",read("exits.json"));result.put("lastCrash",read("crash.json")).put("lastTask",read("task.json")).put("previousTask",read("previous-task.json")).put("lastGitFailure",read("git-failure.json"));
         ArrayDeque<JSONObject> history=new ArrayDeque<>();for(String name:new String[]{"events.previous.jsonl","events.jsonl"}){File file=new File(directory,name);if(file.exists())try(BufferedReader input=new BufferedReader(new InputStreamReader(new FileInputStream(file),StandardCharsets.UTF_8))){String line;while((line=input.readLine())!=null){try{history.add(new JSONObject(line));if(history.size()>100)history.removeFirst();}catch(Exception ignored){}}}catch(IOException ignored){}}
         result.put("events",new JSONArray(history));JSONArray exits=new JSONArray();
         if(Build.VERSION.SDK_INT>=30)try{ActivityManager manager=(ActivityManager)context.getSystemService(Context.ACTIVITY_SERVICE);for(ApplicationExitInfo exit:manager.getHistoricalProcessExitReasons(context.getPackageName(),0,8)){JSONObject value=new JSONObject().put("time",exit.getTimestamp()).put("reason",exit.getReason()).put("status",exit.getStatus()).put("description",safe(exit.getDescription(),1200)).put("process",exit.getProcessName()).put("pssKiB",exit.getPss()).put("rssKiB",exit.getRss());try(InputStream trace=exit.getTraceInputStream()){if(trace!=null)value.put("trace",text(trace,16384));}catch(Exception ignored){}exits.put(value);}}catch(Exception error){result.put("exitInfoError",safe(error.getMessage(),500));}
