@@ -59,7 +59,7 @@ final class CrashDiagnostics {
     }
     static void event(String kind,JSONObject data){if(directory==null)return;IO.execute(()->{try{eventNow(kind,data);}catch(Exception ignored){}});}
     static synchronized void checkpoint(JSONObject incoming)throws Exception{
-        JSONObject entry=new JSONObject();for(String key:new String[]{"time","kind","stage","project","branch","action","status","message","stack"})if(incoming.has(key))entry.put(key,safe(incoming.optString(key),key.equals("stack")?5000:1200));if(incoming.has("elapsedMs"))entry.put("elapsedMs",Math.max(0,incoming.optDouble("elapsedMs")));
+        JSONObject entry=new JSONObject();for(String key:new String[]{"time","kind","stage","project","branch","action","status","message","stack"})if(incoming.has(key))entry.put(key,safe(incoming.optString(key),key.equals("stack")?8000:1200));if(incoming.has("elapsedMs"))entry.put("elapsedMs",Math.max(0,incoming.optDouble("elapsedMs")));
         String kind=entry.optString("kind");eventNow(kind,entry);
         if(Arrays.asList("task","phase","progress","task-result").contains(kind))write("task.json",entry);
     }

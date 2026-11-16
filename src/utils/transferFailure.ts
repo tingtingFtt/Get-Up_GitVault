@@ -1,4 +1,4 @@
-export type TransferFailureKind = 'network' | 'rate-limit' | 'archive' | 'validation' | 'storage-space' | 'storage-permission' | 'storage' | 'http' | 'cancelled' | 'unknown';
+export type TransferFailureKind = 'network' | 'tls-network' | 'tls-certificate' | 'tls' | 'rate-limit' | 'archive' | 'validation' | 'storage-space' | 'storage-permission' | 'storage' | 'http' | 'cancelled' | 'unknown';
 const marks = new WeakMap<object, TransferFailureKind>();
 /** Keep the original exception (including HTTP status, retry deadline and cause). */
 export function markTransferFailure<T>(error: T, kind: TransferFailureKind): T {
@@ -13,6 +13,9 @@ export function transferFailureKind(error: unknown): TransferFailureKind {
     if (e.rateLimited === true) return 'rate-limit';
     if (e.name === 'AbortError' || e.code === 'CANCELLED') return 'cancelled';
     if (e.code === 'GIT_NETWORK') return 'network';
+    if (e.code === 'GIT_TLS_NETWORK') return 'tls-network';
+    if (e.code === 'GIT_TLS_CERTIFICATE') return 'tls-certificate';
+    if (e.code === 'GIT_TLS_ERROR') return 'tls';
     if (e.name === 'QuotaExceededError' || e.code === 'ENOSPC' || e.code === 'INSUFFICIENT_SPACE') return 'storage-space';
     if (['NotAllowedError', 'SecurityError'].includes(e.name)) return 'storage-permission';
     const marked = marks.get(value); if (marked) return marked;
@@ -24,7 +27,8 @@ export function transferFailureKind(error: unknown): TransferFailureKind {
   return 'unknown';
 }
 const labels: Record<TransferFailureKind, string> = {
-  network: '网络失败或超时', 'rate-limit': 'GitHub 限流', archive: '压缩包解压失败', validation: '文件校验失败',
+  network: '网络失败或超时', 'tls-network': 'TLS 连接中断或超时', 'tls-certificate': 'TLS 证书或身份校验失败', tls: 'TLS 安全连接失败',
+  'rate-limit': 'GitHub 限流', archive: '压缩包解压失败', validation: '文件校验失败',
   'storage-space': '存储空间或配额不足', 'storage-permission': '存储授权失效', storage: '存储写入失败',
   http: 'HTTP 请求失败', cancelled: '用户取消', unknown: '未分类错误',
 };

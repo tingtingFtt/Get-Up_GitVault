@@ -48,7 +48,7 @@ jobs:
           arch: x86_64
           profile: pixel_7
           disable-animations: true
-          script: cd android && bash gradlew --no-daemon :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.gitvault.app.JgitInflaterRegressionTest,com.gitvault.app.GitTransferTest,com.gitvault.app.DiagnosticsIntegrationTest
+          script: cd android && bash gradlew --no-daemon :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.gitvault.app.JgitInflaterRegressionTest,com.gitvault.app.GitTlsRecoveryTest,com.gitvault.app.GitTlsRecoveryIntegrationTest,com.gitvault.app.GitRecoveryIntegrationTest,com.gitvault.app.GitTransferTest,com.gitvault.app.DiagnosticsIntegrationTest
       - name: Upload native regression results
         if: always()
         uses: actions/upload-artifact@v4

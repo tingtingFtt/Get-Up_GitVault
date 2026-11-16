@@ -3,13 +3,13 @@ export interface OperationLog {
   project?: string; branch?: string; target?: string; stage?: string; message: string; httpStatus?: number; batchId?: string;
 }
 const KEY = 'gitvault_operation_logs_v1';
-export function redactLog(value: string, secrets: string[] = []) {
+export function redactLog(value: string, secrets: string[] = [], maximum = 5000) {
   let result = value;
   for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length)) result = result.split(secret).join('[已隐藏凭证]');
   return result.replace(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+/g, '[已隐藏凭证]')
     .replace(/(Bearer\s+)[^\s,;"']+/gi, '$1[已隐藏凭证]')
     .replace(/([?&](?:access_token|token|auth)=)[^&\s]+/gi, '$1[已隐藏凭证]')
-    .replace(/https?:\/\/[^/@\s]+:[^/@\s]+@/g, 'https://[已隐藏凭证]@').slice(0, 5000);
+    .replace(/https?:\/\/[^/@\s]+:[^/@\s]+@/g, 'https://[已隐藏凭证]@').slice(0, maximum);
 }
 export function readOperationLogs(): OperationLog[] {
   try { const value = JSON.parse(localStorage.getItem(KEY) || '[]'); return Array.isArray(value) ? value.filter(entry => entry && typeof entry.id === 'string' && typeof entry.time === 'string' && typeof entry.message === 'string' && ['success','error','skipped','cancelled','partial'].includes(entry.status)).slice(0, 1000) : []; } catch { return []; }

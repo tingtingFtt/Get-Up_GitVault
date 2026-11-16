@@ -64,7 +64,7 @@ public class GitVaultGitPlugin extends Plugin {
                 finally{networkTasks.remove(id,network);network.close();}
             }
             createSession(id,call);call.resolve();
-        }catch(Exception error){recordFailure(id,"准备上传暂存",call,error);releaseSession(id);String token=call.getString("token","");call.reject(token.isEmpty()?error.getMessage():String.valueOf(error.getMessage()).replace(token,"[redacted]"));}});
+        }catch(Exception error){recordFailure(id,"准备上传暂存",call,error);releaseSession(id);String token=call.getString("token","");String message=GitTransferRecovery.failureMessage(error);call.reject(token.isEmpty()?message:message.replace(token,"[redacted]"),GitTransferRecovery.failureCode(error));}});
     }
     @PluginMethod public void clearObjectCache(PluginCall call){io.execute(()->{try{if(!sessions.isEmpty())throw new IOException("Git 传输正在进行，请结束后清理缓存");GitObjectCache cache=new GitObjectCache(getContext().getCacheDir());long bytes=cache.bytes();cache.clear();JSObject result=new JSObject();result.put("bytes",bytes);call.resolve(result);}catch(Exception error){call.reject(error.getMessage(),"GIT_CACHE");}});}
     @PluginMethod public void readChunk(PluginCall call){chunkCall(call,false);}
@@ -147,7 +147,7 @@ public class GitVaultGitPlugin extends Plugin {
                     result.put("timings",timings);
                     check(stop);call.resolve(result);
                 }
-            }catch(Exception exception){recordFailure(id,stage,call,exception);Staged active=sessions.get(id);for(Throwable cause=exception;cause!=null;cause=cause.getCause())if(active!=null&&(cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException))active.invalidCache=true;String message=exception.getMessage()==null?"原生 Git 传输失败":exception.getMessage();if(!token.isEmpty())message=message.replace(token,"[redacted]");if(exception instanceof ManagedFolderStore.Verification)call.reject(message,"FOLDER_STORAGE",((ManagedFolderStore.Verification)exception).details);else call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":GitTransferRecovery.transientFailure(exception)?"GIT_NETWORK":"GIT_TRANSFER");}
+            }catch(Exception exception){recordFailure(id,stage,call,exception);Staged active=sessions.get(id);for(Throwable cause=exception;cause!=null;cause=cause.getCause())if(active!=null&&(cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException))active.invalidCache=true;String message=GitTransferRecovery.failureMessage(exception);if(!token.isEmpty())message=message.replace(token,"[redacted]");if(exception instanceof ManagedFolderStore.Verification)call.reject(message,"FOLDER_STORAGE",((ManagedFolderStore.Verification)exception).details);else call.reject(message,cancelled.get(id)!=null&&cancelled.get(id).get()?"CANCELLED":GitTransferRecovery.failureCode(exception));}
             finally {GitNetwork network=networkTasks.remove(id);if(network!=null)network.close();if(!retain)releaseSession(id);}
         });
     }

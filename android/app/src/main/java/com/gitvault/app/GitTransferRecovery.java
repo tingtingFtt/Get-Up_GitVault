@@ -5,7 +5,7 @@ import java.net.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
-import javax.net.ssl.SSLException;
+import javax.net.ssl.*;
 
 /** Retry within the same staged repository; never re-read or re-stage source files. */
 final class GitTransferRecovery {
@@ -45,16 +45,43 @@ final class GitTransferRecovery {
         }
     }
     static int timeout(int attempt){return Math.min(180,90+45*attempt);}
-    static boolean transientFailure(Throwable error){
+    private enum Failure {
+        OTHER("GIT_TRANSFER",false),NETWORK("GIT_NETWORK",true),TLS_NETWORK("GIT_TLS_NETWORK",true),
+        TLS_CERTIFICATE("GIT_TLS_CERTIFICATE",false),TLS_ERROR("GIT_TLS_ERROR",false);
+        final String code;final boolean retryable;
+        Failure(String code,boolean retryable){this.code=code;this.retryable=retryable;}
+    }
+    static boolean transientFailure(Throwable error){return classify(error).retryable;}
+    static String failureCode(Throwable error){return classify(error).code;}
+    static String failureMessage(Throwable error){
+        Failure kind=classify(error);String message=error.getMessage()==null?"原生 Git 传输失败":error.getMessage();
+        if(kind==Failure.TLS_NETWORK)return "TLS 连接中断或超时；"+message;
+        if(kind==Failure.TLS_CERTIFICATE)return "TLS 证书或身份校验失败；"+message;
+        if(kind==Failure.TLS_ERROR)return "TLS 安全连接失败；"+message;
+        return message;
+    }
+    private static Failure classify(Throwable error){
         Set<Throwable> visited=Collections.newSetFromMap(new IdentityHashMap<>());
-        boolean temporary=false;
+        boolean temporary=false,tls=false,certificate=false,permanent=false,unsupportedTls=false;
         for(Throwable cause=error;cause!=null&&visited.add(cause);cause=cause.getCause()){
-            // Certificate, permission, corruption and missing-object failures
-            // cannot be repaired by retrying a connection.
             String text=String.valueOf(cause.getMessage()).toLowerCase(Locale.ROOT);
-            if(cause instanceof SSLException||cause instanceof java.security.GeneralSecurityException||cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException||text.matches("(?s).*(not authorized|authentication|permission denied|forbidden|not found|non.fast.forward|推送拒绝|仓库 id|取消).*")||text.matches("(?s).*\\b(401|403|404|422)\\b.*"))return false;
+            if(cause instanceof SSLException){
+                tls=true;
+                certificate|=cause instanceof SSLPeerUnverifiedException||text.matches("(?s).*(certificate|certpath|certification path|trust anchor|pkix|hostname|host name|subject alternative|peer not authenticated|unknown_ca|unknown ca).*");
+                // Only handshake/base SSL wrappers with positive network evidence
+                // are retryable. Protocol/key failures must remain fail-closed.
+                unsupportedTls|=!(cause instanceof SSLHandshakeException)&&cause.getClass()!=SSLException.class;
+                unsupportedTls|=text.matches("(?s).*(fatal alert|handshake_failure|protocol_version|no (appropriate protocol|cipher)|cipher suites in common|bad record|record.*(decrypt|overflow)|wrong version|unsupported protocol).*");
+            }
+            certificate|=cause instanceof java.security.cert.CertificateException||cause instanceof java.security.cert.CertPathValidatorException||cause instanceof java.security.cert.CertPathBuilderException;
+            permanent|=cause instanceof java.security.GeneralSecurityException||cause instanceof org.eclipse.jgit.errors.CorruptObjectException||cause instanceof org.eclipse.jgit.errors.MissingObjectException||text.matches("(?s).*(not authorized|authentication|permission denied|forbidden|not found|non.fast.forward|推送拒绝|仓库 id|取消).*")||text.matches("(?s).*\\b(401|403|404|422)\\b.*");
             if(cause instanceof SocketTimeoutException||cause instanceof SocketException||cause instanceof EOFException||cause instanceof UnknownHostException||cause instanceof InterruptedIOException||cause instanceof IOException&&text.matches("(?s).*(unexpected end of (stream|file)|premature eof|connection (reset|closed|abort)|broken pipe|timed? out|\\b(408|500|502|503|504)\\b).*") )temporary=true;
         }
-        return temporary;
+        // Inspect the complete cause chain before allowing a retry: an EOF/socket
+        // wrapper must never hide a certificate or permission failure deeper down.
+        if(tls&&certificate)return Failure.TLS_CERTIFICATE;
+        if(permanent)return tls?Failure.TLS_ERROR:Failure.OTHER;
+        if(tls)return temporary&&!unsupportedTls?Failure.TLS_NETWORK:Failure.TLS_ERROR;
+        return temporary?Failure.NETWORK:Failure.OTHER;
     }
 }

@@ -36,3 +36,10 @@ test('a successful archive fallback retains its classified cause and final stora
   await assert.rejects(measureTransfer(context,async()=>{throw new DOMException('full','QuotaExceededError');}));
   assert.match(readOperationLogs()[0].message,/失败分类：存储空间或配额不足/);
 });
+test('native TLS failures retain their precise classification in operation logs',async()=>{
+ for(const [code,label] of [['GIT_TLS_NETWORK','TLS 连接中断或超时'],['GIT_TLS_CERTIFICATE','TLS 证书或身份校验失败'],['GIT_TLS_ERROR','TLS 安全连接失败']]){
+  clearOperationLogs();const error=Object.assign(new Error('native TLS failure'),{code});
+  await assert.rejects(measureTransfer({action:'更新',project:'a/b',mode:'native',signal:new AbortController().signal},async()=>{throw error;}),candidate=>candidate===error);
+  assert.ok(readOperationLogs()[0].message.includes('失败分类：'+label));assert.ok(!readOperationLogs()[0].message.includes('未分类错误'));
+ }
+});

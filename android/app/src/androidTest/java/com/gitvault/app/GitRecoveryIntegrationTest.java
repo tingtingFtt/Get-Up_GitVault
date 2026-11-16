@@ -20,13 +20,13 @@ public class GitRecoveryIntegrationTest {
             String url=new File(folder,"remote").toURI().toString();ObjectId first=commit(source,null,"first");
             source.push().setRemote(url).setRefSpecs(new RefSpec(first.name()+":refs/heads/dev"),new RefSpec(first.name()+":refs/heads/main")).call();
             ObjectId parent=first;
-            for(boolean responseLost:new boolean[]{true,false}){
-                ObjectId next=commit(source,parent,responseLost?"lost response":"lost connection");AtomicInteger sends=new AtomicInteger();
+            for(boolean tls:new boolean[]{false,true})for(boolean responseLost:new boolean[]{true,false}){
+                ObjectId next=commit(source,parent,(tls?"TLS ":"")+(responseLost?"lost response":"lost connection"));AtomicInteger sends=new AtomicInteger();
                 String result=new GitTransferRecovery(new AtomicBoolean(),message->{},milliseconds->{}).push(next.name(),parent.name(),timeout->remote.getRepository().exactRef("refs/heads/dev").getObjectId().name(),timeout->{
                     int attempt=sends.incrementAndGet();
-                    if(!responseLost&&attempt==1)throw new EOFException("unexpected end of stream");
+                    if(!responseLost&&attempt==1)throw networkFailure(tls);
                     source.push().setRemote(url).setRefSpecs(new RefSpec(next.name()+":refs/heads/dev")).call();
-                    if(responseLost)throw new EOFException("response lost");return null;
+                    if(responseLost)throw networkFailure(tls);return null;
                 });
                 assertEquals(next.name(),result);assertEquals(responseLost?1:2,sends.get());
                 assertEquals(first,remote.getRepository().exactRef("refs/heads/main").getObjectId());
@@ -35,6 +35,7 @@ public class GitRecoveryIntegrationTest {
             }
         }finally{remove(folder);}
     }
+    private static IOException networkFailure(boolean tls){if(!tls)return new EOFException("unexpected end of stream");javax.net.ssl.SSLHandshakeException error=new javax.net.ssl.SSLHandshakeException("connection closed");error.initCause(new EOFException("connection closed"));return new IOException("JGit SSL wrapper",error);}
     private ObjectId commit(Git git,ObjectId parent,String text)throws Exception{
         try(ObjectInserter insert=git.getRepository().newObjectInserter()){
             TreeFormatter tree=new TreeFormatter();tree.append("content.txt",FileMode.REGULAR_FILE,insert.insert(Constants.OBJ_BLOB,text.getBytes(java.nio.charset.StandardCharsets.UTF_8)));

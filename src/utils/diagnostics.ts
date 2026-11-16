@@ -10,7 +10,7 @@ const native=()=>Capacitor.isNativePlatform()&&Capacitor.getPlatform()==='androi
 export function diagnosticSecrets(values:string[]){secrets=[...new Set(values.filter(value=>value.length>=4))];}
 function clean(entry:Entry):Entry{
  const safe:Record<string,unknown>={};
- for(const key of ['time','kind','stage','project','branch','action','status','message','stack'] as const){const value=entry[key];if(typeof value==='string')safe[key]=redactLog(value,secrets).slice(0,key==='stack'?5000:1200);}
+ for(const key of ['time','kind','stage','project','branch','action','status','message','stack'] as const){const value=entry[key];if(typeof value==='string')safe[key]=redactLog(value,secrets,key==='stack'?8000:1200);}
  if(typeof entry.elapsedMs==='number'&&Number.isFinite(entry.elapsedMs))safe.elapsedMs=Math.max(0,entry.elapsedMs);
  return safe as Entry;
 }
@@ -38,9 +38,11 @@ export function installDiagnostics(){
  const pulse=()=>{if(native())void plugin.pulse({visible:!document.hidden}).catch(()=>{});};
  document.addEventListener('visibilitychange',pulse);pulse();setInterval(pulse,3000);
 }
+export function redactDiagnosticData(value:unknown,key=''):unknown{
+ return typeof value==='string'?redactLog(value,secrets,key==='stack'?8000:key==='trace'?16384:5000):Array.isArray(value)?value.map(item=>redactDiagnosticData(item,key)):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).map(([field,item])=>[field,redactDiagnosticData(item,field)])):value;
+}
 export async function diagnosticReport(){
- const redact=(value:unknown):unknown=>typeof value==='string'?redactLog(value,secrets):Array.isArray(value)?value.map(redact):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).map(([key,item])=>[key,redact(item)])):value;
- let system:unknown={available:false};if(native())try{system=redact(await plugin.report());}catch(error){system={available:false,message:redactLog((error as Error).message,secrets)};}
+ let system:unknown={available:false};if(native())try{system=redactDiagnosticData(await plugin.report());}catch(error){system={available:false,message:redactLog((error as Error).message,secrets)};}
  const logs=readOperationLogs().slice(0,200).map(row=>Object.fromEntries(Object.entries(row).map(([key,value])=>[key,typeof value==='string'?redactLog(value,secrets):value])));
  return {format:'GitVault diagnostic v1',exportedAt:new Date().toISOString(),environment:{userAgent:navigator.userAgent,platform:Capacitor.getPlatform(),native:Capacitor.isNativePlatform()},events:readDiagnostics(),operations:logs,system};
 }

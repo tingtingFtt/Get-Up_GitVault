@@ -21,7 +21,7 @@ public class GitTransferRecoveryTest {
             AtomicInteger calls=new AtomicInteger();try{recovery(new AtomicBoolean()).read("read",timeout->{calls.incrementAndGet();throw error;});fail();}catch(Exception expected){assertSame(error,expected);assertEquals(1,calls.get());}
         }
         assertTrue(GitTransferRecovery.transientFailure(new IOException("wrapped",new EOFException())));
-        assertFalse(GitTransferRecovery.transientFailure(new SSLHandshakeException("connection reset")));
+        assertTrue(GitTransferRecovery.transientFailure(new SSLHandshakeException("connection reset")));
     }
     @Test public void lostSuccessfulPushDoesNotPublishAgain()throws Exception{
         AtomicInteger sends=new AtomicInteger();
