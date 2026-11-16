@@ -58,7 +58,7 @@ public class JgitInflaterRegressionTest {
                     .setRefSpecs(new RefSpec(upstream.name()+":refs/heads/main"), new RefSpec(upstream.name()+":refs/heads/dev")).call();
             ObjectId originalMain = upstream, target = upstream;
             // Closing a loose large-object stream used to return then end a pooled inflater on Android.
-            verifyObject(source, upstream, bytes); source.gc().call(); verifyObject(source, upstream, bytes);
+            verifyObject(source, upstream, bytes, false);
             // Three batch items followed by standalone update and standalone upload.
             for (int round=0; round<5; round++) {
                 bytes[bytes.length-1] = (byte)round;
@@ -68,7 +68,7 @@ public class JgitInflaterRegressionTest {
                     work.fetch().setRemote(new File(root,"source").toURI().toString())
                             .setRefSpecs(new RefSpec(upstream.name()+":refs/gitvault/source")).call();
                     // Real packed objects, early prefix close, full read and repeated close.
-                    verifyObject(work, upstream, bytes);
+                    verifyObject(work, upstream, bytes, true);
                     work.fetch().setRemote(new File(root,"target").toURI().toString())
                             .setRefSpecs(new RefSpec("refs/heads/dev:refs/gitvault/target")).call();
                     ObjectId next = commit(work, target, bytes, "sync-"+round);
@@ -111,7 +111,7 @@ public class JgitInflaterRegressionTest {
                         return work.fetch().setRemote(new File(root,"source").toURI().toString())
                                 .setRefSpecs(new RefSpec(ref.name()+":refs/gitvault/source")).call();
                     });
-                    verifyObject(work, ref, bytes);
+                    verifyObject(work, ref, bytes, true);
                 }
             }
         } finally { remove(root); }
@@ -125,11 +125,12 @@ public class JgitInflaterRegressionTest {
             RefUpdate update = git.getRepository().updateRef("refs/heads/main"); update.setNewObjectId(ref); update.forceUpdate(); return ref;
         }
     }
-    private static void verifyObject(Git git, ObjectId ref, byte[] expected) throws Exception {
+    private static void verifyObject(Git git, ObjectId ref, byte[] expected, boolean packed) throws Exception {
         try (RevWalk walk = new RevWalk(git.getRepository()); org.eclipse.jgit.treewalk.TreeWalk tree =
                 org.eclipse.jgit.treewalk.TreeWalk.forPath(git.getRepository(),"large.bin",walk.parseCommit(ref).getTree())) {
             ObjectLoader loader = git.getRepository().open(tree.getObjectId(0));
             assertTrue("Exercise large-object streaming path",loader.isLarge());
+            if(packed) assertTrue("Fetch must exercise a real packed object",loader.getClass().getName().contains("LargePacked"));
             InputStream prefix = loader.openStream(); assertEquals(expected[0]&255,prefix.read()); prefix.close(); prefix.close();
             try (InputStream input = loader.openStream()) { assertArrayEquals(expected,input.readAllBytes()); }
         }

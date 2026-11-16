@@ -48,16 +48,22 @@ public class GitTransferTest {
             }
             // Both real loose and packed large objects must survive prefix inspection.
             assertEquals(101,store.describe(commitId.name()).getJSONArray("files").length());
-            RefUpdate pin=git.getRepository().updateRef("refs/gitvault/source");pin.setNewObjectId(commitId);pin.update();git.gc().call();
-            JSObject manifest=store.describe(commitId.name());assertEquals(101,manifest.getJSONArray("files").length());
+            RefUpdate pin=git.getRepository().updateRef("refs/gitvault/source");pin.setNewObjectId(commitId);pin.update();
+            File packedFolder=new File(folder,"packed-copy");
+            try(Git packed=Git.init().setBare(true).setDirectory(packedFolder).call();GitSnapshotStore packedStore=new GitSnapshotStore(packed.getRepository(),packedFolder,stop)){
+            GitMemoryBudget.configure(packed.getRepository().getConfig());
+            // Use production fetch/pack parsing; desktop GC relies on ProcessHandle absent on Android.
+            packed.fetch().setRemote(folder.toURI().toString()).setRefSpecs(new RefSpec(commitId.name()+":refs/gitvault/source")).call();
+            JSObject manifest=packedStore.describe(commitId.name());assertEquals(101,manifest.getJSONArray("files").length());
             for(int i=0;i<101;i++){
                 org.json.JSONObject entry=manifest.getJSONArray("files").getJSONObject(i);assertFalse(entry.has("content"));long offset=0;
                 java.security.MessageDigest hash=java.security.MessageDigest.getInstance("SHA-1");hash.update(("blob "+entry.getLong("size")+"\0").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                do{JSObject chunk=store.readChunk(entry.getString("path"),offset);byte[] part=android.util.Base64.decode(chunk.getString("content"),android.util.Base64.DEFAULT);assertTrue(part.length<=GitSnapshotStore.CHUNK_BYTES);hash.update(part);offset+=part.length;}while(offset<entry.getLong("size"));
+                do{JSObject chunk=packedStore.readChunk(entry.getString("path"),offset);byte[] part=android.util.Base64.decode(chunk.getString("content"),android.util.Base64.DEFAULT);assertTrue(part.length<=GitSnapshotStore.CHUNK_BYTES);hash.update(part);offset+=part.length;}while(offset<entry.getLong("size"));
                 StringBuilder actual=new StringBuilder();for(byte value:hash.digest())actual.append(String.format("%02x",value&255));assertEquals(entry.getString("sha"),actual.toString());total+=offset;
             }
             assertTrue(total>100L*1024*1024);stop.set(true);
-            try{store.readChunk(manifest.getJSONArray("files").getJSONObject(0).getString("path"),0);fail("Cancellation must stop chunk reads");}catch(java.io.IOException expectedError){assertTrue(expectedError.getMessage().contains("取消"));}
+            try{packedStore.readChunk(manifest.getJSONArray("files").getJSONObject(0).getString("path"),0);fail("Cancellation must stop chunk reads");}catch(java.io.IOException expectedError){assertTrue(expectedError.getMessage().contains("取消"));}
+            }
         }finally{remove(folder);}
     }
     @Test public void incompleteOrCorruptStagingCannotPublishATree()throws Exception{
