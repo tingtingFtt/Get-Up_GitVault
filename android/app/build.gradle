@@ -50,10 +50,10 @@ repositories {
     }
 }
 
-// Resolve the normal upstream graph, but package only the Android-compatible JGit
-// artifact. Keeping its transitive jars avoids losing codec/bitmap dependencies.
+// Package only the Android-compatible JGit artifact. Its upstream runtime
+// dependencies stay normal Gradle modules, so SLF4J has a single resolved copy.
 configurations { jgitUpstream }
-dependencies { jgitUpstream "org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r" }
+dependencies { jgitUpstream("org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r") { transitive = false } }
 def compatibleJgit = tasks.register('compatibleJgit') {
     def upstream = configurations.jgitUpstream.filter { it.name.startsWith('org.eclipse.jgit-') }
     inputs.files(upstream)
@@ -65,7 +65,9 @@ def compatibleJgit = tasks.register('compatibleJgit') {
 
 dependencies {
     implementation files(compatibleJgit)
-    implementation files(configurations.jgitUpstream.filter { !it.name.startsWith('org.eclipse.jgit-') })
+    // Match the runtime dependencies in JGit 6.10's parent POM.
+    implementation 'com.googlecode.javaewah:JavaEWAH:1.2.3'
+    implementation 'commons-codec:commons-codec:1.17.0'
     implementation "org.slf4j:slf4j-nop:1.7.36"
     implementation "androidx.documentfile:documentfile:1.1.0"
     implementation fileTree(include: ['*.jar'], dir: 'libs')

@@ -33,6 +33,7 @@ public class GitTransferTest {
         File folder=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getCacheDir(),"git-large-test-"+System.nanoTime());
         AtomicBoolean stop=new AtomicBoolean();long total=0;
         try(Git git=Git.init().setBare(true).setDirectory(folder).call();GitSnapshotStore store=new GitSnapshotStore(git.getRepository(),folder,stop)){
+            GitMemoryBudget.configure(git.getRepository().getConfig());
             byte[] bytes=new byte[1024*1024+1];Arrays.fill(bytes,(byte)173);JSArray expected=new JSArray();
             for(int i=0;i<101;i++){
                 bytes[0]=(byte)i;String sha;try(ObjectInserter insert=git.getRepository().newObjectInserter()){sha=insert.idFor(Constants.OBJ_BLOB,bytes).name();}
