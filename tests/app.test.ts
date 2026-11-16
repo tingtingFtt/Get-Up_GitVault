@@ -1814,3 +1814,11 @@ test('opening a legacy implicitly renamed upload restores source while retaining
  assert.equal(storedProjects()[0].repo,'project');assert.equal(storedProjects()[0].uploadTarget.id,77);
  await enterWorkbench();assert.ok(document.body.textContent?.includes('拉取来源：source/project'));assert.ok(document.body.textContent?.includes('固定上传目标：destination/backup'));
 });
+
+test('large project lists render progressively while filtered bulk selection still includes every matching record',async()=>{
+ await reloadProjects(Array.from({length:120},(_,i)=>({...repo(),id:'list-'+i,repo:'project-'+i,remark:'list project '+i})));
+ await click('仓库已有项目 (120)');assert.equal(document.querySelectorAll('button[title="删除项目"]').length,50);assert.ok(document.body.textContent?.includes('已显示 50 / 120'));
+ await click('全选所有');assert.ok(document.querySelector('.batch-selection')?.textContent?.includes('已选定 120 / 120'));
+ await click('加载更多项目');assert.equal(document.querySelectorAll('button[title="删除项目"]').length,100);
+ await setField(document.querySelector<HTMLInputElement>('input[placeholder^="搜索项目"]')!,'project-119');assert.equal(document.querySelectorAll('button[title="删除项目"]').length,1);assert.ok(!document.body.textContent?.includes('加载更多项目'));
+});

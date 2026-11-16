@@ -1,3 +1,4 @@
+import {diagnosticTask,diagnosticPhase,diagnosticTaskResult} from './diagnostics';
 import { appendOperationLog } from './operationLog';
 import {transferFailureLabel} from './transferFailure';
 
@@ -13,6 +14,7 @@ export interface TransferTrace {
 /** Phase durations include I/O and queue waits. Native details are sub-phases,
  * not additional time to add to the total. No credentials or file bodies enter logs. */
 export async function measureTransfer<T>(context: TransferContext, work: (trace: TransferTrace) => Promise<T>): Promise<T> {
+  const restoreTask=diagnosticTask(context.project,context.branch||'',context.action);
   const now = () => performance.now(), start = now(), durations: Array<{ name: string; ms: number }> = [];
   let current = '识别仓库与分支', since = start, status: 'success' | 'error' | 'cancelled' = 'error', native = '';
   const counters=new Map<string,number>(), recoveries=new Map<string,number>();let waitMs=0,requestMs=0,attempts=0,rateLimits=0, failure='';
@@ -20,7 +22,7 @@ export async function measureTransfer<T>(context: TransferContext, work: (trace:
   const metric=(event:Event)=>{const data=(event as CustomEvent).detail;if(data?.signal!==context.signal)return;waitMs+=number(data.waitMs);requestMs+=number(data.requestMs);attempts+=number(data.attempts);rateLimits+=number(data.rateLimits);};
   if(typeof window!=='undefined')window.addEventListener('gitvault-transport-metric',metric);
   const trace: TransferTrace = {
-    phase(name) { const at = now(); durations.push({ name: current, ms: at - since }); current = name; since = at; },
+    phase(name) { diagnosticPhase(name);const at = now(); durations.push({ name: current, ms: at - since }); current = name; since = at; },
     branch(name) { context.branch = name; },
     count(name,amount){if(Number.isSafeInteger(amount)&&amount>=0)counters.set(name,(counters.get(name)||0)+amount);},
     recovery(error){const label=transferFailureLabel(error);recoveries.set(label,(recoveries.get(label)||0)+1);},
@@ -36,6 +38,7 @@ export async function measureTransfer<T>(context: TransferContext, work: (trace:
   catch (error) { if (context.signal.reason?.name!=='TimeoutError'&&(context.signal.aborted || (error as Error)?.name === 'AbortError' || (error as { code?: string })?.code === 'CANCELLED')) status = 'cancelled'; failure=status==='cancelled'?'用户取消':transferFailureLabel(error); throw error; }
   finally {
     if(typeof window!=='undefined')window.removeEventListener('gitvault-transport-metric',metric);
+    diagnosticTaskResult(status);restoreTask();
     const end = now(); durations.push({ name: current, ms: end - since });
     const message = [`传输方式：${context.mode}；总耗时 ${((end - start) / 1000).toFixed(2)} 秒`, ...durations.map(item => `${item.name}：${(item.ms / 1000).toFixed(2)} 秒`),`网页层 API 请求 ${attempts} 次；限流响应 ${rateLimits} 次；排队／限流等待累计 ${(waitMs/1000).toFixed(2)} 秒；请求与响应处理累计 ${(requestMs/1000).toFixed(2)} 秒（含流式解压、校验和保存；并发累计值不可与总耗时相加）`,...Array.from(counters,([key,value])=>`${key}：${value}`),...Array.from(recoveries,([key,value])=>`压缩包恢复原因：${key} ${value} 次`),...(failure?[`失败分类：${failure}`]:[]), ...(native ? [`原生细项（已包含在上述耗时内）：${native}`] : [])].join('\n');
     try { if (typeof window !== 'undefined') appendOperationLog({ action: `${context.action}传输明细`, project: context.project, branch: context.branch, target: context.target, status, stage: status === 'success' ? '传输完成' : current, message }); }

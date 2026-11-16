@@ -33,3 +33,7 @@ test('invalid journal data is not silently replaced by an empty task', () => {
   assert.throws(() => checkpoint({ kind: 'upload', items: [] }));
   assert.equal(localStorage.getItem('gitvault_tasks_v1'), '{broken');
 });
+test('progress-only checkpoints do not rewrite the recoverable queue or change its timestamp',()=>{
+ const task={kind:'projects' as const,action:'update' as const,items:[{id:'p',status:'running',label:'source/repo'}]};checkpoint(task);const before=localStorage.getItem('gitvault_tasks_v1');let events=0;const listener=()=>events++;window.addEventListener('gitvault-tasks-changed',listener);
+ try{for(let i=0;i<30;i++)checkpoint({...task,items:task.items.map(item=>({...item,message:'progress '+i}))});assert.equal(localStorage.getItem('gitvault_tasks_v1'),before);assert.equal(events,0);checkpoint({...task,items:[{...task.items[0],status:'success'}]});assert.equal(events,1);}finally{window.removeEventListener('gitvault-tasks-changed',listener);}
+});

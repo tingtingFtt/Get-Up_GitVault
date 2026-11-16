@@ -5,6 +5,7 @@ export type ProjectRecord = { id: string };
 export interface PreparedRecords { rows: Map<string, string>; order: string[] }
 interface RecordState { key: 'current'; revision: number; order: string[] }
 const serialized = new WeakMap<object, string>();
+export function rememberRecordJSON(project:ProjectRecord,json:string){serialized.set(project,json);}
 export function prepareRecords(projects: readonly ProjectRecord[]): PreparedRecords {
   if (!Array.isArray(projects)) throw new Error('项目记录格式错误，原数据未清除');
   const rows = new Map<string, string>();
@@ -21,6 +22,9 @@ function parseRecords(json: string): ProjectRecord[] {
   const projects = JSON.parse(json);
   prepareRecords(projects);
   return projects;
+}
+function parsePrepared(records:PreparedRecords):ProjectRecord[]{
+ return records.order.map(id=>{const json=records.rows.get(id);if(json===undefined)throw new Error('项目记录缺失，原数据未清除');const project=JSON.parse(json);if(!project||project.id!==id)throw new Error('项目数据库身份不一致，已停止读取');rememberRecordJSON(project,json);return project;});
 }
 async function openRecords(): Promise<IDBDatabase> {
   if (typeof indexedDB === 'undefined') throw new Error('当前环境无法使用项目数据库，原记录未清除');
@@ -46,7 +50,7 @@ async function openRecords(): Promise<IDBDatabase> {
 async function readRecords() {
   const db = await openRecords();
   try {
-    return await new Promise<{ state?: RecordState; records: PreparedRecords }>((resolve, reject) => {
+    return await new Promise<{ state?: RecordState; records: PreparedRecords; projects:ProjectRecord[] }>((resolve, reject) => {
       const transaction = db.transaction([PROJECTS, STATE], 'readonly');
       const state = transaction.objectStore(STATE).get('current');
       const projects = transaction.objectStore(PROJECTS).getAll();
@@ -59,9 +63,9 @@ async function readRecords() {
           if (!value && rows.size) throw new Error('项目数据库缺少索引，已停止读取');
           if (value && (!Number.isSafeInteger(value.revision) || value.revision < 1 || !Array.isArray(value.order) || new Set(value.order).size !== value.order.length || rows.size !== value.order.length || value.order.some(id => !rows.has(id)))) throw new Error('项目数据库索引不完整，已停止读取');
           const records = { rows, order: value?.order || [] };
-          const parsed = parseRecords(recordsJSON(records));
+          const parsed = parsePrepared(records);
           if (parsed.some((project, index) => project.id !== records.order[index])) throw new Error('项目数据库身份不一致，已停止读取');
-          resolve({ state: value, records });
+          resolve({ state: value, records, projects:parsed });
         } catch (error) { reject(error); }
       };
     });
@@ -99,18 +103,20 @@ export function createProjectRecordStore() {
       const loaded = await readRecords();
       revision = loaded.state?.revision || 0;
       persisted = loaded.records;
+      let initializedProjects=loaded.projects;
       // An existing empty index is authoritative too: never resurrect deleted projects.
       if (!loaded.state) {
         const raw = legacy.gitvault_repos_v8 ?? legacy.gitvault_repos_v7 ?? '[]';
         const prepared = prepareRecords(parseRecords(raw));
         await commit(prepared, legacy);
         const verified = await readRecords();
-        if (recordsJSON(verified.records) !== recordsJSON(prepared)) throw new Error('项目记录迁移校验失败，旧记录未清除');
+        if(verified.records.order.length!==prepared.order.length||prepared.order.some((id,i)=>verified.records.order[i]!==id||verified.records.rows.get(id)!==prepared.rows.get(id)))throw new Error('项目记录迁移校验失败，旧记录未清除');
+        initializedProjects=verified.projects;
       } else if (Object.keys(legacy).length) {
         // Keep a copy from an older open app before removing its localStorage value.
         await commit(persisted, legacy);
       }
-      return { records: persisted, projects: parseRecords(recordsJSON(persisted)) };
+      return { records: persisted, projects: initializedProjects };
     },
     async save(next: PreparedRecords) { await commit(next); },
   };

@@ -1,3 +1,5 @@
+import {diagnosticSecrets} from './diagnostics';
+import {createNativeProjectRecords,nativeRecordsBridge} from './nativeProjectRecords';
 import { isNativeAndroid, nativeBridge } from './nativePlatform';
 import { createProjectRecordStore, prepareRecords, recordsJSON, type PreparedRecords, type ProjectRecord } from './projectRecordStore';
 
@@ -8,6 +10,8 @@ let projects: readonly ProjectRecord[] = [];
 let prepared: PreparedRecords = { rows: new Map(), order: [] };
 let database = createProjectRecordStore();
 let initialized = false;
+let nativeDatabase:ReturnType<typeof createNativeProjectRecords>|undefined;
+let savedVault='';
 let recoverySource: string | undefined;
 let writeQueue: Promise<void> | undefined;
 let requested = 0, committed = 0;
@@ -20,8 +24,11 @@ function startWrites() {
       const version = requested;
       const wasFailed = !!storageFailure;
       const records = prepared;
-      if (isNativeAndroid()) await nativeBridge.writeVault({ value: JSON.stringify(values) });
-      else await database.save(records);
+      if (isNativeAndroid()) {
+        const vault=JSON.stringify(values);
+        if(nativeDatabase)await nativeDatabase.save(records);
+        if(vault!==savedVault){await nativeBridge.writeVault({value:vault});savedVault=vault;}
+      } else await database.save(records);
       committed = version;
       storageFailure = undefined;
       if (wasFailed) window.dispatchEvent(new CustomEvent('gitvault-storage-saved'));
@@ -31,39 +38,53 @@ function startWrites() {
     window.dispatchEvent(new CustomEvent('gitvault-secure-storage-error', { detail: failureMessage() }));
   }).finally(() => { writeQueue = undefined; if (committed !== requested && !storageFailure) startWrites(); });
 }
-export async function initializeCredentials() {
+export async function initializeCredentials(onProgress?:(stage:string)=>void) {
   if (writeQueue) await writeQueue;
   initialized = false;
+  nativeDatabase=undefined;
   requested = committed = 0;
   storageFailure = undefined;
   const legacy: Record<string, string> = {};
   for (const key of projectKeys) { const value = localStorage.getItem(key); if (value !== null) legacy[key] = value; }
   recoverySource=legacy.gitvault_repos_v8??legacy.gitvault_repos_v7;
   if (isNativeAndroid()) {
+    onProgress?.('读取安全存储');
     const stored = await nativeBridge.readVault();
+    savedVault=stored.value||'{}';
     values = stored.value ? JSON.parse(stored.value) : {};
     if (!values || typeof values !== 'object' || Array.isArray(values) || Object.values(values).some(value => typeof value !== 'string')) throw new Error('安全存储格式错误，原数据未清除');
     for (const key of keys) if (!(key in values)) { const value = localStorage.getItem(key); if (value !== null) values[key] = value; }
     if (Object.keys(legacy).length) values.gitvault_legacy_project_backup = JSON.stringify(legacy);
-    const raw = values.gitvault_repos_v8 ?? values.gitvault_repos_v7 ?? '[]';
-    recoverySource=raw;
-    projects = JSON.parse(raw);
-    prepared = prepareRecords(projects);
-    values.gitvault_repos_v8 = recordsJSON(prepared);
-    delete values.gitvault_repos_v7;
-    // The plugin resolves only after encrypted SharedPreferences.commit succeeds.
-    await nativeBridge.writeVault({ value: JSON.stringify(values) });
+    const legacyRaw=values.gitvault_repos_v8??values.gitvault_repos_v7;
+    const raw=legacyRaw??'[]';
+    recoverySource=legacyRaw;
+    if(stored.recordStorage===1){
+      nativeDatabase=createNativeProjectRecords();
+      const loaded=await nativeDatabase.initialize(()=>JSON.parse(raw),onProgress);
+      projects=loaded.projects;prepared=loaded.records;
+      delete values.gitvault_repos_v8;delete values.gitvault_repos_v7;
+      if(values.gitvault_legacy_project_backup){recoverySource=recordsJSON(prepared);await nativeRecordsBridge.archive(values.gitvault_legacy_project_backup);delete values.gitvault_legacy_project_backup;}
+      // Originals are removed from the credential vault only after verified encrypted persistence.
+    }else{
+      onProgress?.('解析项目记录');projects=JSON.parse(raw);prepared=prepareRecords(projects);
+      if(!values.gitvault_repos_v8)values.gitvault_repos_v8=recordsJSON(prepared);
+      delete values.gitvault_repos_v7;
+    }
+    const compact=JSON.stringify(values);
+    // A normal launch is read-only. Only migration/credential changes need a write.
+    if(compact!==savedVault){if(nativeDatabase)recoverySource=recordsJSON(prepared);onProgress?.('保存迁移结果');await nativeBridge.writeVault({value:compact});savedVault=compact;}
     // No project mirror in WebView storage, even when the records exceed its quota.
     localStorage.removeItem('gitvault_global_token');
   } else {
+    onProgress?.('读取项目数据库');
     database = createProjectRecordStore();
     const loaded = await database.initialize(legacy);
     projects = loaded.projects;
     prepared = loaded.records;
-    recoverySource=recordsJSON(prepared);
   }
   // Migration and read-back verification have completed; originals remain on failure.
   for (const key of projectKeys) localStorage.removeItem(key);
+  diagnosticSecrets([values.gitvault_global_token||'',...projects.flatMap(project=>{const row=project as any;return [row.token,row.uploadTarget?.token,row.forkTarget?.token,...Object.values(row.branchTargets||{}).map((binding:any)=>binding?.token)].filter(value=>typeof value==='string');})]);
   initialized = true;
   recoverySource=undefined;
 }
@@ -78,7 +99,7 @@ export function writeProjectRecords(next: readonly ProjectRecord[]) {
   projects = next;
   if (!changed && !storageFailure) return;
   prepared = nextRecords;
-  if (isNativeAndroid()) values.gitvault_repos_v8 = recordsJSON(prepared);
+  if (isNativeAndroid()&&!nativeDatabase) values.gitvault_repos_v8 = recordsJSON(prepared);
   requested++;
   startWrites();
 }

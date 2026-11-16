@@ -4,7 +4,7 @@ import { androidPlugin } from './androidPlugin';
 import type { CachedFile } from './localCache';
 
 interface GitVaultNative {
-  readVault(): Promise<{ value: string }>;
+  readVault(): Promise<{ value: string; recordStorage?:number }>;
   writeVault(options: { value: string }): Promise<void>;
   chooseDirectory(): Promise<{ uri: string }>;
   writeDocument(options: { directory: string; path: string; data: string }): Promise<void>;

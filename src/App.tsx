@@ -1,3 +1,4 @@
+import {appReady,diagnosticReport} from './utils/diagnostics';
 import { readMetadataSource } from './utils/projectProvenance';
 import {folderBridge, folderTask, usesNativeFolder, hydrateFile, saveFolderArchive, withFolderConfirmation, type FolderFiles} from './utils/nativeFolder';
 import {nativeGitCacheEnabled,saveNativeGitCache,clearNativeGitCache} from './utils/nativeGitCache';
@@ -188,6 +189,9 @@ function publicProjectRecord({ token, uploadTarget, branchTargets, forkTarget, .
 function escapeHtml(value: string) { return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!)); }
 
 export default function App() {
+  useEffect(()=>{appReady();},[]);
+  const [diagnosticExporting,setDiagnosticExporting]=useState(false);
+  const [visibleProjectCount,setVisibleProjectCount]=useState(50);
   const [repos, setRepos] = useState<TrackedRepo[]>(() => readProjectRecords<TrackedRepo>().map(restoreImplicitSource));
 
   // Global settings state
@@ -217,6 +221,7 @@ export default function App() {
   const [searchFilter, setSearchFilter] = useState('');
   const [projectTypeFilter,setProjectTypeFilter]=useState('all');
   const [selectedTagFilter, setSelectedTagFilter] = useState<string>('all');
+  useEffect(()=>{setVisibleProjectCount(50);},[searchFilter,projectTypeFilter,selectedTagFilter]);
 
   // Batch Management state for Projects (仓库已有项目)
   const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
@@ -2826,11 +2831,11 @@ export default config;
     return { added, removed, modified };
   };
 
-  const allTags = Array.from(new Set(repos.flatMap(r => r.tags)));
+  const allTags = useMemo(()=>Array.from(new Set(repos.flatMap(r => r.tags))),[repos]);
 
   const openProjectList=(filter:string)=>{setSearchFilter('');setSelectedTagFilter('all');setProjectTypeFilter(filter);setSelectedProjectIds([]);setCurrentView('projects');};
   // Global search filtering across Project Name, Owner, Remark, Description, and Tags
-  const filteredRepos = repos.filter(repo => {
+  const filteredRepos = useMemo(()=>repos.filter(repo => {
     const source=sourceOf(repo),targets=projectTargets(repo);
     const q=searchFilter.trim().toLowerCase();
     const matchSearch=[repo.repo,repo.owner,repo.url,`${repo.owner}/${repo.repo}`,source.url,`${source.owner}/${source.repo}`,repo.branch,source.branch,repo.remark,repo.description,repo.repoMeta?.description,...repo.tags,...targets.map(target=>`https://github.com/${target.owner}/${target.repo}`)].filter(Boolean).join(' ').toLowerCase().includes(q);
@@ -2839,9 +2844,9 @@ export default config;
     const matchType=projectTypeFilter==='all'||projectTypeFilter==='private-synced'&&isPrivateSynced(repo)||projectTypeFilter==='updates'&&needsProjectUpdate(repo)||projectTypeFilter==='bound'&&bound||projectTypeFilter==='unbound'&&!bound||projectTypeFilter==='pending'&&(repo.accountState==='pending'||!!repo.creationReservation||!!repo.pendingSwitch)||projectTypeFilter==='fork'&&fullFork||projectTypeFilter==='upload'&&bound&&!fullFork;
     const matchTag = selectedTagFilter === 'all' || repo.tags.includes(selectedTagFilter);
     return matchSearch && matchTag && matchType;
-  });
+  }),[repos,searchFilter,projectTypeFilter,selectedTagFilter]);
 
-  const quickProjectSelections = projectSelections(filteredRepos, repos);
+  const quickProjectSelections = useMemo(()=>projectSelections(filteredRepos, repos),[filteredRepos,repos]);
   const allVisibleProjectsSelected = filteredRepos.length > 0 && filteredRepos.every(repo => selectedProjectIds.includes(repo.id));
 
   const activeTree = viewingBackup ? viewingBackup.tree : (activeRepo?.tree || []);
@@ -3561,7 +3566,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               </div>
             ) : (
               <div className="flex flex-col gap-4">
-                {filteredRepos.map(repo => {
+                {filteredRepos.slice(0,visibleProjectCount).map(repo => {
                   const isSelected = selectedProjectIds.includes(repo.id);
 
                   return (
@@ -3770,6 +3775,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 })}
               </div>
             )}
+          {filteredRepos.length>visibleProjectCount&&<div className="flex flex-wrap items-center justify-center gap-3 text-xs text-[#7A7367]"><span>已显示 {Math.min(visibleProjectCount,filteredRepos.length)} / {filteredRepos.length} 个项目；批量选择仍覆盖全部筛选结果</span><button type="button" onClick={()=>setVisibleProjectCount(count=>count+50)} className="px-3 py-2 border border-[#DFD8CE] rounded-xl bg-white text-[#5D6F5A]">加载更多项目</button></div>}
           </div>
         )}
 
@@ -4754,6 +4760,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
         <div role="dialog" aria-modal="true" aria-label="操作日志" className="bg-white border border-[#E2DBD0] rounded-3xl max-w-2xl w-full p-5 shadow-xl flex flex-col gap-3 max-h-[90dvh] overflow-y-auto">
           <div className="flex flex-wrap justify-between items-center gap-2"><h3 className="text-base font-bold font-serif text-[#2B2723]">操作日志</h3><button type="button" onClick={() => setIsLogOpen(false)} className="px-3 py-2 bg-[#EFECE6] rounded-xl text-xs">关闭日志</button></div>
           <p className="text-xs text-[#7A7367]">本设备保存最近 1000 条记录，包含失败原因。导出内容会隐藏已知凭证；日志不会写入项目仓库。</p>
+          <p className="text-xs text-[#7A7367]">闪退或启动缓慢时，请导出诊断报告：包含最后任务阶段、启动耗时及可获取的系统退出信息，不包含项目源码。</p>
+          <button type="button" disabled={diagnosticExporting} onClick={async()=>{setDiagnosticExporting(true);try{await saveDownload(new Blob([JSON.stringify(await diagnosticReport(),null,2)],{type:'application/json'}),'gitvault-diagnostics.json');}catch(error){appDialog.notify('诊断导出失败：'+(error as Error).message);}finally{setDiagnosticExporting(false);}}} className="self-start px-3 py-2 border border-[#DFD8CE] rounded-xl bg-white text-[#5D6F5A] disabled:opacity-40">{diagnosticExporting?'正在生成诊断…':'导出诊断报告'}</button>
           {logStorageError && <p role="alert" className="text-xs text-[#8C5D54]">{logStorageError}</p>}
           <label className="text-xs">显示记录<select aria-label="日志筛选" value={logFilter} onChange={event => setLogFilter(event.target.value)} className="ml-2 border border-[#DFD8CE] rounded-lg p-2"><option value="all">全部</option><option value="failed">失败与未完成</option></select></label>
           <div className="batch-results">{operationLogs.filter(entry => logFilter === 'all' || ['error','partial','cancelled'].includes(entry.status)).map(entry => <div key={entry.id} className="batch-result text-xs">

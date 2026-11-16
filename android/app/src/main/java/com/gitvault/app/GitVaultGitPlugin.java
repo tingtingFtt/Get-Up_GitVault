@@ -27,9 +27,10 @@ public class GitVaultGitPlugin extends Plugin {
     private final Map<String,Long> lastProgress=new HashMap<>();
     private static final class Staged {
         final File folder;final GitObjectCache.Lease lease;final Git git;final GitSnapshotStore store;final ManagedFolderStore.ReadBatch reader;long preparationMs;boolean invalidCache;
-        Staged(GitObjectCache.Lease lease,AtomicBoolean stop,android.content.Context context)throws Exception{this.lease=lease;folder=lease.folder;git=Git.init().setBare(true).setDirectory(folder).call();store=new GitSnapshotStore(git.getRepository(),folder,stop);reader=new ManagedFolderStore(context).readBatch();git.getRepository().getConfig().setString("gc",null,"auto","0");}
+        Staged(GitObjectCache.Lease lease,AtomicBoolean stop,android.content.Context context)throws Exception{this.lease=lease;folder=lease.folder;git=Git.init().setBare(true).setDirectory(folder).call();store=new GitSnapshotStore(git.getRepository(),folder,stop);reader=new ManagedFolderStore(context).readBatch();git.getRepository().getConfig().setString("gc",null,"auto","0");GitMemoryBudget.configure(git.getRepository().getConfig());}
     }
     private Staged createSession(String id,PluginCall call)throws Exception{
+        GitMemoryBudget.install();
         GitObjectCache cache=new GitObjectCache(getContext().getCacheDir());
         GitObjectCache.Lease lease;
         try{lease=cache.acquire(readRepositoryId(call),call.getBoolean("retainObjects",false));}
@@ -40,8 +41,10 @@ public class GitVaultGitPlugin extends Plugin {
         catch(Exception error){if(staged!=null){staged.git.close();}remove(folder);throw error;}
     }
     private void releaseSession(String id){Staged staged=sessions.remove(id);if(staged!=null){try{staged.store.close();staged.reader.close();}catch(Exception ignored){}staged.git.close();try{new GitObjectCache(getContext().getCacheDir()).release(staged.invalidCache?new GitObjectCache.Lease(staged.folder,staged.lease.repositoryId,false,false):staged.lease);}catch(IOException ignored){remove(staged.folder);}}cancelled.remove(id);lastProgress.remove(id);}
-    @Override public void load(){File[] leftovers=getContext().getCacheDir().listFiles((dir,name)->name.startsWith("gitvault-session-"));if(leftovers!=null)for(File file:leftovers)remove(file);}
-    @Override protected void handleOnDestroy(){for(AtomicBoolean stop:cancelled.values())stop.set(true);io.execute(()->{for(String id:new ArrayList<>(sessions.keySet()))releaseSession(id);});for(GitNetwork network:networkTasks.values())cancelIo.execute(network::disconnect);io.shutdown();cancelIo.shutdown();}
+    private static final long PROCESS_START=System.currentTimeMillis();
+    @Override public void load(){java.util.concurrent.ExecutorService cleanup=Executors.newSingleThreadExecutor();cleanup.execute(()->{try{File[] leftovers=getContext().getCacheDir().listFiles((dir,name)->name.startsWith("gitvault-session-")&&new File(dir,name).lastModified()<PROCESS_START);if(leftovers!=null)for(File file:leftovers)remove(file);CrashDiagnostics.event("startup-cleanup",new org.json.JSONObject());}finally{cleanup.shutdown();}});}
+    public void requestStopAll(){for(AtomicBoolean stop:cancelled.values())stop.set(true);for(GitNetwork network:networkTasks.values())cancelIo.execute(network::disconnect);}
+    @Override protected void handleOnDestroy(){requestStopAll();io.execute(()->{for(String id:new ArrayList<>(sessions.keySet()))releaseSession(id);});for(GitNetwork network:networkTasks.values())cancelIo.execute(network::disconnect);io.shutdown();cancelIo.shutdown();}
     @PluginMethod public void prepareUpload(PluginCall call){
         String id=call.getString("id","");if(id.isEmpty()||cancelled.putIfAbsent(id,new AtomicBoolean())!=null){call.reject("Git 任务 ID 无效");return;}
         io.execute(()->{try{

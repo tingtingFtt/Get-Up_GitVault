@@ -35,6 +35,9 @@ import javax.crypto.spec.GCMParameterSpec;
 @CapacitorPlugin(name = "GitVaultNative")
 public class GitVaultNativePlugin extends Plugin {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService recordsIo = Executors.newSingleThreadExecutor();
+    private EncryptedProjectRecords records;
+    private static final long PROCESS_START=System.currentTimeMillis();
     private static final String KEY = "gitvault.credentials.v1";
     private final Map<String,java.util.concurrent.atomic.AtomicBoolean> folderTasks=new ConcurrentHashMap<>();
     private final Map<String, File> folderParts = new ConcurrentHashMap<>();
@@ -43,11 +46,18 @@ public class GitVaultNativePlugin extends Plugin {
     private final Map<String, String> mimes = new ConcurrentHashMap<>();
 
     @Override public void load() {
-        File partial = new File(getContext().getCacheDir(), "folder-parts");File[] parts=partial.listFiles();if(parts!=null)for(File file:parts)file.delete();
-        File folder = new File(getContext().getCacheDir(), "exports");
-        File[] stale = folder.listFiles();
-        if (stale != null) for (File file : stale) file.delete();
+        // Only files from an earlier process; never remove active export/staging files.
+        java.util.concurrent.ExecutorService cleanup=Executors.newSingleThreadExecutor();
+        cleanup.execute(()->{try{for(String name:new String[]{"folder-parts","exports"}){File[] files=new File(getContext().getCacheDir(),name).listFiles();if(files!=null)for(File file:files)if(file.lastModified()<PROCESS_START)file.delete();}}finally{cleanup.shutdown();}});
     }
+    private EncryptedProjectRecords records()throws Exception{if(records==null)records=new EncryptedProjectRecords(getContext(),key());return records;}
+    @PluginMethod public void recordIndex(PluginCall call){recordsIo.execute(()->{try{call.resolve(JSObject.fromJSONObject(records().index()));}catch(Exception error){call.reject("读取加密项目索引失败",error);}});}
+    @PluginMethod public void readRecords(PluginCall call){recordsIo.execute(()->{try{call.resolve(JSObject.fromJSONObject(records().read(call.getData().getLong("revision"),call.getInt("offset",0))));}catch(Exception error){call.reject("读取加密项目记录失败",error);}});}
+    @PluginMethod public void beginRecordMigration(PluginCall call){recordsIo.execute(()->{try{call.resolve(JSObject.fromJSONObject(records().beginMigration()));}catch(Exception error){call.reject("无法开始项目迁移",error);}});}
+    @PluginMethod public void stageRecordMigration(PluginCall call){recordsIo.execute(()->{try{records().stageMigration(call.getString("id",""),call.getArray("rows",new com.getcapacitor.JSArray()));call.resolve();}catch(Exception error){call.reject("迁移批次未完成，旧记录保留",error);}});}
+    @PluginMethod public void finishRecordMigration(PluginCall call){recordsIo.execute(()->{try{call.resolve(JSObject.fromJSONObject(records().finishMigration(call.getString("id",""),call.getArray("order",new com.getcapacitor.JSArray()))));}catch(Exception error){call.reject("迁移未发布，旧记录保留",error);}});}
+    @PluginMethod public void archiveRecordBackup(PluginCall call){recordsIo.execute(()->{try{records().archive(call.getString("value",""));call.resolve();}catch(Exception error){call.reject("旧记录备份未完成，原备份保留",error);}});}
+    @PluginMethod public void commitRecords(PluginCall call){recordsIo.execute(()->{try{call.resolve(JSObject.fromJSONObject(records().commit(call.getData().getLong("revision"),call.getArray("order",new com.getcapacitor.JSArray()),call.getArray("rows",new com.getcapacitor.JSArray()),call.getArray("removed",new com.getcapacitor.JSArray()))));}catch(Exception error){call.reject("加密项目保存失败；未覆盖较新记录或清理源码："+error.getMessage(),error);}});}
     private SecretKey key() throws Exception {
         KeyStore store = KeyStore.getInstance("AndroidKeyStore"); store.load(null);
         if (store.containsAlias(KEY)) return (SecretKey) store.getKey(KEY, null);
@@ -67,7 +77,7 @@ public class GitVaultNativePlugin extends Plugin {
                     cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(preferences.getString("iv", ""), Base64.NO_WRAP)));
                     value = new String(cipher.doFinal(Base64.decode(encrypted, Base64.NO_WRAP)), StandardCharsets.UTF_8);
                 }
-                JSObject result = new JSObject(); result.put("value", value); call.resolve(result);
+                JSObject result = new JSObject(); result.put("value", value); result.put("recordStorage",1); call.resolve(result);
             } catch (Exception exception) { call.reject("无法读取安全存储；原数据未清除", exception); }
         });
     }
@@ -213,6 +223,7 @@ public class GitVaultNativePlugin extends Plugin {
         });
     }
     @PluginMethod public void abortDownload(PluginCall call) { discard(call.getString("id", "")); call.resolve(); }
-    @Override protected void handleOnDestroy() { io.shutdown(); }
+    public void requestStopAll(){for(java.util.concurrent.atomic.AtomicBoolean stop:folderTasks.values())stop.set(true);}
+    @Override protected void handleOnDestroy() { requestStopAll();io.shutdown();recordsIo.execute(()->{if(records!=null)records.close();});recordsIo.shutdown(); }
     private void discard(String id) { File file = downloads.remove(id); if (file != null) file.delete(); names.remove(id); mimes.remove(id); }
 }

@@ -20,7 +20,10 @@ export function checkpoint(task: Omit<SavedTask, 'updatedAt'>) {
   // Explicit field selection prevents transient Tokens/errors/payloads entering the journal.
   const items = task.items.map(({ id, label, name, repo, url, remark, status, branch, source, targetId, sha, targetOwner, targetRepo }) => ({ id, label, name, repo, url, remark, status, branch, source, targetId, sha, targetOwner, targetRepo }));
   const entry: SavedTask = { kind: task.kind, action: task.action, scope: task.scope, purge: task.purge, projectId: task.projectId, prefix: task.prefix, items, updatedAt: new Date().toISOString() };
-  localStorage.setItem(KEY, JSON.stringify([...readTasks().filter(item => item.kind !== task.kind), entry]));
+  const previous=readTasks(),old=previous.find(item=>item.kind===task.kind);
+  // Progress text changes do not change the recoverable queue. Avoid rewriting it.
+  if(old&&JSON.stringify({...old,updatedAt:undefined})===JSON.stringify({...entry,updatedAt:undefined}))return;
+  localStorage.setItem(KEY, JSON.stringify([...previous.filter(item => item.kind !== task.kind), entry]));
   window.dispatchEvent(new CustomEvent('gitvault-tasks-changed'));
 }
 export function forgetTask(kind: TaskKind) {

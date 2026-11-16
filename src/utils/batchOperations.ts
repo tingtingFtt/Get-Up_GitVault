@@ -1,3 +1,4 @@
+import {diagnosticTask,diagnosticTaskResult} from './diagnostics';
 import {withOperationSignal} from './operation';
 export interface ProjectBatchItem {
   id: string;
@@ -21,6 +22,7 @@ export async function runProjectBatch(items: ProjectBatchItem[], options: {
     if (queue[i].status !== 'pending') continue;
     if (options.signal.aborted) break;
     queue[i] = { ...queue[i], status: 'running', message: '正在处理…' }; emit();
+    diagnosticTask(queue[i].label,'','批量任务');
     let failure: unknown,lastProgress=0,lastActivity=performance.now();
     const child=new AbortController(),abort=()=>child.abort(options.signal.reason);
     options.signal.addEventListener('abort',abort,{once:true});if(options.signal.aborted)abort();
@@ -48,6 +50,7 @@ export async function runProjectBatch(items: ProjectBatchItem[], options: {
       queue[i] = { ...queue[i], status: options.signal.aborted ? 'cancelled' : 'error', message: options.signal.aborted ? '已取消，可重试' : (error as Error).message || '处理失败' };
     }
     finally{clearInterval(timer);options.signal.removeEventListener('abort',abort);if(typeof window!=='undefined'){window.removeEventListener('gitvault-progress',progress);window.removeEventListener('gitvault-transfer-activity',activity);}}
+    diagnosticTaskResult(queue[i].status);
     emit(); options.onResult?.(queue[i], failure);
   }
   for (let i = 0; i < queue.length; i++) if (queue[i].status === 'pending') { queue[i] = { ...queue[i], status: 'cancelled', message: '未执行，可重试' }; options.onResult?.(queue[i]); }

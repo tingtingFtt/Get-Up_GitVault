@@ -148,7 +148,7 @@ test('failed startup migration exposes a complete backup without nested credenti
 test('failed native encryption migration exposes the original project metadata for recovery',async()=>{
  Capacitor.isNativePlatform=()=>true;Capacitor.getPlatform=()=> 'android';Capacitor.isPluginAvailable=()=>true;
  const original=[small('native',{token:'secret',forkTarget:{id:77,token:'fork-secret'}})];
- nativeBridge.readVault=async()=>({value:list({gitvault_repos_v8:list(original)})});nativeBridge.writeVault=async()=>{throw new Error('disk full');};
+ nativeBridge.readVault=async()=>({value:list({gitvault_repos_v7:list(original)})});nativeBridge.writeVault=async()=>{throw new Error('disk full');};
  await assert.rejects(initializeCredentials,/disk full/);const raw=readProjectRecoveryBackup()!;
  assert.equal(JSON.parse(raw).projects[0].forkTarget.id,77);assert.ok(!raw.includes('secret'));
 });
