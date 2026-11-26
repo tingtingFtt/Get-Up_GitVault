@@ -381,11 +381,12 @@ export const githubClient = {
     let head;
     try{head=await branchStatus.read(owner,repo,branch,token,signal,options.force);}
     catch(error){
-      if(!(error instanceof GitHubError)||error.status!==404||!options.expectedId)throw error;
+      if(!(error instanceof GitHubError)||![301,302,307,308,404].includes(error.status)||!options.expectedId)throw error;
       const identity=await githubClient.repository(owner,repo,token,options.expectedId,signal);
-      if(identity.owner.toLowerCase()===owner.toLowerCase()&&identity.repo.toLowerCase()===repo.toLowerCase())throw error;
+      if(identity.owner.toLowerCase()===owner.toLowerCase()&&identity.repo.toLowerCase()===repo.toLowerCase())throw Object.assign(error,{sourceCheckKind:error.status===404?'branch':undefined});
       resolved={owner:identity.owner,repo:identity.repo,repositoryId:identity.id,url:identity.htmlUrl};
-      head=await branchStatus.read(identity.owner,identity.repo,branch,token,signal,true);
+      try{head=await branchStatus.read(identity.owner,identity.repo,branch,token,signal,true);}
+      catch(branchError){if(branchError instanceof GitHubError&&branchError.status===404)Object.assign(branchError,{sourceCheckKind:'branch'});throw branchError;}
     }
     return {hasUpdate:head.sha!==currentSha,latestSha:head.sha,latestCommit:{sha:head.sha,message:'',author:'',date:''},checkedAt:head.checkedAt,cached:head.cached,resolved};
   },
@@ -397,7 +398,7 @@ export const githubClient = {
       let meta;
       try{meta=await json(root(owner, repo), token, { cache: 'no-store' }, signal);}
       catch(error){
-        if(!(error instanceof GitHubError)||![301,302,404].includes(error.status)||!Number.isSafeInteger(expectedId)||!expectedId||expectedId<=0)throw error;
+        if(!(error instanceof GitHubError)||![301,302,307,308,404].includes(error.status)||!Number.isSafeInteger(expectedId)||!expectedId||expectedId<=0)throw error;
         try{meta=await json(`/repositories/${expectedId}`,token,{cache:'no-store'},signal);}
         catch(lookupError){if(lookupError instanceof GitHubError&&lookupError.status===404)throw error;throw lookupError;}
       }

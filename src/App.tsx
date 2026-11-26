@@ -26,6 +26,7 @@ import { parseImportLinks, type ImportLink } from './utils/importLinks';
 import {reportProgress,cooperate} from './utils/operation';
 import { runProjectBatch, type ProjectBatchItem } from './utils/batchOperations';
 import {runStatusChecks} from './utils/statusChecks';
+import {activeUpdateCheckIssue,updateCheckFailure,updateCheckIssueLabel,updateCheckSourceKey,scheduledUpdateCheck,type UpdateCheckIssue} from './utils/updateCheckIssue';
 import { importCandidates, compareImportTrees, sameRepository, candidateExclusion, isExcludedCandidate, type CandidateExclusion, type ImportCandidate } from './utils/importAssociation';
 import { projectSelections } from './utils/projectSelection';
 import { projectTargets, detachedTarget, sameTarget, targetHealthOf, targetKey, type TargetHealth, type TargetIdentity } from './utils/targetLifecycle';
@@ -89,6 +90,7 @@ interface TrackedRepo {
   lastCheckedAt?: string;
   lastCheckAttemptAt?: string;
   checkError?: string;
+  updateCheckIssue?: UpdateCheckIssue;
   checkCancelled?: boolean;
   upstreamStatus?: {sha?:string;hasUpdate?:boolean;checkedAt?:string;error?:string};
   latestCommitSha: string;
@@ -220,8 +222,9 @@ export default function App() {
   // Search & Filter (Projects and Dashboard)
   const [searchFilter, setSearchFilter] = useState('');
   const [projectTypeFilter,setProjectTypeFilter]=useState('all');
+  const [sourceStatusFilter,setSourceStatusFilter]=useState<'normal'|'issues'|'all'>('normal');
   const [selectedTagFilter, setSelectedTagFilter] = useState<string>('all');
-  useEffect(()=>{setVisibleProjectCount(50);},[searchFilter,projectTypeFilter,selectedTagFilter]);
+  useEffect(()=>{setVisibleProjectCount(50);},[searchFilter,projectTypeFilter,selectedTagFilter,sourceStatusFilter]);
 
   // Batch Management state for Projects (仓库已有项目)
   const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
@@ -1209,7 +1212,7 @@ export default config;
     const interval=setInterval(()=>{
       if(document.hidden||statusMutating.current||statusBackgroundActive.current||controller.signal.aborted)return;
       const now=Date.now();
-      const due=reposRef.current.filter(repo=>repo.checkInterval>0&&!checkingRepos.current.has(repo.id)&&now-(new Date(repo.lastCheckAttemptAt||repo.lastCheckedAt||0).getTime()||0)>=Math.max(repo.checkInterval*60000,repo.checkError?60000:0));
+      const due=reposRef.current.filter(repo=>!checkingRepos.current.has(repo.id)&&scheduledUpdateCheck(repo,now));
       statusBackgroundActive.current=true;
       void runStatusChecks(due,{signal:controller.signal,run:async repo=>{await checkSingleRepoStatus(repo.id,true,{signal:controller.signal});}}).catch(()=>{}).finally(()=>{statusBackgroundActive.current=false;});
     },30000);
@@ -1256,7 +1259,7 @@ export default config;
       patchRepo(repo.id, { primarySource: repo.primarySource ? {...repo.primarySource,branch:data.branch} : undefined, branch: logicalBranch, url: repo.origin ? repo.url : `https://github.com/${source.owner}/${source.repo}`, origin: repo.origin ? { ...repo.origin, branch: logicalBranch, repositoryId: repo.primarySource ? repo.origin.repositoryId : data.repositoryId || repo.origin.repositoryId } : undefined,
         repositoryId: repo.origin ? repo.repositoryId : data.repositoryId, latestCommitSha: data.latestCommitSha, commitMessage: data.commitMessage, commitAuthor: data.commitAuthor, commitDate: data.commitDate, tree: data.tree,
         repoMeta: { ...data.repoMeta, htmlUrl: repo.origin ? repo.repoMeta.htmlUrl : data.repoMeta.htmlUrl },
-        backups: [old, ...current.backups.map(item => ({ ...item, branch: item.branch || sourceOf(repo).branch }))], branchTargets, uploadTarget: nextTarget, branchUploadPending: !!nextTarget && !Object.hasOwn(branchTargets, logicalBranch), remoteSnapshot: undefined,
+        backups: [old, ...current.backups.map(item => ({ ...item, branch: item.branch || sourceOf(repo).branch }))], updateCheckIssue:undefined,checkError:undefined,checkCancelled:false,branchTargets, uploadTarget: nextTarget, branchUploadPending: !!nextTarget && !Object.hasOwn(branchTargets, logicalBranch), remoteSnapshot: undefined,
         forkTarget: repo.forkTarget ? { ...repo.forkTarget, branch: data.branch } : undefined,
         hasUpdate: false, latestRemoteCommit: undefined, isCachePurged: false, cachedFilesCount: data.files.length, lastSyncedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString() });
       if(repo.primarySource && nextTarget){
@@ -1273,9 +1276,10 @@ export default config;
 
   // Status checks read only the tracked branch head. Target health and account
   // registration belong to explicit target checks / writes, not this fast path.
-  const checkSingleRepoStatus = async (repoId:string,isBackground=false,options:{signal?:AbortSignal;force?:boolean;upstream?:boolean}={}):Promise<'updated'|'latest'|'failed'|'cancelled'|'skipped'> => {
+  const checkSingleRepoStatus = async (repoId:string,isBackground=false,options:{signal?:AbortSignal;force?:boolean;upstream?:boolean;includeIssues?:boolean}={}):Promise<'updated'|'latest'|'failed'|'cancelled'|'skipped'> => {
     const repo=reposRef.current.find(item=>item.id===repoId);
     if(!repo||checkingRepos.current.has(repoId))return 'skipped';
+    if(isBackground&&!options.includeIssues&&!options.upstream&&activeUpdateCheckIssue(repo))return 'skipped';
     if(!isBackground){if(statusMutating.current)return 'skipped';startOperation();setLoadingText(`正在快速检测 ${repo.repo} 的更新…`);}
     const signal=options.signal||operationSignal();if(signal.aborted)return 'cancelled';
     checkingRepos.current.add(repoId);setStatusChecking([...checkingRepos.current]);
@@ -1290,7 +1294,7 @@ export default config;
       return JSON.stringify([now.owner.toLowerCase(),now.repo.toLowerCase(),now.branch,now.repositoryId,current.latestCommitSha])===context?current:undefined;
     };
     try{
-      const data=await githubClient.checkUpdate(source.owner,source.repo,source.branch,baseline,token,{signal,force:options.force,expectedId:source.repositoryId});
+      const data=await githubClient.checkUpdate(source.owner,source.repo,source.branch,baseline,token,{signal,force:options.force||!!activeUpdateCheckIssue(repo),expectedId:source.repositoryId});
       signal.throwIfAborted();const current=stillCurrent();if(!current)return 'skipped';
       let repaired=current;
       if(data.resolved){
@@ -1299,11 +1303,11 @@ export default config;
         else repaired={...current,primarySource:resolved};
       }
       const checkedAt=data.checkedAt||new Date().toISOString();
-      patchRepo(repoId,{...repaired,...(options.upstream?{upstreamStatus:{sha:data.latestSha,hasUpdate:baseline?data.hasUpdate:undefined,checkedAt,error:undefined}}:{hasUpdate:data.hasUpdate,latestRemoteCommit:data.latestCommit,lastCheckedAt:checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,checkCancelled:false})});
+      patchRepo(repoId,{...repaired,...(options.upstream?{upstreamStatus:{sha:data.latestSha,hasUpdate:baseline?data.hasUpdate:undefined,checkedAt,error:undefined}}:{hasUpdate:data.hasUpdate,latestRemoteCommit:data.latestCommit,lastCheckedAt:checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,updateCheckIssue:undefined,checkCancelled:false})});
       return data.hasUpdate?'updated':'latest';
     }catch(error){
       const cancelled=isOperationCancelled(error,signal),current=stillCurrent();
-      if(current)patchRepo(repoId,options.upstream?{upstreamStatus:{...current.upstreamStatus,error:cancelled?'已取消检测':(error as Error).message}}:{lastCheckAttemptAt:new Date().toISOString(),checkError:cancelled?undefined:(error as Error).message,checkCancelled:cancelled});
+      if(current)patchRepo(repoId,options.upstream?{upstreamStatus:{...current.upstreamStatus,error:cancelled?'已取消检测':(error as Error).message}}:{lastCheckAttemptAt:new Date().toISOString(),checkError:cancelled?undefined:(error as Error).message,updateCheckIssue:(!cancelled&&updateCheckFailure(error,source,undefined,[token]))||activeUpdateCheckIssue(current),checkCancelled:cancelled});
       logOperation('检测更新',cancelled?'cancelled':'error',repo,(error as Error).message,options.upstream?'轻量检测原始上游':'轻量检测跟踪分支',error);
       if(!isBackground&&!cancelled)appDialog.notify('检测失败：'+(error as Error).message);
       return cancelled?'cancelled':'failed';
@@ -1312,13 +1316,16 @@ export default config;
 
   const checkAllUpdates = async (force=false) => {
     if(statusMutating.current)return;
-    startOperation();const signal=operationSignal(),items=[...reposRef.current];
+    const issuesOnly=sourceStatusFilter==='issues',excluded=issuesOnly?0:reposRef.current.filter(repo=>!!activeUpdateCheckIssue(repo)).length;
+    const items=(issuesOnly?filteredRepos:reposRef.current).filter(repo=>issuesOnly?!!activeUpdateCheckIssue(repo):!activeUpdateCheckIssue(repo));
+    if(!items.length){appDialog.notify(issuesOnly?'当前分类没有待复查的来源异常项目':`没有可常规检测的项目；已跳过来源异常 ${excluded} 个，可切换分类复查。`);return;}
+    startOperation();const signal=operationSignal();
     const counts={updated:0,latest:0,failed:0,cancelled:0,skipped:0};
     try{
       setLoadingText(`正在快速检测 0/${items.length} 个项目…`);
-      const result=await runStatusChecks(items,{signal,run:async repo=>{counts[await checkSingleRepoStatus(repo.id,true,{signal,force})]++;},onProgress:(done,total)=>{if(!signal.aborted)setLoadingText(`快速检测 ${done}/${total} · 有更新 ${counts.updated} · 失败 ${counts.failed}；可取消`);}});
+      const result=await runStatusChecks(items,{signal,run:async repo=>{counts[await checkSingleRepoStatus(repo.id,true,{signal,force:force||issuesOnly,includeIssues:issuesOnly})]++;},onProgress:(done,total)=>{if(!signal.aborted)setLoadingText(`快速检测 ${done}/${total} · 有更新 ${counts.updated} · 失败 ${counts.failed}；可取消`);}});
       await flushCredentials();
-      appDialog.notify(`${result.cancelled?'检测已取消，已完成结果保留':'检测完成'}：有更新 ${counts.updated} · 最新 ${counts.latest} · 失败 ${counts.failed} · 未执行 ${items.length-result.done+counts.skipped}`);
+      appDialog.notify(`${result.cancelled?'检测已取消，已完成结果保留':'检测完成'}：有更新 ${counts.updated} · 最新 ${counts.latest} · 失败 ${counts.failed} · 未执行 ${items.length-result.done+counts.skipped} · 已跳过来源异常 ${excluded}`);
     }catch(error){appDialog.notify('检测结果保存未完成：'+(error as Error).message);}
     finally{setIsLoading(false);}
   };
@@ -2234,14 +2241,19 @@ export default config;
       const getSource=()=>syncOrigin?sourceOf(repo):pullSourceOf(repo);
       const getToken=()=>(repo.primarySource&&!syncOrigin?authToken||repo.uploadTarget?.token||globalToken||repo.token:repo.token||authToken||globalToken)||'';
       let source=getSource(),token=getToken();
-      let status=await githubClient.checkUpdate(source.owner,source.repo,source.branch,repo.latestCommitSha,token,{signal,force:true,expectedId:source.repositoryId});
+      const readStatus=async()=>{
+        const checkingSource={...source};
+        try{return await githubClient.checkUpdate(checkingSource.owner,checkingSource.repo,checkingSource.branch,repo.latestCommitSha,token,{signal,force:true,expectedId:checkingSource.repositoryId});}
+        catch(error){const current=reposRef.current.find(item=>item.id===repo.id);if(current&&!isOperationCancelled(error,signal)&&updateCheckSourceKey(pullSourceOf(current))===updateCheckSourceKey(checkingSource))patchRepo(repo.id,{checkError:(error as Error).message,lastCheckAttemptAt:new Date().toISOString(),updateCheckIssue:updateCheckFailure(error,checkingSource,undefined,[token])||activeUpdateCheckIssue(current)});throw error;}
+      };
+      let status=await readStatus();
       if(status.resolved){
         const current=reposRef.current.find(item=>item.id===repo.id)||repo,resolved={...source,...status.resolved};
         repo=current.primarySource&&!syncOrigin?{...current,primarySource:resolved}:current.origin?{...current,origin:resolved}:{...current,...resolved};patchRepo(repo.id,repo);source=getSource();
       }
       const hasMaintenance=!!(repo.pendingSwitch||repo.creationReservation||repo.cloudPending?.length||repo.cloudRemovals?.length||repo.accountState==='pending');
       const pendingUpload=!!(repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha));
-      const checkPatch={hasUpdate:status.hasUpdate,latestRemoteCommit:status.hasUpdate?status.latestCommit:undefined,lastCheckedAt:status.checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,checkCancelled:false};
+      const checkPatch={hasUpdate:status.hasUpdate,latestRemoteCommit:status.hasUpdate?status.latestCommit:undefined,lastCheckedAt:status.checkedAt,lastCheckAttemptAt:new Date().toISOString(),checkError:undefined,updateCheckIssue:updateCheckSourceKey(pullSourceOf(repo))===updateCheckSourceKey(source)?undefined:repo.updateCheckIssue,checkCancelled:false};
       patchRepo(repo.id,checkPatch);repo={...repo,...checkPatch};
       if(!status.hasUpdate&&!hasMaintenance&&!pendingUpload&&!(repo.forkScope==='full'&&repo.forkTarget))return repo.primarySource&&!syncOrigin?'固定主仓库当前已是最新版本；原始来源通过上游同步入口处理。':'当前已是最新版本';
       const before=JSON.stringify([source.owner,source.repo,source.branch]);
@@ -2251,7 +2263,7 @@ export default config;
         const auth=repo.uploadTarget?.token||authToken||globalToken||repo.token;if(!auth)throw new Error('请填写 GitHub Token');return syncFullProject(repo,auth);
       }
       source=getSource();token=getToken();
-      if(JSON.stringify([source.owner,source.repo,source.branch])!==before)status=await githubClient.checkUpdate(source.owner,source.repo,source.branch,repo.latestCommitSha,token,{signal,force:true,expectedId:source.repositoryId});
+      if(JSON.stringify([source.owner,source.repo,source.branch])!==before)status=await readStatus();
       if(repo.uploadTarget||repo.privateRepoUrl)await boundTarget(repo,repo.uploadTarget?.token||authToken||globalToken||token);
       repo=reposRef.current.find(item=>item.id===repo.id)||repo;source=getSource();token=getToken();
       if(!status.hasUpdate){
@@ -2833,7 +2845,9 @@ export default config;
 
   const allTags = useMemo(()=>Array.from(new Set(repos.flatMap(r => r.tags))),[repos]);
 
-  const openProjectList=(filter:string)=>{setSearchFilter('');setSelectedTagFilter('all');setProjectTypeFilter(filter);setSelectedProjectIds([]);setCurrentView('projects');};
+  const openProjectList=(filter:string)=>{setSourceStatusFilter('all');setSearchFilter('');setSelectedTagFilter('all');setProjectTypeFilter(filter);setSelectedProjectIds([]);setCurrentView('projects');};
+  const sourceIssues=useMemo(()=>new Map(repos.map(repo=>[repo.id,activeUpdateCheckIssue(repo)])),[repos]);
+  const sourceIssueCount=useMemo(()=>[...sourceIssues.values()].filter(Boolean).length,[sourceIssues]);
   // Global search filtering across Project Name, Owner, Remark, Description, and Tags
   const filteredRepos = useMemo(()=>repos.filter(repo => {
     const source=sourceOf(repo),targets=projectTargets(repo);
@@ -2843,8 +2857,10 @@ export default config;
     const fullFork=repo.forkScope==='full'||repo.uploadTarget?.kind==='full'||!!repo.forkTarget?.branches?.length&&repo.forkScope!=='current';
     const matchType=projectTypeFilter==='all'||projectTypeFilter==='private-synced'&&isPrivateSynced(repo)||projectTypeFilter==='updates'&&needsProjectUpdate(repo)||projectTypeFilter==='bound'&&bound||projectTypeFilter==='unbound'&&!bound||projectTypeFilter==='pending'&&(repo.accountState==='pending'||!!repo.creationReservation||!!repo.pendingSwitch)||projectTypeFilter==='fork'&&fullFork||projectTypeFilter==='upload'&&bound&&!fullFork;
     const matchTag = selectedTagFilter === 'all' || repo.tags.includes(selectedTagFilter);
-    return matchSearch && matchTag && matchType;
-  }),[repos,searchFilter,projectTypeFilter,selectedTagFilter]);
+    const issue=sourceIssues.get(repo.id);
+    const matchSource=sourceStatusFilter==='all'||(sourceStatusFilter==='issues'?!!issue:!issue);
+    return matchSearch && matchTag && matchType && matchSource;
+  }),[repos,searchFilter,projectTypeFilter,selectedTagFilter,sourceStatusFilter,sourceIssues]);
 
   const quickProjectSelections = useMemo(()=>projectSelections(filteredRepos, repos),[filteredRepos,repos]);
   const allVisibleProjectsSelected = filteredRepos.length > 0 && filteredRepos.every(repo => selectedProjectIds.includes(repo.id));
@@ -3356,7 +3372,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                                 缓存已精简
                               </span>
                             )}
-                            {repo.hasUpdate ? (
+                            {sourceIssues.get(repo.id)?<span className="text-[10px] bg-[#B6847A]/20 text-[#8C5D54] px-2.5 py-0.5 rounded-full font-bold border border-[#B6847A]/30 flex flex-row items-center gap-1 shrink-0"><AlertCircle className="w-3 h-3 shrink-0" /><span>{updateCheckIssueLabel(sourceIssues.get(repo.id)!)}</span></span>:repo.hasUpdate ? (
                               <span className="text-[10px] bg-[#B6847A]/20 text-[#8C5D54] px-2 py-0.5 rounded-full font-bold border border-[#B6847A]/30 whitespace-nowrap shrink-0">
                                 发现新版本
                               </span>
@@ -3418,7 +3434,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                   className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#474239] rounded-xl text-xs font-medium border border-[#DFD8CE] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <RefreshCw className="w-3.5 h-3.5 text-[#B6847A] shrink-0" />
-                  <span>全部检测</span>
+                  <span>{sourceStatusFilter==='issues'?'检测异常项目':'全部检测'}</span>
                 </button>
                 <button type="button" disabled={isLoading} onClick={()=>void checkAllUpdates(true)} className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#474239] rounded-xl text-xs border border-[#DFD8CE] shadow-xs">强制刷新</button>
               </div>
@@ -3514,6 +3530,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
               </details>
             </div>
 
+            {sourceIssueCount>0&&<p className="text-xs text-[#7A7367] leading-relaxed">{sourceIssueCount} 个项目已放入“来源异常”，常规全部检测、强制刷新及定时检测会跳过。<button type="button" onClick={()=>{setSourceStatusFilter('issues');setProjectTypeFilter('all');setSelectedTagFilter('all');setSearchFilter('');setSelectedProjectIds([]);}} className="ml-2 text-[#5D6F5A] underline">查看来源异常</button></p>}
             {/* Filter Toolbar */}
             <div className="bg-[#FFFFFF] border border-[#E5DFD7] rounded-2xl p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-3 shadow-xs">
               <div className="relative flex-1 max-w-md">
@@ -3527,6 +3544,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                 />
               </div>
 
+              <select aria-label="来源状态分类" value={sourceStatusFilter} onChange={event=>{setSourceStatusFilter(event.target.value as 'normal'|'issues'|'all');setSelectedProjectIds([]);}} className="w-full xl:w-auto max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#554F45]"><option value="normal">正常项目</option><option value="issues">来源异常（{sourceIssueCount}）</option><option value="all">全部项目（含异常）</option></select>
               <select aria-label="项目类型筛选" value={projectTypeFilter} onChange={event=>setProjectTypeFilter(event.target.value)} className="w-full xl:w-auto max-w-full bg-[#FAF8F5] border border-[#DFD8CE] rounded-xl px-3 py-2 text-xs text-[#554F45]"><option value="all">全部类型</option><option value="private-synced">已同步私人仓库</option><option value="updates">待更新版本</option><option value="bound">已绑定</option><option value="unbound">未绑定</option><option value="pending">待完成</option><option value="upload">上传／分支副本</option><option value="fork">完整分叉</option></select>
               <div className="flex flex-row items-center gap-2 overflow-x-auto pb-1 md:pb-0 whitespace-nowrap">
                 <span className="text-xs text-[#7A7367] flex flex-row items-center gap-1 shrink-0">
@@ -3637,7 +3655,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                               </span>
                             )}
 
-                            {repo.hasUpdate ? (
+                            {sourceIssues.get(repo.id)?<span className="text-[10px] bg-[#B6847A]/20 text-[#8C5D54] px-2.5 py-0.5 rounded-full font-bold border border-[#B6847A]/30 flex flex-row items-center gap-1 shrink-0"><AlertCircle className="w-3 h-3 shrink-0" /><span>{updateCheckIssueLabel(sourceIssues.get(repo.id)!)}</span></span>:repo.hasUpdate ? (
                               <span className="text-[10px] bg-[#B6847A]/20 text-[#8C5D54] px-2.5 py-0.5 rounded-full font-bold border border-[#B6847A]/30 flex flex-row items-center gap-1 shrink-0">
                                 <AlertCircle className="w-3 h-3 shrink-0" />
                                 <span>{repo.primarySource?'固定主仓库有更新':'远程有更新'}</span>
@@ -3650,7 +3668,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                             )}
                           </div>
 
-                          {repo.checkError&&<p role="status" className="text-xs text-[#8C5D54] break-all">检测失败：{repo.checkError}</p>}
+                          {sourceIssues.get(repo.id)&&<p className="text-xs text-[#8C5D54] break-words">已暂停常规检测，保留上次结果；可在此分类重新检测，恢复后自动回到正常项目。</p>}
+                          {(repo.checkError||sourceIssues.get(repo.id)?.message)&&<p role="status" className="text-xs text-[#8C5D54] break-all">检测失败：{repo.checkError||sourceIssues.get(repo.id)?.message}</p>}
                           {repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha)&&<p className="text-xs text-[#7A7367]">当前来源版本待上传至固定目标</p>}
                           {repo.primarySource&&<div className="flex flex-wrap items-center gap-2 text-xs text-[#7A7367]"><span className="break-all">原始上游：{repo.upstreamStatus?.error?`检测失败：${repo.upstreamStatus.error}`:repo.upstreamStatus?.checkedAt?repo.upstreamStatus.hasUpdate===undefined?'已获取上游版本，尚未确认同步基线':repo.upstreamStatus.hasUpdate?'有更新':'已同步的来源版本没有新提交':'尚未检测'}</span><button type="button" disabled={statusChecking.includes(repo.id)} onClick={()=>void checkSingleRepoStatus(repo.id,false,{upstream:true,force:true})} className="px-2 py-1 border border-[#DFD8CE] rounded-lg bg-white text-[#5D6F5A] disabled:opacity-40">检测原始上游</button></div>}
                           {/* Description display */}

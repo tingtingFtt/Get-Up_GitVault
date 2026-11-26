@@ -1758,7 +1758,7 @@ test('repeated status checks reuse metadata, force refresh reaches the network, 
   alerts=[];await click('全部检测');await waitFor(()=>alerts.length>0);assert.equal(count,1);
   fail=true;alerts=[];await click('强制刷新');await waitFor(()=>alerts.some(message=>message.includes('失败 1')));
   assert.equal(count,2);assert.equal(storedProjects()[0].lastCheckedAt,checked);assert.equal(storedProjects()[0].hasUpdate,false);assert.ok(storedProjects()[0].checkError.includes('Resource'));
-  assert.ok(document.body.textContent?.includes('检测失败，保留上次结果'));
+  await click('查看来源异常');assert.ok(document.body.textContent?.includes('来源权限待确认'));assert.ok(document.body.textContent?.includes('保留上次结果'));
 });
 test('cancelling quick checks aborts current reads, preserves prior status and never starts queued projects',async()=>{
   const date='2026-10-01T00:00:00Z';await reloadProjects(Array.from({length:5},(_,i)=>({...repo(),id:'cancel-check-'+i,repo:'cancel-check-'+i,lastCheckedAt:date,hasUpdate:true})));
@@ -1821,4 +1821,73 @@ test('large project lists render progressively while filtered bulk selection sti
  await click('全选所有');assert.ok(document.querySelector('.batch-selection')?.textContent?.includes('已选定 120 / 120'));
  await click('加载更多项目');assert.equal(document.querySelectorAll('button[title="删除项目"]').length,100);
  await setField(document.querySelector<HTMLInputElement>('input[placeholder^="搜索项目"]')!,'project-119');assert.equal(document.querySelectorAll('button[title="删除项目"]').length,1);assert.ok(!document.body.textContent?.includes('加载更多项目'));
+});
+
+test('source failures move to their own category, survive reload, and regular force checks skip them',async()=>{
+ const target={id:77,owner:'destination',repo:'fixed-name',branch:'release',purgeAfterUpload:false};
+ const projects=[{...repo(),id:'healthy',repo:'healthy',url:'https://github.com/source/healthy'},{...repo(),id:'missing',repo:'missing',url:'https://github.com/source/missing',uploadTarget:target},{...repo(),id:'private',repo:'private',url:'https://github.com/source/private'}];
+ await reloadProjects(projects);let recover=false;
+ globalThis.fetch=async(input)=>{const path=new URL(String(input)).pathname;requests.push({path,payload:null});if(path.includes('/healthy/'))return head('v2');if(path.includes('/missing/'))return recover?head('v2'):ok({message:'Not Found'},404);if(path.includes('/private/'))return ok({message:'Resource not accessible'},403);throw Error('Unexpected read: '+path);};
+ await click('仓库已有项目 (3)');await click('全部检测');await waitFor(()=>alerts.some(message=>message.includes('失败 2')));
+ const saved=storedProjects();assert.equal(saved.filter((p:any)=>p.updateCheckIssue).length,2);assert.equal(saved.find((p:any)=>p.id==='missing').updateCheckIssue.kind,'unavailable');assert.deepEqual(saved.find((p:any)=>p.id==='missing').backups,projects[1].backups);assert.deepEqual(saved.find((p:any)=>p.id==='missing').uploadTarget,target);
+ assert.equal(buttons().filter(button=>!button.closest('nav')&&button.textContent?.trim()==='工作台').length,1);
+ requests=[];alerts=[];await click('强制刷新');await waitFor(()=>alerts.some(message=>message.includes('已跳过来源异常 2')));assert.equal(requests.length,1);assert.ok(requests[0].path.includes('/healthy/'));
+ await reloadProjects(storedProjects());await click('仓库已有项目 (3)');assert.equal(buttons().filter(button=>!button.closest('nav')&&button.textContent?.trim()==='工作台').length,1);
+ await click('查看来源异常');assert.equal(buttons().filter(button=>!button.closest('nav')&&button.textContent?.trim()==='工作台').length,2);assert.ok(document.body.textContent?.includes('来源不可访问'));assert.ok(document.body.textContent?.includes('来源权限待确认'));
+ recover=true;requests=[];alerts=[];await click('检测异常项目');await waitFor(()=>alerts.some(message=>message.includes('检测完成')));assert.equal(requests.length,2);assert.ok(requests.every(r=>!r.path.includes('/healthy/')));
+ assert.equal(storedProjects().find((p:any)=>p.id==='missing').updateCheckIssue,undefined);assert.equal(storedProjects().find((p:any)=>p.id==='private').updateCheckIssue.kind,'permission');
+ await setField(document.querySelector<HTMLSelectElement>('[aria-label="来源状态分类"]')!,'normal');assert.equal(buttons().filter(button=>!button.closest('nav')&&button.textContent?.trim()==='工作台').length,2);
+ assert.ok(requests.every(r=>r.payload===null));
+});
+
+test('a renamed source is recovered by repository ID from its isolated category without changing the upload binding',async()=>{
+ const project={...repo(),repositoryId:42,uploadTarget:{id:77,owner:'destination',repo:'fixed-name',branch:'release',purgeAfterUpload:false}};
+ await reloadProject(project);let restored=false;
+ globalThis.fetch=async(input)=>{const path=new URL(String(input)).pathname;requests.push({path,payload:null});
+  if(path==='/repos/source/project/git/ref/heads/develop'||path==='/repos/source/project')return ok({message:'Not Found'},404);
+  if(path==='/repositories/42')return ok({id:42,name:'renamed',owner:{login:'source'},default_branch:'develop',html_url:'https://github.com/source/renamed'});
+  if(path==='/repos/source/renamed/git/ref/heads/develop')return restored?head('v2'):ok({message:'Not Found'},404);
+  throw Error('Unexpected read: '+path);
+ };
+ await click('仓库已有项目 (1)');await click('全部检测');await waitFor(()=>!!storedProjects()[0].updateCheckIssue);
+ await click('查看来源异常');assert.ok(document.body.textContent?.includes('来源分支不可访问'));
+ restored=true;alerts=[];await click('检测');await waitFor(()=>!storedProjects()[0].updateCheckIssue);
+ const saved=storedProjects()[0];assert.equal(saved.repo,'renamed');assert.equal(saved.repositoryId,42);assert.deepEqual(saved.uploadTarget,project.uploadTarget);assert.deepEqual(saved.backups,project.backups);assert.equal(saved.branch,'develop');
+});
+
+test('temporary update check errors remain in regular checks instead of being isolated as missing sources',async()=>{
+ await reloadProject(repo());let fail=true;
+ globalThis.fetch=async(input)=>{requests.push({path:new URL(String(input)).pathname,payload:null});return fail?ok({message:'temporary backend failure'},500):head('v2');};
+ await click('仓库已有项目 (1)');await click('全部检测');await waitFor(()=>alerts.some(message=>message.includes('失败 1')));
+ assert.equal(storedProjects()[0].updateCheckIssue,undefined);assert.equal(buttons().filter(button=>!button.closest('nav')&&button.textContent?.trim()==='工作台').length,1);
+ fail=false;alerts=[];await click('强制刷新');await waitFor(()=>alerts.some(message=>message.includes('最新 1')));assert.equal(storedProjects()[0].checkError,undefined);
+});
+
+test('a source check failure during one-click update is isolated without losing its snapshot or bound target',async()=>{
+ const project=repo();await reloadProject(project);
+ const original=globalThis.fetch;globalThis.fetch=async(input,init={})=>new URL(String(input)).pathname.includes('/git/ref/heads/')?ok({message:'Not Found'},404):original(input,init);
+ await click('仓库已有项目 (1)');await click('一键更新');await waitFor(()=>!!storedProjects()[0].updateCheckIssue);
+ assert.equal(storedProjects()[0].latestCommitSha,project.latestCommitSha);assert.deepEqual(storedProjects()[0].backups,project.backups);
+ assert.ok(document.body.textContent?.includes('查看来源异常'));
+});
+
+
+test('cancelling isolated-source rechecks preserves their marker and never starts queued failures',async()=>{
+ const projects=Array.from({length:5},(_,i)=>({...repo(),id:'isolated-'+i,repo:'isolated-'+i,checkError:'GitHub (404): Not Found',hasUpdate:true}));
+ await reloadProjects(projects);let count=0;
+ globalThis.fetch=async(_input,init={})=>{count++;return new Promise((_resolve,reject)=>init.signal!.addEventListener('abort',()=>reject(init.signal!.reason),{once:true}));};
+ await click('仓库已有项目 (5)');await click('查看来源异常');await click('检测异常项目');await waitFor(()=>count===3);await click('取消');await waitFor(()=>alerts.some(message=>message.includes('检测已取消')));
+ const saved=storedProjects();assert.equal(count,3);assert.equal(document.querySelectorAll('button[title="删除项目"]').length,5);assert.ok(saved.every((project:any)=>project.hasUpdate&&project.latestCommitSha==='v2'&&(project.updateCheckIssue?.kind==='unavailable'||project.checkError==='GitHub (404): Not Found')));
+ requests=[];await setField(document.querySelector<HTMLSelectElement>('[aria-label="来源状态分类"]')!,'normal');alerts=[];await click('全部检测');await waitFor(()=>alerts.some(message=>message.includes('没有可常规检测')));assert.equal(count,3);
+});
+
+
+test('checking the original upstream cannot clear an unavailable explicitly followed target source',async()=>{
+ const primarySource={owner:'destination',repo:'fixed',branch:'release',url:'https://github.com/destination/fixed',repositoryId:77};
+ const issue={kind:'unavailable',sourceKey:JSON.stringify(['destination','fixed','release',77]),message:'GitHub (404): Not Found',failedAt:'2026-11-26T00:00:00Z'};
+ const project={...repo(),origin:{owner:'source',repo:'project',branch:'develop',url:'https://github.com/source/project'},primarySource,sourceMode:'target',updateCheckIssue:issue,checkError:issue.message};
+ await reloadProject(project);
+ globalThis.fetch=async(input)=>{const path=new URL(String(input)).pathname;assert.equal(path,'/repos/source/project/git/ref/heads/develop');requests.push({path,payload:null});return head('v2');};
+ await click('仓库已有项目 (1)');await click('查看来源异常');await click('检测原始上游');await waitFor(()=>!!storedProjects()[0].upstreamStatus?.checkedAt);
+ assert.deepEqual(storedProjects()[0].updateCheckIssue,issue);assert.deepEqual(storedProjects()[0].primarySource,primarySource);assert.equal(document.querySelectorAll('button[title="删除项目"]').length,1);assert.equal(requests.length,1);
 });
