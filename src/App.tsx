@@ -3671,7 +3671,7 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
                           {sourceIssues.get(repo.id)&&<p className="text-xs text-[#8C5D54] break-words">已暂停常规检测，保留上次结果；可在此分类重新检测，恢复后自动回到正常项目。</p>}
                           {(repo.checkError||sourceIssues.get(repo.id)?.message)&&<p role="status" className="text-xs text-[#8C5D54] break-all">检测失败：{repo.checkError||sourceIssues.get(repo.id)?.message}</p>}
                           {repo.uploadTarget&&!repo.primarySource&&(repo.branchUploadPending||repo.remoteSnapshot?.sourceSha!==repo.latestCommitSha)&&<p className="text-xs text-[#7A7367]">当前来源版本待上传至固定目标</p>}
-                          {repo.primarySource&&<div className="flex flex-wrap items-center gap-2 text-xs text-[#7A7367]"><span className="break-all">原始上游：{repo.upstreamStatus?.error?`检测失败：${repo.upstreamStatus.error}`:repo.upstreamStatus?.checkedAt?repo.upstreamStatus.hasUpdate===undefined?'已获取上游版本，尚未确认同步基线':repo.upstreamStatus.hasUpdate?'有更新':'已同步的来源版本没有新提交':'尚未检测'}</span><button type="button" disabled={statusChecking.includes(repo.id)} onClick={()=>void checkSingleRepoStatus(repo.id,false,{upstream:true,force:true})} className="px-2 py-1 border border-[#DFD8CE] rounded-lg bg-white text-[#5D6F5A] disabled:opacity-40">检测原始上游</button></div>}
+                          {repo.primarySource&&<div className="flex flex-wrap items-center gap-2 text-xs text-[#7A7367]"><span className="break-all">原始上游：{repo.upstreamStatus?.error?`检测失败：${repo.upstreamStatus.error}`:repo.upstreamStatus?.checkedAt?repo.upstreamStatus.hasUpdate===undefined?'已获取上游版本，尚未确认同步基线':repo.upstreamStatus.hasUpdate?'有更新':'已同步的来源版本没有新提交':'尚未检测'}</span><button type="button" disabled={isLoading||statusChecking.includes(repo.id)} onClick={()=>void checkSingleRepoStatus(repo.id,false,{upstream:true,force:true})} className="px-2 py-1 border border-[#DFD8CE] rounded-lg bg-white text-[#5D6F5A] disabled:opacity-40">检测原始上游</button></div>}
                           {/* Description display */}
                           {repo.description && (
                             <p className="text-xs text-[#554F45] leading-relaxed line-clamp-2">
@@ -3750,7 +3750,8 @@ Note: 此压缩包可直接解压至手机文件管理器或 APK 存储目录中
 
                         <button
                           onClick={() => checkSingleRepoStatus(repo.id)}
-                          className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DCD5CB] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0"
+                          disabled={isLoading||statusChecking.includes(repo.id)}
+                          className="px-3 py-1.5 bg-[#FFFFFF] hover:bg-[#F5F2EB] text-[#3B362F] rounded-xl text-xs font-medium border border-[#DCD5CB] shadow-xs transition flex flex-row items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-40"
                           title="手动检测此项目远程是否有更新"
                         >
                           <RefreshCw className="w-3.5 h-3.5 text-[#8E9F8B] shrink-0" />

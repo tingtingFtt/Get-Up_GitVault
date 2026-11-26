@@ -1849,7 +1849,7 @@ test('a renamed source is recovered by repository ID from its isolated category 
   if(path==='/repos/source/renamed/git/ref/heads/develop')return restored?head('v2'):ok({message:'Not Found'},404);
   throw Error('Unexpected read: '+path);
  };
- await click('仓库已有项目 (1)');await click('全部检测');await waitFor(()=>!!storedProjects()[0].updateCheckIssue);
+ await click('仓库已有项目 (1)');await click('全部检测');await waitFor(()=>alerts.some(message=>message.includes('检测完成')));assert.ok(storedProjects()[0].updateCheckIssue);
  await click('查看来源异常');assert.ok(document.body.textContent?.includes('来源分支不可访问'));
  restored=true;alerts=[];await click('检测');await waitFor(()=>!storedProjects()[0].updateCheckIssue);
  const saved=storedProjects()[0];assert.equal(saved.repo,'renamed');assert.equal(saved.repositoryId,42);assert.deepEqual(saved.uploadTarget,project.uploadTarget);assert.deepEqual(saved.backups,project.backups);assert.equal(saved.branch,'develop');
